@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "capcore"
+version = "0.1.0"
+description = "M1 capability core: trusted authorization decision path for a capability-enforced agent runtime"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "hypothesis>=6.0",
+]
+
+[tool.setuptools]
+packages = ["capcore", "capcore.tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["capcore/tests"]
+addopts = "-q"

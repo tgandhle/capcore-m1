@@ -1,0 +1,715 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+<title>Reference Monitor — Capability-Enforced Agent Runtime</title>
+<style>
+  /* No external font import: the footer claims no network calls, so we honor it.
+     Display/body use a grotesk-leaning system stack; data/trace use a mono stack. */
+  :root{
+    --sans:'Space Grotesk','Segoe UI',system-ui,-apple-system,sans-serif;
+    --mono:'JetBrains Mono',ui-monospace,'SF Mono',Menlo,Consolas,monospace;
+    --ink:#0d1117;
+    --panel:#141b24;
+    --panel-2:#1b2430;
+    --line:#26303c;
+    --line-bright:#37475a;
+    --fg:#dce3ea;
+    --fg-dim:#8a9aab;
+    --fg-faint:#5c6a7a;
+    --allow:#4ea87a;
+    --allow-bg:#12281e;
+    --approval:#d99a3a;
+    --approval-bg:#2b2110;
+    --deny:#e0554e;
+    --deny-bg:#2c1512;
+    --cyan:#4cc4d6;
+    --hostile:#b45cd1;
+    font-size:16px;
+  }
+
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{
+    background:
+      radial-gradient(1200px 600px at 80% -10%, #17222e 0%, transparent 60%),
+      var(--ink);
+    color:var(--fg);
+    font-family:var(--sans);
+    line-height:1.5;
+    min-height:100vh;
+    padding:0;
+  }
+  .mono{font-family:var(--mono)}
+
+  .wrap{max-width:1180px;margin:0 auto;padding:clamp(20px,4vw,44px)}
+
+  /* header */
+  header.masthead{
+    display:flex;justify-content:space-between;align-items:flex-start;
+    gap:24px;flex-wrap:wrap;
+    border-bottom:1px solid var(--line);
+    padding-bottom:22px;margin-bottom:8px;
+  }
+  .brand{max-width:640px}
+  .eyebrow{
+    font-family:var(--mono);font-size:.68rem;letter-spacing:.22em;
+    text-transform:uppercase;color:var(--cyan);margin:0 0 10px;
+    display:flex;align-items:center;gap:10px;
+  }
+  .eyebrow::before{content:"";width:26px;height:1px;background:var(--cyan);display:inline-block}
+  h1{
+    font-size:clamp(1.6rem,3.4vw,2.5rem);font-weight:700;margin:0 0 10px;
+    letter-spacing:-.02em;line-height:1.05;
+  }
+  h1 .thin{color:var(--fg-dim);font-weight:400}
+  .lede{color:var(--fg-dim);font-size:.98rem;margin:0;max-width:560px}
+  .legend{
+    display:flex;flex-direction:column;gap:8px;
+    font-family:var(--mono);font-size:.7rem;
+    padding-top:4px;
+  }
+  .legend .row{display:flex;align-items:center;gap:9px;color:var(--fg-dim)}
+  .chip{width:11px;height:11px;border-radius:2px;flex:none}
+  .chip.allow{background:var(--allow)}
+  .chip.approval{background:var(--approval)}
+  .chip.deny{background:var(--deny)}
+
+  /* control bar */
+  .controls{
+    display:flex;gap:12px;align-items:center;flex-wrap:wrap;
+    margin:26px 0 22px;
+  }
+  button.act{
+    font-family:var(--mono);font-size:.8rem;letter-spacing:.03em;
+    background:var(--panel-2);color:var(--fg);border:1px solid var(--line-bright);
+    padding:11px 18px;border-radius:6px;cursor:pointer;transition:.15s;
+    display:inline-flex;align-items:center;gap:9px;
+  }
+  button.act:hover{border-color:var(--cyan);color:#fff;background:#1f2a36}
+  button.act:focus-visible{outline:2px solid var(--cyan);outline-offset:2px}
+  button.act.primary{background:var(--cyan);color:#04141a;border-color:var(--cyan);font-weight:600}
+  button.act.primary:hover{background:#63d4e6}
+  button.act:disabled{opacity:.4;cursor:not-allowed}
+  .spacer{flex:1}
+  .counter{font-family:var(--mono);font-size:.72rem;color:var(--fg-faint)}
+  .counter b{color:var(--fg)}
+
+  /* main grid */
+  .grid{display:grid;grid-template-columns:1.55fr 1fr;gap:20px;align-items:start}
+  @media(max-width:860px){.grid{grid-template-columns:1fr}}
+
+  .panel{
+    background:var(--panel);border:1px solid var(--line);border-radius:10px;
+    overflow:hidden;
+  }
+  .panel > .head{
+    display:flex;align-items:center;justify-content:space-between;
+    padding:13px 16px;border-bottom:1px solid var(--line);
+    font-family:var(--mono);font-size:.7rem;letter-spacing:.16em;
+    text-transform:uppercase;color:var(--fg-dim);
+  }
+  .head .tag{color:var(--fg-faint)}
+
+  /* feed */
+  #feed{padding:8px;min-height:340px;max-height:640px;overflow-y:auto}
+  .empty{
+    color:var(--fg-faint);font-family:var(--mono);font-size:.8rem;
+    text-align:center;padding:60px 20px;line-height:1.9;
+  }
+  .empty b{color:var(--fg-dim)}
+
+  .verdict{
+    border:1px solid var(--line);border-left-width:3px;border-radius:8px;
+    margin:8px;padding:14px 15px;background:var(--panel-2);
+    animation:slidein .34s cubic-bezier(.2,.7,.3,1);
+  }
+  @keyframes slidein{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:none}}
+  .verdict.allow{border-left-color:var(--allow)}
+  .verdict.approval{border-left-color:var(--approval)}
+  .verdict.deny{border-left-color:var(--deny)}
+
+  .v-top{display:flex;align-items:baseline;gap:10px;justify-content:space-between}
+  .v-actor{
+    font-family:var(--mono);font-size:.66rem;letter-spacing:.1em;
+    text-transform:uppercase;color:var(--hostile);display:flex;align-items:center;gap:7px;
+  }
+  .v-actor .dot{width:6px;height:6px;border-radius:50%;background:var(--hostile)}
+  .v-num{font-family:var(--mono);font-size:.66rem;color:var(--fg-faint)}
+
+  .v-action{
+    font-family:var(--mono);font-size:.86rem;margin:9px 0 3px;
+    color:var(--fg);word-break:break-word;
+  }
+  .v-action .verb{color:var(--cyan)}
+  .v-action .res{color:#e8c07d}
+
+  .v-verdict{
+    display:inline-flex;align-items:center;gap:8px;margin-top:11px;
+    font-family:var(--mono);font-weight:700;font-size:.82rem;
+    letter-spacing:.06em;padding:5px 11px;border-radius:5px;
+  }
+  .v-verdict.allow{color:var(--allow);background:var(--allow-bg)}
+  .v-verdict.approval{color:var(--approval);background:var(--approval-bg)}
+  .v-verdict.deny{color:var(--deny);background:var(--deny-bg)}
+
+  .v-reason{
+    margin-top:11px;padding-top:11px;border-top:1px dashed var(--line);
+    font-family:var(--mono);font-size:.74rem;color:var(--fg-dim);
+    line-height:1.7;
+  }
+  .v-reason .tr{display:block}
+  .v-reason .k{color:var(--fg-faint)}
+  .v-reason .hot{color:var(--deny)}
+  .v-reason .ok{color:var(--allow)}
+  .v-reason .warn{color:var(--approval)}
+
+  /* right column stacks */
+  .stack{display:flex;flex-direction:column;gap:20px}
+
+  /* capability list */
+  #caps{padding:6px}
+  .cap{
+    border:1px solid var(--line);border-radius:7px;margin:6px;padding:11px 12px;
+    font-family:var(--mono);font-size:.73rem;background:var(--panel-2);
+    transition:.2s;
+  }
+  .cap.revoked{opacity:.42;border-style:dashed}
+  .cap-h{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
+  .cap-id{color:var(--cyan);font-weight:600}
+  .cap-state{font-size:.62rem;letter-spacing:.1em;text-transform:uppercase}
+  .cap-state.live{color:var(--allow)}
+  .cap-state.dead{color:var(--deny)}
+  .cap-line{color:var(--fg-dim);display:flex;gap:6px;margin-top:2px}
+  .cap-line .lbl{color:var(--fg-faint);min-width:66px;flex:none}
+  .cap .revoke-btn{
+    background:none;border:1px solid var(--line-bright);color:var(--fg-faint);
+    font-family:inherit;font-size:.6rem;letter-spacing:.08em;text-transform:uppercase;
+    padding:3px 8px;border-radius:4px;cursor:pointer;transition:.15s;
+  }
+  .cap .revoke-btn:hover{border-color:var(--deny);color:var(--deny)}
+  .cap .revoke-btn:focus-visible{outline:2px solid var(--deny);outline-offset:2px}
+
+  /* ledger */
+  #ledger{padding:6px;max-height:280px;overflow-y:auto}
+  .led{
+    font-family:var(--mono);font-size:.7rem;
+    display:flex;gap:9px;padding:5px 8px;border-radius:4px;align-items:baseline;
+  }
+  .led:nth-child(odd){background:#0f161e}
+  .led .st{min-width:78px;flex:none;font-weight:600}
+  .led .st.completed{color:var(--allow)}
+  .led .st.denied{color:var(--deny)}
+  .led .st.awaiting{color:var(--approval)}
+  .led .st.revoked{color:var(--deny)}
+  .led .st.executing{color:var(--cyan)}
+  .led .txt{color:var(--fg-dim);word-break:break-word}
+  .led .arrow{color:var(--fg-faint)}
+
+  footer{
+    margin-top:34px;padding-top:20px;border-top:1px solid var(--line);
+    font-family:var(--mono);font-size:.68rem;color:var(--fg-faint);
+    line-height:1.9;
+  }
+  footer b{color:var(--fg-dim);font-weight:500}
+  .scrollfade::-webkit-scrollbar{width:8px}
+  .scrollfade::-webkit-scrollbar-thumb{background:var(--line-bright);border-radius:4px}
+  .scrollfade::-webkit-scrollbar-track{background:transparent}
+  @media(prefers-reduced-motion:reduce){.verdict{animation:none}}
+</style>
+
+<div class="wrap">
+  <header class="masthead">
+    <div class="brand">
+      <p class="eyebrow">Capability-Enforced Agent Runtime · M1 core</p>
+      <h1>Reference&nbsp;Monitor <span class="thin">/ live decision trace</span></h1>
+      <p class="lede">A deliberately hostile model proposes actions. The monitor combines the
+        applicable capabilities, applies deny&nbsp;&gt;&nbsp;require-approval&nbsp;&gt;&nbsp;allow
+        precedence, and shows its reasoning. Deny is the default; authority only ever narrows.</p>
+    </div>
+    <div class="legend">
+      <div class="row"><span class="chip allow"></span> allow — every check passes</div>
+      <div class="row"><span class="chip approval"></span> require-approval — human gate</div>
+      <div class="row"><span class="chip deny"></span> deny — fail closed</div>
+    </div>
+  </header>
+
+  <div class="controls">
+    <button class="act primary" id="step">▸ Propose next action</button>
+    <button class="act" id="run">▸▸ Run all</button>
+    <button class="act" id="reset">↺ Reset</button>
+    <div class="spacer"></div>
+    <div class="counter">proposals&nbsp;<b id="c-total">0</b> · allowed&nbsp;<b id="c-allow">0</b> · gated&nbsp;<b id="c-appr">0</b> · denied&nbsp;<b id="c-deny">0</b></div>
+  </div>
+
+  <div class="grid">
+    <div class="panel">
+      <div class="head"><span>Decision feed</span><span class="tag">hostile model → monitor</span></div>
+      <div id="feed" class="scrollfade">
+        <div class="empty" id="empty">
+          <b>monitor idle</b><br>
+          press <b>propose next action</b> to feed the monitor<br>
+          a scripted-hostile action sequence
+        </div>
+      </div>
+    </div>
+
+    <div class="stack">
+      <div class="panel">
+        <div class="head"><span>Capabilities</span><span class="tag">revoke, then re-propose</span></div>
+        <div id="caps"></div>
+      </div>
+      <div class="panel">
+        <div class="head"><span>Decision log</span><span class="tag">in-memory, cleared on reset</span></div>
+        <div id="ledger" class="scrollfade"></div>
+      </div>
+    </div>
+  </div>
+
+  <footer>
+    <b>Scope, stated honestly.</b> This is the M1 capability core rendered in the browser: real
+    authorization algebra (per-grant scope check, union of alternative grants, most-restrictive approval,
+    fail-closed), real deny&nbsp;&gt;&nbsp;require-approval&nbsp;&gt;&nbsp;allow precedence including an
+    explicit platform-deny policy. No model or tool network calls; fonts are system-local.
+    Identity (tenant · principal · run) is supplied by a <b>trusted context</b>, never read from the
+    model's proposal. Containment shown here is <b>evidence</b> from a decision trace, not <b>proof</b>:
+    these properties are <b>intended to be backed by a property-based test suite</b> (the Python M1 core),
+    which is where the enumerable claims get exhaustively checked. Attacker modeled: hostile model output
+    attempting tenant impersonation, over-attenuation, prefix confusion, malformed proposals, and use of a
+    revoked capability.
+  </footer>
+</div>
+
+<script>
+"use strict";
+
+/* =========================================================================
+   M1 capability core — corrected.
+   Faithful port of the intended Python model. Key rules, made explicit
+   because the earlier version got several wrong:
+
+   1. IDENTITY IS TRUSTED. tenant / principal / run come from a RunContext
+      supplied by the runtime, NEVER from the model's proposal. The proposal
+      carries only {resource, verb, args}. This closes the confused-deputy
+      hole where a proposal could claim to be another tenant.
+
+   2. ALTERNATIVE GRANTS COMBINE BY UNION. A proposal is allowed if ANY single
+      applicable grant authorizes it on its own (its scope covers the resource
+      AND its actions include the verb). Independent grants are not intersected.
+
+   3. ATTENUATION IS VALIDATED AT ISSUE TIME. deriveChild() rejects any child
+      whose tenant, scope, or actions exceed the parent. The runtime never
+      re-simulates attenuation by intersecting caps found at authorize time.
+
+   4. SCOPE IS SEGMENT-AWARE. Resource containment is path-segment prefix, not
+      raw string startsWith, so "acme/data" does NOT cover "acme/database".
+
+   5. FAIL CLOSED ON BAD INPUT. A malformed proposal becomes a deterministic
+      DENY (reason: invalid schema), never an uncaught exception.
+
+   6. EXPLICIT DENY BEATS EVERYTHING. A platform deny-policy overrides an
+      otherwise-valid allow or approval, demonstrating deny > approval > allow.
+   ========================================================================= */
+
+/* ---------- resource scope: segment-aware containment ---------- */
+// Split on "/", drop empty trailing segment. "acme/records/" -> ["acme","records"]
+function segs(path){ return String(path).split('/').filter(s => s.length > 0); }
+// Does scope cover resource? Every scope segment must equal the resource's
+// segment at the same position. "acme/data" covers "acme/data/x" but NOT
+// "acme/database" (segment "data" !== "database").
+function scopeCovers(scope, resource){
+  const s = segs(scope), r = segs(resource);
+  if(s.length > r.length) return false;
+  for(let i = 0; i < s.length; i++){ if(s[i] !== r[i]) return false; }
+  return true;
+}
+
+/* ---------- Capability: immutable authority ---------- */
+function Capability(spec){
+  return Object.freeze({
+    id: spec.id,
+    tenant: spec.tenant,
+    resource: spec.resource,                       // scope, segment-prefix
+    actions: Object.freeze([...spec.actions]),
+    approvalActions: Object.freeze([...(spec.approvalActions || [])]),
+    parent: spec.parent || null,
+    runtime: spec.runtime !== false,               // false = derivation-only
+    revoked: false,
+  });
+}
+
+/* ---------- Store: unique IDs, revoke, validated derivation ---------- */
+class CapabilityStore{
+  constructor(){ this.caps = new Map(); }
+
+  // Issue a ROOT capability. Fails closed on duplicate id.
+  issue(spec){
+    if(this.caps.has(spec.id)) throw new StoreError('duplicate capability id: ' + spec.id);
+    const c = Capability(spec);
+    this.caps.set(c.id, { cap: c, revoked: false });
+    return c.id;
+  }
+
+  // Derive a CHILD from a parent, validating child <= parent on every axis.
+  // Returns {ok:true,id} or {ok:false,reason}. This is where attenuation is
+  // actually enforced — not at authorize time.
+  deriveChild(parentId, childSpec){
+    const pe = this.caps.get(parentId);
+    if(!pe) return { ok:false, reason:'parent does not exist' };
+    const p = pe.cap;
+    if(this.caps.has(childSpec.id)) return { ok:false, reason:'duplicate capability id' };
+    if(childSpec.tenant !== p.tenant)
+      return { ok:false, reason:'child tenant differs from parent' };
+    // child scope must be within parent scope
+    if(!scopeCovers(p.resource, childSpec.resource))
+      return { ok:false, reason:'child scope escapes parent scope' };
+    // child actions must be a subset of parent actions
+    for(const a of childSpec.actions){
+      if(!p.actions.includes(a))
+        return { ok:false, reason:'child action "' + a + '" not held by parent' };
+    }
+    // child cannot drop an approval requirement the parent imposes on a shared action
+    for(const a of p.approvalActions){
+      if(childSpec.actions.includes(a) && !(childSpec.approvalActions || []).includes(a))
+        return { ok:false, reason:'child drops approval requirement on "' + a + '"' };
+    }
+    const c = Capability(Object.assign({}, childSpec, { parent: parentId }));
+    this.caps.set(c.id, { cap: c, revoked: false });
+    return { ok:true, id: c.id };
+  }
+
+  revoke(id){ const e = this.caps.get(id); if(e) e.revoked = true; }
+  isRevoked(id){ const e = this.caps.get(id); return !e || e.revoked; }
+
+  // Applicable = live, runtime-bound caps for THIS tenant whose scope covers the
+  // resource. Not verb-filtered here; the per-grant verb check happens in the
+  // monitor so we can express union-of-grants correctly.
+  getApplicable(tenant, resource){
+    const out = [];
+    for(const { cap } of this.caps.values()){
+      if(this.isRevoked(cap.id)) continue;
+      if(!cap.runtime) continue;
+      if(cap.tenant !== tenant) continue;
+      if(!scopeCovers(cap.resource, resource)) continue;
+      out.push(cap);
+    }
+    return out;
+  }
+}
+function StoreError(msg){ const e = new Error(msg); e.name = 'StoreError'; return e; }
+
+/* ---------- Platform deny policies (explicit deny) ---------- */
+// Mandatory platform rules that DENY regardless of capability. Demonstrates
+// deny > approval > allow: even a fully-authorized action is denied if a
+// platform policy forbids it.
+const PLATFORM_DENY = [
+  // Example: a data-residency rule forbidding export of EU-flagged records,
+  // expressed as a verb+scope match. Deny wins over any grant.
+  { verb: 'send', scopePrefix: 'acme/records/restricted', reason: 'platform policy: restricted records may not be sent' },
+];
+function platformDenies(tenant, resource, verb){
+  for(const p of PLATFORM_DENY){
+    if(p.verb === verb && scopeCovers(p.scopePrefix, resource)) return p.reason;
+  }
+  return null;
+}
+
+/* ---------- Proposal schema validation ---------- */
+// A well-formed proposal has string resource and string verb. Anything else
+// is a deterministic deny, never a throw.
+function validProposal(proposal){
+  return proposal
+    && typeof proposal === 'object'
+    && typeof proposal.resource === 'string' && proposal.resource.length > 0
+    && typeof proposal.verb === 'string' && proposal.verb.length > 0;
+}
+
+/* ---------- Reference monitor ---------- */
+// authorize(ctx, proposal): identity from ctx (trusted), request from proposal.
+// Precedence: explicit-deny > require-approval > allow; default deny.
+class ReferenceMonitor{
+  constructor(store){ this.store = store; }
+
+  authorize(ctx, proposal){
+    const trace = [];
+
+    // 0. Schema — malformed proposals fail closed.
+    if(!validProposal(proposal)){
+      trace.push(['schema', 'malformed proposal — resource/verb must be non-empty strings', 'hot']);
+      trace.push(['result', 'DENY — invalid proposal schema', 'hot']);
+      return { verdict:'deny', trace };
+    }
+
+    const tenant = ctx.tenant;               // TRUSTED. not from proposal.
+    const resource = proposal.resource;
+    const verb = proposal.verb;
+
+    trace.push(['identity', 'tenant=' + tenant + ' (from trusted context, not proposal)', '']);
+
+    // 1. Explicit platform deny wins over everything.
+    const denyReason = platformDenies(tenant, resource, verb);
+    if(denyReason){
+      trace.push(['platform', denyReason, 'hot']);
+      trace.push(['precedence', 'explicit deny beats allow and approval', 'hot']);
+      trace.push(['result', 'DENY — ' + denyReason, 'hot']);
+      return { verdict:'deny', trace };
+    }
+
+    // 2. Applicable grants for this trusted tenant + resource.
+    const applicable = this.store.getApplicable(tenant, resource);
+    trace.push(['applicable', applicable.length ? applicable.map(c=>c.id).join(', ') : 'none',
+      applicable.length ? '' : 'hot']);
+
+    if(applicable.length === 0){
+      trace.push(['result', 'DENY — ' + this._whyNone(tenant, resource, verb), 'hot']);
+      return { verdict:'deny', trace };
+    }
+
+    // 3. UNION of alternative grants: is there ANY single grant that both covers
+    //    the resource (already true) and grants this verb?
+    const granting = applicable.filter(c => c.actions.includes(verb));
+    if(granting.length === 0){
+      trace.push(['grants', 'no single applicable grant includes verb "' + verb + '"', 'hot']);
+      trace.push(['result', 'DENY — verb not granted by any applicable capability', 'hot']);
+      return { verdict:'deny', trace };
+    }
+    trace.push(['grants', granting.map(c=>c.id).join(', ') + ' grant "' + verb + '"', 'ok']);
+
+    // 4. Approval: if EVERY granting path requires approval for this verb, the
+    //    action is gated. If at least one grant permits it without approval,
+    //    it's allowed (the least-restrictive authorizing grant governs, which
+    //    is the correct semantics for alternative grants — but we still respect
+    //    approval when no unconditional grant exists).
+    const unconditional = granting.filter(c => !c.approvalActions.includes(verb));
+    if(unconditional.length === 0){
+      trace.push(['approval', 'every granting capability classifies "' + verb + '" as approval-gated', 'warn']);
+      trace.push(['precedence', 'no deny; approval required before allow', 'warn']);
+      trace.push(['result', 'REQUIRE-APPROVAL — human gate on this action class', 'warn']);
+      return { verdict:'approval', trace };
+    }
+
+    trace.push(['approval', unconditional.map(c=>c.id).join(', ') + ' grant "' + verb + '" without approval', 'ok']);
+    trace.push(['precedence', 'no deny, an unconditional grant exists → allow', 'ok']);
+    trace.push(['result', 'ALLOW', 'ok']);
+    return { verdict:'allow', trace };
+  }
+
+  _whyNone(tenant, resource, verb){
+    let wrongTenant=false, revokedHit=false;
+    for(const { cap } of this.store.caps.values()){
+      if(!cap.runtime) continue;
+      const cover = scopeCovers(cap.resource, resource);
+      if(cover && cap.tenant !== tenant) wrongTenant = true;
+      if(cover && cap.tenant === tenant && this.store.isRevoked(cap.id)) revokedHit = true;
+    }
+    if(revokedHit) return 'the runtime capability for this scope is revoked';
+    if(wrongTenant) return 'a capability covers this resource but under a DIFFERENT tenant (cross-tenant escape blocked; identity came from trusted context)';
+    return 'no live runtime capability covers this resource for this tenant';
+  }
+}
+
+/* ---------- scenario ---------- */
+function seed(){
+  const store = new CapabilityStore();
+  // Derivation-only root for acme.
+  store.issue({ id:'cap-acme-root', tenant:'acme', resource:'acme/records',
+    actions:['read','write','send'], approvalActions:['send'], runtime:false });
+  // Validated child: read+send within customers scope, send stays approval-gated.
+  const d = store.deriveChild('cap-acme-root', {
+    id:'cap-acme-run', tenant:'acme', resource:'acme/records/customers',
+    actions:['read','send'], approvalActions:['send'] });
+  if(!d.ok) throw new Error('seed derivation failed: ' + d.reason);
+  // A separate tenant.
+  store.issue({ id:'cap-globex', tenant:'globex', resource:'globex/records',
+    actions:['read','write'] });
+  return store;
+}
+
+// The RunContext is trusted: this run is bound to tenant acme. The model cannot
+// change it. Each proposal below is what the hostile MODEL emits; the context
+// stays acme throughout.
+const RUN_CTX = { tenant:'acme', principal:'agent-7', run:'run-42' };
+
+// Proposals carry only {resource, verb}. The "tenant" note describes the
+// model's *attempt*, but identity is fixed by RUN_CTX.
+const SCRIPT = [
+  { resource:'acme/records/customers/c-1001', verb:'read',
+    note:'legitimate read, in scope' },
+  { resource:'acme/records/customers/c-1001', verb:'send',
+    note:'in scope but classified — needs approval' },
+  { resource:'globex/records/secret', verb:'read',
+    note:'cross-tenant reach: proposal names a globex resource, but ctx is acme' },
+  { resource:'acme/records/customers/c-1001', verb:'write',
+    note:'over-attenuation: root has write, the run child does not' },
+  { resource:'acme/records/database-secret', verb:'read',
+    note:'prefix confusion: "database-secret" must NOT match scope "records"' },
+  { resource:'acme/records/restricted/c-9', verb:'send',
+    note:'explicit platform deny overrides an otherwise-grantable send' },
+  { resource:{ evil:true }, verb:'read',
+    note:'malformed proposal — resource is an object, must fail closed' },
+];
+
+/* ---------- UI wiring (safe DOM construction, no innerHTML for data) ---------- */
+let store, monitor, cursor, counts, running;
+const $ = s => document.querySelector(s);
+const feed = $('#feed'), capsEl = $('#caps'), ledgerEl = $('#ledger'), emptyEl = $('#empty');
+
+// small helpers for safe element creation
+function el(tag, cls, text){
+  const n = document.createElement(tag);
+  if(cls) n.className = cls;
+  if(text != null) n.textContent = text;   // textContent — never innerHTML for data
+  return n;
+}
+
+function reset(){
+  store = seed();
+  monitor = new ReferenceMonitor(store);
+  cursor = 0; running = false;
+  counts = { total:0, allow:0, appr:0, deny:0 };
+  while(feed.firstChild) feed.removeChild(feed.firstChild);
+  feed.appendChild(emptyEl); emptyEl.style.display = '';
+  renderCaps(); renderCounts();
+  while(ledgerEl.firstChild) ledgerEl.removeChild(ledgerEl.firstChild);
+  $('#step').disabled = false; $('#run').disabled = false;
+}
+
+function renderCounts(){
+  $('#c-total').textContent = counts.total;
+  $('#c-allow').textContent = counts.allow;
+  $('#c-appr').textContent = counts.appr;
+  $('#c-deny').textContent = counts.deny;
+}
+
+function capLine(label, value){
+  const row = el('div', 'cap-line');
+  row.appendChild(el('span', 'lbl', label));
+  row.appendChild(el('span', null, value));
+  return row;
+}
+
+function renderCaps(){
+  while(capsEl.firstChild) capsEl.removeChild(capsEl.firstChild);
+  for(const { cap } of store.caps.values()){
+    const dead = store.isRevoked(cap.id);
+    const box = el('div', 'cap' + (dead ? ' revoked' : ''));
+    const h = el('div', 'cap-h');
+    h.appendChild(el('span', 'cap-id', cap.id));
+    if(!cap.runtime){
+      const s = el('span', 'cap-state'); s.style.color = 'var(--fg-faint)';
+      s.textContent = 'derivation-only'; h.appendChild(s);
+    } else if(dead){
+      h.appendChild(el('span', 'cap-state dead', 'revoked'));
+    } else {
+      const b = el('button', 'revoke-btn', 'revoke');
+      b.dataset.id = cap.id;
+      b.onclick = () => { store.revoke(cap.id); renderCaps();
+        logLedger('revoked', 'capability ' + cap.id + ' revoked by operator'); };
+      h.appendChild(b);
+    }
+    box.appendChild(h);
+    box.appendChild(capLine('tenant', cap.tenant));
+    box.appendChild(capLine('resource', cap.resource + '/*'));
+    box.appendChild(capLine('actions', cap.actions.join(' · ')));
+    if(cap.approvalActions.length) box.appendChild(capLine('approval', cap.approvalActions.join(' · ')));
+    if(cap.parent) box.appendChild(capLine('parent', cap.parent));
+    if(!cap.runtime){
+      const note = capLine('', 'not live at runtime — derives children only');
+      note.querySelector('span:last-child').style.color = 'var(--fg-faint)';
+      box.appendChild(note);
+    }
+    capsEl.appendChild(box);
+  }
+}
+
+function logLedger(state, txt){
+  const row = el('div', 'led');
+  row.appendChild(el('span', 'st ' + state, state));
+  row.appendChild(el('span', 'arrow', '›'));
+  row.appendChild(el('span', 'txt', txt));
+  ledgerEl.appendChild(row);
+  ledgerEl.scrollTop = ledgerEl.scrollHeight;
+}
+
+function describeProposal(p){
+  // safe, human-readable rendering of the proposal, whatever type resource is
+  const r = typeof p.resource === 'string' ? p.resource : JSON.stringify(p.resource);
+  return { verb: p.verb, resource: r };
+}
+
+function renderVerdict(proposal, decision, n){
+  emptyEl.style.display = 'none';
+  const v = decision.verdict;
+  const box = el('div', 'verdict ' + v);
+
+  const top = el('div', 'v-top');
+  const actor = el('span', 'v-actor');
+  actor.appendChild(el('span', 'dot'));
+  actor.appendChild(document.createTextNode('hostile model'));
+  top.appendChild(actor);
+  top.appendChild(el('span', 'v-num', 'proposal #' + n));
+  box.appendChild(top);
+
+  const d = describeProposal(proposal);
+  const act = el('div', 'v-action');
+  act.appendChild(el('span', 'verb', d.verb || '(none)'));
+  act.appendChild(document.createTextNode(' '));
+  act.appendChild(el('span', 'res', d.resource));
+  box.appendChild(act);
+
+  const intent = el('div', 'v-num', 'intent: ' + proposal.note);
+  intent.style.color = 'var(--fg-faint)'; intent.style.marginTop = '2px';
+  box.appendChild(intent);
+
+  const vlabel = v === 'allow' ? 'ALLOW' : v === 'approval' ? 'REQUIRE-APPROVAL' : 'DENY';
+  box.appendChild(el('div', 'v-verdict ' + v, vlabel));
+
+  const reason = el('div', 'v-reason');
+  for(const [k, val, cls] of decision.trace){
+    const line = el('span', 'tr');
+    line.appendChild(el('span', 'k', k.padEnd(11, ' ')));
+    line.appendChild(document.createTextNode(' '));
+    line.appendChild(el('span', cls || '', val));
+    reason.appendChild(line);
+  }
+  box.appendChild(reason);
+
+  feed.appendChild(box);
+  feed.scrollTop = feed.scrollHeight;
+}
+
+function labelOf(p){
+  const r = typeof p.resource === 'string' ? p.resource : '[malformed]';
+  return (p.verb || '?') + ' ' + r;
+}
+
+function stepOnce(){
+  if(cursor >= SCRIPT.length){ $('#step').disabled = true; $('#run').disabled = true; return false; }
+  const proposal = SCRIPT[cursor++];
+  const decision = monitor.authorize(RUN_CTX, proposal);   // TRUSTED ctx + proposal
+  counts.total++;
+  const lbl = labelOf(proposal);
+  if(decision.verdict === 'allow'){ counts.allow++; logLedger('executing', lbl); logLedger('completed', lbl); }
+  else if(decision.verdict === 'approval'){ counts.appr++; logLedger('awaiting', lbl + ' — held for human'); }
+  else { counts.deny++; logLedger('denied', lbl); }
+  renderVerdict(proposal, decision, counts.total);
+  renderCounts();
+  if(cursor >= SCRIPT.length){ $('#step').disabled = true; $('#run').disabled = true; }
+  return true;
+}
+
+$('#step').onclick = () => stepOnce();
+$('#run').onclick = () => {
+  if(running) return; running = true;
+  $('#step').disabled = true; $('#run').disabled = true;
+  const tick = () => {
+    const more = stepOnce();
+    if(more && cursor < SCRIPT.length) setTimeout(tick, 620);
+    else running = false;
+  };
+  tick();
+};
+$('#reset').onclick = reset;
+
+reset();
+</script>
+
