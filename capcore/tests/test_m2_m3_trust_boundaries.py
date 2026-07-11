@@ -87,11 +87,16 @@ def build_broker(secret: str = "LEAKME") -> CredentialBroker:
 # --------------------------------------------------------------------------- #
 
 class MutatingModel:
-    """Hostile model: drives the trusted budget counter negative on every call.
+    """Hostile model: tries every route it can find to corrupt the trusted budget.
 
     Self-capping so a failing run cannot hang CI. The engine is supposed to stop
     this model at `max_steps`; the cap only exists so that when it does NOT, the
     test fails fast instead of looping forever.
+
+    The model does not get to crash the run by probing. A real adversarial
+    adapter would swallow its own failures and keep going, so this one catches
+    everything and records what it managed to touch. `attempts` is the evidence:
+    if the boundary holds, every write is refused and `mutated` stays empty.
     """
 
     HARD_CAP = 20
@@ -99,23 +104,35 @@ class MutatingModel:
     def __init__(self, proposal: Proposal):
         self.proposal = proposal
         self.calls = 0
+        self.mutated = []      # writes that SUCCEEDED. Must stay empty.
+        self.refused = []      # writes that were refused. Evidence of the boundary.
 
-    def next_proposal(self, record):
+    def _probe(self, obj, field, value):
+        try:
+            setattr(obj, field, value)
+        except Exception as exc:
+            self.refused.append((field, type(exc).__name__))
+            return
+        # The write landed. If this ever happens, trusted state is reachable.
+        self.mutated.append((field, value))
+
+    def next_proposal(self, view):
         self.calls += 1
         if self.calls > self.HARD_CAP:
             raise AssertionError(
                 f"engine failed to terminate: model was asked {self.calls} times "
                 f"under a budget that should have stopped it"
             )
-        # The model should not be able to reach trusted state at all. Today it
-        # is handed the live RunRecord, so this write lands on the counter that
-        # both run()'s loop guard and step()'s budget check read.
-        record.steps_taken = -100
+        # Whatever the engine hands us, try to drive the budget counter negative.
+        # Pre-fix this was the live RunRecord and the write landed. Post-fix it is
+        # a frozen ModelView and the write must be refused.
+        self._probe(view, "steps_taken", -100)
+        self._probe(view, "remaining_steps", 10 ** 9)
         return self.proposal
 
 
 def test_model_cannot_mutate_trusted_budget_counter():
-    """A hostile model must not be able to bypass the budget or hang the run."""
+    """A hostile model must not bypass the budget, corrupt state, or hang the run."""
     store = build_store()
     registry, calls = recording_registry()
     engine = ExecutionEngine(ReferenceMonitor(store), store, registry, Budget(1))
@@ -123,14 +140,26 @@ def test_model_cannot_mutate_trusted_budget_counter():
 
     record = engine.run(build_ctx(), model)
 
-    # The budget is 1. At most one action may execute, and the run must end.
+    # 1. No write from untrusted code may land on anything the engine reads.
+    assert model.mutated == [], (
+        f"untrusted model successfully wrote to trusted state: {model.mutated}"
+    )
+    assert model.refused, (
+        "the model's writes were neither refused nor recorded: it was probably "
+        "handed a plain mutable object that silently accepted the assignment"
+    )
+
+    # 2. The budget is 1. At most one action may execute.
     assert len(calls) <= 1, (
         f"budget was 1 but {len(calls)} actions executed: the model corrupted "
         f"steps_taken (final value {record.steps_taken})"
     )
+
+    # 3. The trusted counter is intact and the run terminated.
     assert record.steps_taken >= 0, (
         "trusted counter went negative: untrusted code wrote to trusted state"
     )
+    assert record.state in (RunState.COMPLETED, RunState.ABORTED)
 
 
 # --------------------------------------------------------------------------- #

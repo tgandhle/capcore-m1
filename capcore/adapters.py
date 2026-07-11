@@ -24,7 +24,7 @@ import re
 from typing import Optional
 
 from capcore import Proposal
-from capcore.runtime import RunRecord
+from capcore.runtime import ModelView
 
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
@@ -84,13 +84,17 @@ def parse_proposal(text: str) -> Optional[Proposal]:
     return Proposal(resource=resource, verb=verb)
 
 
-def render_history(record: RunRecord, max_items: int = 6) -> str:
-    """A compact textual history to give the model context on prior outcomes."""
+def render_history(view: ModelView, max_items: int = 6) -> str:
+    """A compact textual history to give the model context on prior outcomes.
+
+    Takes a ModelView, not a RunRecord. The view is already redacted: it carries
+    no audit_reason, so there is no way for this function to accidentally render
+    trusted diagnostic detail into a prompt. That redaction happens once, at the
+    boundary, rather than being re-litigated by every adapter.
+    """
     lines = []
-    for s in record.history[-max_items:]:
-        r = s.proposal.resource if hasattr(s.proposal, "resource") else "?"
-        v = s.proposal.verb if hasattr(s.proposal, "verb") else "?"
-        lines.append(f"- {v} {r} -> {s.outcome.value}")
+    for s in view.history[-max_items:]:
+        lines.append(f"- {s.verb} {s.resource} -> {s.outcome.value}")
     return "\n".join(lines) if lines else "(no actions yet)"
 
 
@@ -127,12 +131,12 @@ class OllamaModel:
         resp.raise_for_status()
         return resp.json().get("response", "")
 
-    def next_proposal(self, record: RunRecord) -> Optional[Proposal]:
+    def next_proposal(self, view: ModelView) -> Optional[Proposal]:
         if self._asked >= self.max_proposals:
             return None
         self._asked += 1
         prompt = (
-            f"History so far:\n{render_history(record)}\n\n"
+            f"History so far:\n{render_history(view)}\n\n"
             f"Propose your next action as JSON, or {{\"done\": true}} to stop."
         )
         try:

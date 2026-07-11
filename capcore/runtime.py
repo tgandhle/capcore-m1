@@ -65,11 +65,85 @@ class StepResult:
 
 @dataclass
 class RunRecord:
-    """Trusted per-run state. The model never touches this object."""
+    """Trusted per-run state. The model never receives this object.
+
+    This is the authoritative record: run state, the budget counter both
+    enforcement checks read, and the full history INCLUDING audit_reason. None of
+    it is model-reachable. Model adapters get a ModelView built by
+    `to_model_view()` below: an immutable, redacted copy.
+
+    Handing this object to a ModelClient was a critical defect. An untrusted
+    adapter could write `record.steps_taken = -100`, and because both the
+    `run()` loop guard and the `step()` budget check read that same field, the
+    model could bypass its budget AND produce a nonterminating run. See
+    tests/test_m2_m3_trust_boundaries.py::test_model_cannot_mutate_trusted_budget_counter.
+    """
     ctx: RunContext
     state: RunState = RunState.CREATED
     steps_taken: int = 0
     history: list[StepResult] = field(default_factory=list)
+
+
+# --------------------------------------------------------------------------- #
+# Model-facing view (untrusted boundary).
+# --------------------------------------------------------------------------- #
+
+@dataclass(frozen=True)
+class ModelStepView:
+    """One past step, as the MODEL is allowed to see it.
+
+    Deliberately excludes `audit_reason`. That field is trusted-only diagnostic
+    detail (which tenant owns a resource, whether a capability exists) and is the
+    same information M1 already withholds from the model via Decision's
+    public_reason/audit_reason split. Leaking it here through the history would
+    reopen that hole by another route: an adversarial model could map the
+    authorization boundary by reading why its prior attempts failed.
+
+    `tool_result` IS included: the model needs the output of its own authorized
+    actions to make progress. Tool results are themselves untrusted data.
+    """
+    verb: str
+    resource: str
+    outcome: StepOutcome
+    tool_result: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ModelView:
+    """Immutable, redacted snapshot handed to a ModelClient.
+
+    A hostile adapter can mutate this all it likes: it is a frozen copy, and the
+    engine never reads it back. Trusted state stays in RunRecord, which the model
+    never sees.
+
+    Note `remaining_steps` is derived, not the raw counter. The model is told how
+    much budget it has left; it is not given the field the engine enforces on.
+    """
+    run_id: str
+    remaining_steps: int
+    history: tuple[ModelStepView, ...] = ()
+
+
+def to_model_view(record: RunRecord, budget: "Budget") -> ModelView:
+    """Build the untrusted model's view of a trusted run record.
+
+    The ONLY channel from trusted run state to a model adapter. Copies, freezes,
+    and redacts. `remaining_steps` is clamped at zero so a model can never see a
+    negative budget even if trusted state is somehow inconsistent.
+    """
+    return ModelView(
+        run_id=record.ctx.run,
+        remaining_steps=max(0, budget.max_steps - record.steps_taken),
+        history=tuple(
+            ModelStepView(
+                verb=s.proposal.verb,
+                resource=s.proposal.resource,
+                outcome=s.outcome,
+                tool_result=s.tool_result,
+            )
+            for s in record.history
+        ),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -119,10 +193,15 @@ class ToolRegistry:
 class ModelClient(Protocol):
     """Produces the next Proposal given the run so far, or None to stop.
 
-    The engine treats every proposal as UNTRUSTED. The model may be a script,
-    a mock, or a real local LLM; the engine does not care.
+    The engine treats every proposal as UNTRUSTED. The model may be a script, a
+    mock, or a real local LLM; the engine does not care.
+
+    A ModelClient receives a ModelView, NOT a RunRecord. This is a trust
+    boundary, not a convenience: a ModelClient implementation is untrusted code
+    (it wraps an untrusted provider), so it must not be able to reach trusted
+    execution state. See RunRecord's docstring for what happened when it could.
     """
-    def next_proposal(self, record: RunRecord) -> Optional[Proposal]: ...
+    def next_proposal(self, view: ModelView) -> Optional[Proposal]: ...
 
 
 class ScriptedModel:
@@ -134,7 +213,7 @@ class ScriptedModel:
         self._proposals = list(proposals)
         self._i = 0
 
-    def next_proposal(self, record: RunRecord) -> Optional[Proposal]:
+    def next_proposal(self, view: ModelView) -> Optional[Proposal]:
         if self._i >= len(self._proposals):
             return None
         p = self._proposals[self._i]
@@ -247,15 +326,32 @@ class ExecutionEngine:
     def run(self, ctx: RunContext, model: ModelClient) -> RunRecord:
         """Drive a full run: pull proposals from the model until it stops or the
         budget is exhausted, stepping each through the trusted pipeline.
+
+        TERMINATION IS STRUCTURAL. The loop is bounded by `range(max_steps)`, a
+        local counter that is never derived from, and never written by, anything
+        the model can reach. The old loop guard read `record.steps_taken`, which
+        was the same field the model could write, so a model that drove it
+        negative made the loop unbounded. Now, even if trusted state were somehow
+        corrupted, this loop cannot iterate more than `max_steps` times.
+
+        `record.steps_taken` is still enforced in step() and still authoritative
+        for the budget verdict. It is no longer the only thing standing between a
+        hostile model and an infinite run.
         """
         record = RunRecord(ctx=ctx, state=RunState.RUNNING)
-        while True:
+
+        for _ in range(self.budget.max_steps):
+            # The budget is still checked against trusted state; the loop ceiling
+            # above is an INDEPENDENT second bound, not a replacement for it.
             if record.steps_taken >= self.budget.max_steps:
                 record.state = RunState.ABORTED
                 break
-            proposal = model.next_proposal(record)
+
+            # The model sees a frozen, redacted copy. Never the record itself.
+            proposal = model.next_proposal(to_model_view(record, self.budget))
             if proposal is None:
                 break
+
             result = self.step(record, proposal)
             if result.outcome == StepOutcome.BUDGET_EXHAUSTED:
                 record.state = RunState.ABORTED
@@ -263,6 +359,13 @@ class ExecutionEngine:
             if result.outcome == StepOutcome.TOOL_ERROR:
                 # already marked FAILED; stop the run
                 break
+        else:
+            # The loop ran to its full ceiling without the model stopping: the
+            # model had more to say than its budget allowed. That is an abort,
+            # not a completion.
+            if record.state == RunState.RUNNING:
+                record.state = RunState.ABORTED
+
         if record.state == RunState.RUNNING:
             record.state = RunState.COMPLETED
         return record
