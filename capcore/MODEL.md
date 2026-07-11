@@ -88,7 +88,7 @@ not all attackers.
 
 ## Post-review fixes (found after the first M1 cut)
 
-Four defects were found in later review and are now fixed and mutation-tested in
+Six defects were found in later review and are now fixed and mutation-tested in
 `test_security_regressions.py`:
 
 8. **Denial reason leaked boundary detail to the model.** `Decision` now splits
@@ -117,6 +117,25 @@ Four defects were found in later review and are now fixed and mutation-tested in
     before comparison; a malformed proposal resource fails closed at the schema
     gate. Internal call sites use a non-raising wrapper (`_covers_safe`) so a
     stored bad scope denies rather than crashing the monitor.
+12. **`*` was permitted in resource segments.** The regex allowed `*`, which the
+    monitor treats as a literal; a future adapter reading it as a wildcard would
+    disagree with the monitor, a bypass. Fixed: `*` is rejected until an explicit
+    wildcard grammar with matching containment algebra exists.
+13. **Malformed mandatory deny policy failed OPEN.** `platform_denies` compared
+    the policy scope with the swallow-errors wrapper, so a policy with an empty
+    or invalid scope silently matched nothing and the action it was meant to deny
+    was ALLOWED, a fail-open in the strongest control in the system. Fixed:
+    `DenyPolicy` validates verb, reason, and scope at construction (raising on
+    malformed input), and `ReferenceMonitor.__init__` revalidates every policy,
+    so a malformed policy fails monitor construction rather than silently
+    disabling a mandatory deny.
+
+Note on the mutation runner: all 13 defects above are individually caught by the
+suite. The runner (`scripts/mutation_check.py`) uses a fresh isolated temp copy
+per mutation, disables bytecode writing, isolates Hypothesis storage, and applies
+a per-mutation timeout (a timeout counts as a harness error, not a caught
+mutation). An earlier runner reused one temp dir and could stall; this one runs
+to completion in about two minutes.
 
 ## Status and open decisions
 
