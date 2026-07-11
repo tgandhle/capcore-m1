@@ -130,7 +130,9 @@ Six defects were found in later review and are now fixed and mutation-tested in
     so a malformed policy fails monitor construction rather than silently
     disabling a mandatory deny.
 
-Note on the mutation runner: all 13 defects above are individually caught by the
+Note on the mutation runner: the 13 defects above, plus two mutations covering
+the principal-binding and run-binding enforcement added with the identity-binding
+feature, are all individually caught by the suite (15 mutations total). The runner
 suite. The runner (`scripts/mutation_check.py`) uses a fresh isolated temp copy
 per mutation, disables bytecode writing, isolates Hypothesis storage, and applies
 a per-mutation timeout (a timeout counts as a harness error, not a caught
@@ -141,11 +143,21 @@ to completion in about two minutes.
 
 Status: **Partial.** Implemented: tenant isolation, union-of-grants, segment
 scope, issue-time attenuation, deny precedence, fail-closed, generic model-facing
-denials, no-derivation-from-revoked-parent. Not yet implemented, honestly marked:
+denials, no-derivation-from-revoked-parent, and principal/run binding. Not yet
+implemented, honestly marked:
 
-- **Principal/run binding.** `RunContext` carries `principal` and `run`, but
-  authorization enforces only `tenant`. The design binds capabilities to tenant,
-  principal, AND run, so this is a design-to-code gap, not merely optional.
+- **Principal/run binding: IMPLEMENTED.** `Capability` has optional `principal`
+  and `run` fields. Authorization matches them against the trusted `RunContext`:
+  a capability that names a principal authorizes only when `ctx.principal` equals
+  it, and likewise for `run`; `None` means unbound on that axis. Binding tightens
+  down the derivation chain (`derive_child` may narrow `None` -> specific but
+  never loosen specific -> `None` or change a bound value). The intended usage:
+  a derivation-only root is tenant-wide (principal=run=None), and the live run
+  capability derived for an execution binds all three. Design note: a capability
+  with principal=run=None is still tenant-wide by construction, which is correct
+  for roots; the guarantee is "a capability is bound to whatever it names," and
+  runtime run-capabilities are expected to name a run. Property-tested that a
+  capability bound to run A never authorizes run B, and the same for principal.
 - **Revocation of existing descendants (cascade).** V1 semantics: revoking a
   capability prevents its direct use and future child derivation; existing
   descendants retain independent validity until explicitly revoked, expired, or
@@ -158,6 +170,11 @@ denials, no-derivation-from-revoked-parent. Not yet implemented, honestly marked
   resources are still stored and passed as strings rather than a dedicated
   immutable `ResourceScope` type, so validation happens at each comparison rather
   than once at construction. Promoting to a real type is the open item.
+- **Runtime run-binding requirement.** Optional fields mean a tenant-wide runtime
+  capability can be constructed. Making the live authorization path *require*
+  that a runtime (non-derivation-only) capability names a run, so tenant-wide
+  runtime authority is impossible, is a reasonable next tightening. Currently the
+  binding is enforced-if-present, not required-on-runtime-caps.
 
 ## Run
 

@@ -35,12 +35,12 @@ CORE_REL = Path("capcore") / "__init__.py"
 PER_MUTATION_TIMEOUT = 120  # seconds; a caught mutation returns well under this
 
 # (name, exact source snippet to find, replacement). `find` must occur exactly
-# once; otherwise the mutation is reported stale. Covers all 13 documented
+# once; otherwise the mutation is reported stale. Covers all 15 documented
 # defects: original seven plus six from hardening review.
 MUTATIONS = [
     ("untrusted_identity_from_proposal",
-     "        tenant = ctx.tenant                 # TRUSTED. Not from proposal.",
-     "        tenant = proposal.resource.split('/')[0]  # BUG"),
+     "            if cap.tenant != ctx.tenant:\n                continue",
+     "            if False:  # BUG: ignore tenant binding (confused deputy)\n                continue"),
     ("missing_action_attenuation",
      "        if not child.actions <= parent.actions:",
      "        if False:  # BUG"),
@@ -77,6 +77,12 @@ MUTATIONS = [
     ("deny_policy_scope_unvalidated",
      "        try:\n            validate_resource(self.scope)\n        except ResourceError as exc:\n            raise ValueError(f\"invalid deny-policy scope: {self.scope!r}\") from exc",
      "        pass  # BUG: skip deny-policy scope validation"),
+    ("principal_binding_ignored",
+     "            if cap.principal is not None and cap.principal != ctx.principal:\n                continue",
+     "            if False:  # BUG: ignore principal binding\n                continue"),
+    ("run_binding_ignored",
+     "            if cap.run is not None and cap.run != ctx.run:\n                continue",
+     "            if False:  # BUG: ignore run binding\n                continue"),
 ]
 
 
