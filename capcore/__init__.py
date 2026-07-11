@@ -50,7 +50,8 @@ def validate_resource(path: str) -> tuple[str, ...]:
       - control characters
       - empty internal segments ("a//b")
       - "." or ".." segments (path traversal)
-      - segments with characters outside [A-Za-z0-9._-*]
+      - segments with characters outside [A-Za-z0-9._-]
+      - '*' (no wildcard grammar yet; treated as literal, so rejected)
 
     Returns the tuple of validated segments. This is the ONLY way scopes and
     resources enter the system; raw strings never reach comparison.
@@ -385,8 +386,27 @@ class DenyPolicy:
     scope: str
     reason: str
 
+    def __post_init__(self):
+        # A mandatory deny policy is the strongest control in the system, so a
+        # malformed one must FAIL CLOSED at construction, never silently vanish
+        # at authorize time. (A prior version compared the scope with a
+        # swallow-errors wrapper, which turned an invalid policy into an
+        # allow-by-omission: exactly the wrong direction for a deny rule.)
+        if not isinstance(self.verb, str) or not self.verb:
+            raise ValueError("deny-policy verb must be a non-empty string")
+        if not isinstance(self.reason, str) or not self.reason:
+            raise ValueError("deny-policy reason must be a non-empty string")
+        try:
+            validate_resource(self.scope)
+        except ResourceError as exc:
+            raise ValueError(f"invalid deny-policy scope: {self.scope!r}") from exc
+
 
 def platform_denies(policies: list[DenyPolicy], resource: str, verb: str) -> Optional[str]:
+    # Policy scopes are validated at construction, so scope_covers here operates
+    # on known-valid scopes. We still guard the RESOURCE (model-supplied) side
+    # via _covers_safe so a malformed proposal resource denies rather than
+    # matching a policy by exception.
     for p in policies:
         if p.verb == verb and _covers_safe(p.scope, resource):
             return p.reason
@@ -406,7 +426,18 @@ class ReferenceMonitor:
 
     def __init__(self, store: CapabilityStore, deny_policies: Optional[list[DenyPolicy]] = None):
         self.store = store
-        self.deny_policies = deny_policies or []
+        policies = deny_policies or []
+        # Revalidate every policy at construction so an object that bypassed the
+        # dataclass validation (e.g. constructed via object.__new__ or a subclass)
+        # still cannot disable a mandatory deny by being malformed. Fail closed:
+        # refuse to build the monitor rather than run with a silently-dead policy.
+        for p in policies:
+            if not isinstance(p.verb, str) or not p.verb:
+                raise ValueError("deny-policy verb must be a non-empty string")
+            if not isinstance(p.reason, str) or not p.reason:
+                raise ValueError("deny-policy reason must be a non-empty string")
+            validate_resource(p.scope)  # raises ResourceError on invalid scope
+        self.deny_policies = policies
 
     def authorize(self, ctx: RunContext, proposal) -> Decision:
         """Return the full Decision (public + audit detail). The runtime is

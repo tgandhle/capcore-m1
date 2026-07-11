@@ -198,6 +198,50 @@ def test_asterisk_rejected_until_wildcard_grammar():
         store.issue(Capability("c", "t", "t/*", frozenset({"read"})))
 
 
+# --------------------------------------------------------------------------- #
+# Defect: a malformed mandatory deny policy failed OPEN (was silently ignored),
+# allowing an action the policy was meant to deny.
+# Fix: deny policies validate at construction and at monitor construction; a
+# malformed policy raises rather than vanishing.
+# --------------------------------------------------------------------------- #
+
+def test_malformed_deny_policy_rejected_at_construction():
+    """Empty verb/reason or an invalid/traversal/wildcard scope must raise when
+    the DenyPolicy is built, not silently disable the rule.
+    """
+    bad_policies = [
+        ("", "acme/records", "blocked"),                    # empty verb
+        ("send", "acme/records", ""),                       # empty reason
+        ("send", "", "blocked"),                            # empty scope
+        ("send", "acme/records/*", "blocked"),              # wildcard scope
+        ("send", "acme/records/../restricted", "blocked"),  # traversal scope
+        ("send", "a\\b", "blocked"),                        # backslash
+    ]
+    for verb, scope, reason in bad_policies:
+        with pytest.raises(ValueError):
+            DenyPolicy(verb, scope, reason)
+
+
+def test_malformed_deny_policy_cannot_fail_open():
+    """The concrete fail-open the review reproduced: a policy meant to deny a
+    send must never allow it by being malformed. Since construction now raises,
+    the monitor can never be built with a dead mandatory policy.
+    """
+    store = CapabilityStore()
+    store.issue(Capability("c", "acme", "acme/records",
+                           frozenset({"read", "send"})))
+    # Attempting to install a malformed deny policy fails before any authorize
+    # call can slip through.
+    with pytest.raises(ValueError):
+        DenyPolicy("send", "acme/records/*", "blocked")
+    # A well-formed policy denies as expected (control case).
+    good = DenyPolicy("send", "acme/records/restricted", "blocked")
+    mon = ReferenceMonitor(store, deny_policies=[good])
+    ctx = RunContext("acme", "p", "r")
+    d = mon.authorize(ctx, Proposal("acme/records/restricted/x", "send"))
+    assert d.verdict == Verdict.DENY
+
+
 def test_empty_scope_does_not_cover_everything():
     """An empty scope must be rejected, not treated as a wildcard."""
     assert not is_valid_resource("")
