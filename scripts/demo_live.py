@@ -54,7 +54,7 @@ def build_engine(pre_execute_hook=None, budget=8):
     reg = ToolRegistry()
     reg.register("read", lambda p: f"[data for {p.resource}]")
     reg.register("send", lambda p: f"[sent {p.resource}]")
-    engine = ExecutionEngine(mon, store, reg, Budget(budget),
+    engine = ExecutionEngine(mon, reg, Budget(budget),
                              pre_execute_hook=pre_execute_hook)
     ctx = RunContext(TENANT, PRINCIPAL, RUN)
     return engine, store, ctx

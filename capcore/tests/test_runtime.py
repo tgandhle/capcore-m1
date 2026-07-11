@@ -26,7 +26,7 @@ def build(budget_steps=10, pre_execute_hook=None, tools=None):
                            principal="p1", run="r1"))
     mon = ReferenceMonitor(store)
     registry = tools or ToolRegistry()
-    engine = ExecutionEngine(mon, store, registry, Budget(budget_steps),
+    engine = ExecutionEngine(mon, registry, Budget(budget_steps),
                              pre_execute_hook=pre_execute_hook)
     ctx = RunContext("acme", "p1", "r1")
     return engine, store, ctx, registry

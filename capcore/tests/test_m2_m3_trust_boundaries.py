@@ -135,7 +135,7 @@ def test_model_cannot_mutate_trusted_budget_counter():
     """A hostile model must not bypass the budget, corrupt state, or hang the run."""
     store = build_store()
     registry, calls = recording_registry()
-    engine = ExecutionEngine(ReferenceMonitor(store), store, registry, Budget(1))
+    engine = ExecutionEngine(ReferenceMonitor(store), registry, Budget(1))
     model = MutatingModel(Proposal("acme/api/x", "read"))
 
     record = engine.run(build_ctx(), model)
@@ -171,7 +171,7 @@ def test_missing_tool_is_not_reported_as_executed():
     """Dispatching an authorized verb with no registered tool executed nothing."""
     store = build_store()
     engine = ExecutionEngine(
-        ReferenceMonitor(store), store, ToolRegistry(), Budget(2)
+        ReferenceMonitor(store), ToolRegistry(), Budget(2)
     )
     record = RunRecord(ctx=build_ctx(), state=RunState.RUNNING)
 
@@ -197,35 +197,45 @@ def test_missing_tool_is_not_reported_as_executed():
 # Fix: ExecutionEngine(monitor, tools, budget); self.store = monitor.store.
 # --------------------------------------------------------------------------- #
 
-def test_engine_store_must_be_the_monitors_store():
-    """The engine must not hold a capability store the monitor does not read."""
-    store_a = build_store()   # the monitor's store (authoritative)
-    store_b = build_store()   # a decoy the engine is handed
-    monitor = ReferenceMonitor(store_a)
+def test_revoking_through_engine_store_actually_stops_the_action():
+    """After the fix, engine.store IS the monitor's store, so a hook that revokes
+    through it affects the very authorization the engine checks.
+
+    Pre-fix, this same revocation could be aimed at a decoy store the engine held
+    while the monitor read a different one, and the action executed regardless.
+    Post-fix there is only one store, so the revoke lands where it matters and the
+    execute-time re-check denies. The tool never runs.
+
+    This is the positive counterpart to test_engine_rejects_a_second_store: that
+    one proves you cannot create the divergence; this one proves the surviving
+    single-store path enforces revocation.
+    """
+    store = build_store()
+    monitor = ReferenceMonitor(store)
     registry, calls = recording_registry()
 
     def revoke_via_engine(engine, proposal):
-        # A caller reasonably believes this affects authorization. It does not.
         engine.store.revoke("cap-1")
 
     engine = ExecutionEngine(
-        monitor, store_b, registry, Budget(2), pre_execute_hook=revoke_via_engine
+        monitor, registry, Budget(2), pre_execute_hook=revoke_via_engine
     )
     record = RunRecord(ctx=build_ctx(), state=RunState.RUNNING)
 
-    engine.step(record, Proposal("acme/api/x", "read"))
+    result = engine.step(record, Proposal("acme/api/x", "read"))
 
     assert calls == [], (
         "the capability was revoked through engine.store before execution, but "
-        "the action still ran: engine.store is not the authoritative store"
+        "the action still ran"
     )
+    assert result.outcome == StepOutcome.REVOKED_RACE
 
 
 def test_engine_store_identity_invariant():
     """After the fix, the engine must expose exactly the monitor's store."""
     store = build_store()
     monitor = ReferenceMonitor(store)
-    engine = ExecutionEngine(monitor, store, ToolRegistry(), Budget(1))
+    engine = ExecutionEngine(monitor, ToolRegistry(), Budget(1))
 
     assert engine.store is engine.monitor.store
     assert engine.monitor.store is store
@@ -313,7 +323,7 @@ def test_engine_cannot_distinguish_model_completion_from_model_failure():
     """
     store = build_store()
     engine = ExecutionEngine(
-        ReferenceMonitor(store), store, ToolRegistry(), Budget(3)
+        ReferenceMonitor(store), ToolRegistry(), Budget(3)
     )
 
     record = engine.run(build_ctx(), UnparseableModel())
@@ -337,7 +347,7 @@ def test_ollama_adapter_does_not_swallow_provider_errors():
 
     store = build_store()
     engine = ExecutionEngine(
-        ReferenceMonitor(store), store, ToolRegistry(), Budget(3)
+        ReferenceMonitor(store), ToolRegistry(), Budget(3)
     )
 
     record = engine.run(build_ctx(), BrokenOllama())

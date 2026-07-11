@@ -235,16 +235,47 @@ class ExecutionEngine:
     def __init__(
         self,
         monitor: ReferenceMonitor,
-        store: CapabilityStore,
         tools: ToolRegistry,
         budget: Budget,
         pre_execute_hook: PreExecuteHook = None,
     ):
+        """The engine authorizes exclusively through `monitor`, and its capability
+        store is, by construction, the monitor's store.
+
+        The engine used to take a separate `store` argument. That permitted a
+        divergent state where `monitor` authorized against store A while
+        `engine.store` (used by hooks and any revocation path) pointed at store B.
+        Both authorization checks read `monitor.store`, so revoking `engine.store`
+        was a silent no-op and the action executed anyway. The store was a
+        parallel reference with no authority that looked like it had some.
+
+        There is now no way to supply a second store. `self.store` is exactly the
+        monitor's store, so anything that revokes through `engine.store` revokes
+        the store the monitor actually reads. See
+        tests/test_m2_m3_trust_boundaries.py::test_engine_store_must_be_the_monitors_store.
+        """
         self.monitor = monitor
-        self.store = store
+        self.store = monitor.store   # the ONLY capability store; not a copy, not a second ref
         self.tools = tools
         self.budget = budget
         self._pre_execute_hook = pre_execute_hook
+
+        # Validate at construction so misuse fails closed HERE, not deep in a run.
+        # Removing the old `store` parameter means an old-style call
+        # ExecutionEngine(monitor, store, tools, budget) would otherwise bind
+        # `store` into `tools` and `tools` into `budget` and construct silently,
+        # surfacing only as a confusing AttributeError mid-run. Reject that now.
+        if not isinstance(monitor, ReferenceMonitor):
+            raise TypeError("monitor must be a ReferenceMonitor")
+        if not isinstance(tools, ToolRegistry):
+            raise TypeError(
+                "tools must be a ToolRegistry; the engine no longer takes a "
+                "separate store argument (it derives store from monitor)"
+            )
+        if not isinstance(budget, Budget):
+            raise TypeError("budget must be a Budget")
+        if pre_execute_hook is not None and not callable(pre_execute_hook):
+            raise TypeError("pre_execute_hook must be callable or None")
 
     def _authorize(self, ctx: RunContext, proposal: Proposal) -> Decision:
         return self.monitor.authorize(ctx, proposal)
