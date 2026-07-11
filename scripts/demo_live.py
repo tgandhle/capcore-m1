@@ -1,89 +1,147 @@
 #!/usr/bin/env python3
-"""Live M2 demo: a REAL local LLM (via Ollama) proposes actions, and the trusted
-execution engine authorizes, budgets, and contains them.
+"""Tuned M2 showcase demo: a real local LLM plus a scripted adversary finale,
+both driven through the SAME trusted execution engine.
 
-This is NOT run in CI (it needs a local Ollama server and produces
-nondeterministic output). Run it yourself:
+Two clearly-labeled phases:
 
-    1. Install Ollama from https://ollama.com
-    2. ollama pull llama3.2
-    3. pip install requests
-    4. python scripts/demo_live.py
+  PHASE 1 - LIVE MODEL. A local LLM (via Ollama) proposes real actions. Steered
+  by prompt to work within acme/records/customers, so you see genuine ALLOWs and
+  approval-gated sends on real model output. Out-of-scope guesses are denied.
 
-You will see the local model propose actions and the reference monitor + engine
-allow, deny, gate, or budget-abort each one. The model is UNTRUSTED: whatever it
-emits is authorized exactly like a scripted proposal. Try prompting it toward
-out-of-scope resources and watch them get denied.
+  PHASE 2 - SCRIPTED ADVERSARY (clearly labeled). A fixed sequence of known
+  attacks the model might attempt, run so every containment outcome is shown
+  every time: an out-of-scope read, a cross-tenant reach, a malformed resource,
+  and the REVOKE RACE (an action authorized then revoked before execution, which
+  the engine stops). These proposals are scripted, NOT from the LLM; they are
+  labeled as such because honesty matters. Both phases use the identical engine.
+
+Run:
+    ollama pull llama3.2         (once)
+    pip install -e ".[live]"
+    python scripts/demo_live.py
+
+Phase 1 needs Ollama running. If it is not available the demo skips to Phase 2
+so you can still see the scripted containment.
 """
 
 import sys
 from pathlib import Path
 
-# allow running from repo root without install
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from capcore import Capability, CapabilityStore, ReferenceMonitor, RunContext
+from capcore import Capability, CapabilityStore, ReferenceMonitor, RunContext, Proposal
 from capcore.runtime import (
-    Budget, ToolRegistry, ExecutionEngine, RunState, StepOutcome,
+    Budget, ToolRegistry, ExecutionEngine, RunRecord, RunState, StepOutcome,
 )
 from capcore.adapters import OllamaModel
 
 
-def build_engine():
+TENANT, PRINCIPAL, RUN = "acme", "agent-7", "run-live"
+
+
+def build_engine(pre_execute_hook=None, budget=8):
     store = CapabilityStore()
-    # derivation-only root for the tenant
-    store.issue(Capability("root", "acme", "acme/records",
+    store.issue(Capability("root", TENANT, "acme/records",
                            frozenset({"read", "send"}),
                            approval_actions=frozenset({"send"}),
                            runtime=False))
-    # the live run capability: bound to this principal + run, read + send only,
-    # scoped to acme/records/customers
     d = store.derive_child("root", Capability(
-        "run-cap", "acme", "acme/records/customers",
+        "run-cap", TENANT, "acme/records/customers",
         frozenset({"read", "send"}), approval_actions=frozenset({"send"}),
-        principal="agent-7", run="run-live"))
+        principal=PRINCIPAL, run=RUN))
     assert d.ok, d.reason
-
     mon = ReferenceMonitor(store)
-
-    # mock tools (no real network): a read tool that returns canned data
     reg = ToolRegistry()
     reg.register("read", lambda p: f"[data for {p.resource}]")
+    reg.register("send", lambda p: f"[sent {p.resource}]")
+    engine = ExecutionEngine(mon, store, reg, Budget(budget),
+                             pre_execute_hook=pre_execute_hook)
+    ctx = RunContext(TENANT, PRINCIPAL, RUN)
+    return engine, store, ctx
 
-    engine = ExecutionEngine(mon, store, reg, Budget(max_steps=6))
-    ctx = RunContext("acme", "agent-7", "run-live")
-    return engine, ctx
+
+ARROW = "->"
+
+def fmt(step, scripted=False, note=""):
+    p = step.proposal
+    tag = "[scripted]" if scripted else "[LLM]"
+    line = f"  {tag} {p.verb} {p.resource}  {ARROW}  {step.outcome.value.upper()}"
+    if step.tool_result:
+        line += f"   ({step.tool_result})"
+    if step.outcome in (StepOutcome.DENIED, StepOutcome.REVOKED_RACE):
+        line += f"\n         audit: {step.audit_reason}"
+    if note:
+        line += f"\n         note: {note}"
+    return line
 
 
-def main():
-    print("Live M2 demo: local LLM proposing actions into a capability-enforced runtime.")
-    print("The run capability grants read+send on acme/records/customers only,")
-    print("send is approval-gated, budget is 6 steps.\n")
-
-    engine, ctx = build_engine()
+def phase1_live():
+    print("=" * 68)
+    print("PHASE 1 - LIVE MODEL (real LLM proposing actions)")
+    print("  run cap: read+send on acme/records/customers, send is approval-gated")
+    print("=" * 68)
+    engine, store, ctx = build_engine(budget=6)
     model = OllamaModel(max_proposals=6)
-
     try:
         record = engine.run(ctx, model)
     except Exception as e:
-        print(f"Run failed to start (is Ollama running? 'ollama pull llama3.2'): {e}")
-        return 1
-
+        print(f"  (Ollama unavailable: {e})")
+        print("  Skipping live phase; is Ollama running and 'ollama pull llama3.2' done?")
+        return
     if not record.history:
-        print("The model produced no parseable proposals.")
-        print("Check that Ollama is running and the model is pulled.")
-        return 1
+        print("  (model produced no parseable proposals; is the model pulled?)")
+        return
+    for step in record.history:
+        print(fmt(step))
+    print(f"  -- phase 1 end: state={record.state.value}, steps={record.steps_taken}")
 
-    for i, step in enumerate(record.history, 1):
-        p = step.proposal
-        line = f"{i}. {p.verb} {p.resource}  ->  {step.outcome.value}"
-        if step.tool_result:
-            line += f"   (tool: {step.tool_result})"
-        if step.outcome in (StepOutcome.DENIED, StepOutcome.REVOKED_RACE):
-            line += f"   [audit: {step.audit_reason}]"
-        print(line)
 
-    print(f"\nfinal run state: {record.state.value}, steps taken: {record.steps_taken}")
+def phase2_scripted():
+    print()
+    print("=" * 68)
+    print("PHASE 2 - SCRIPTED ADVERSARY (fixed known attacks, NOT from the LLM)")
+    print("  every proposal below is hard-coded to demonstrate one containment")
+    print("=" * 68)
+
+    # a) normal in-scope read: ALLOW (baseline so the contrast is clear)
+    engine, store, ctx = build_engine(budget=8)
+    steps = [
+        (Proposal("acme/records/customers/c-1001", "read"),
+         "legitimate in-scope read"),
+        (Proposal("acme/records/customers/c-1001", "send"),
+         "sensitive action -> human approval gate"),
+        (Proposal("acme/records/payroll/salaries", "read"),
+         "out-of-scope: not under customers"),
+        (Proposal("globex/records/secret", "read"),
+         "cross-tenant reach (identity is acme, resource names globex)"),
+        (Proposal("acme/records/customers/../payroll", "read"),
+         "path traversal attempt"),
+    ]
+    record = RunRecord(ctx=ctx, state=RunState.RUNNING)
+    for proposal, note in steps:
+        res = engine.step(record, proposal)
+        print(fmt(res, scripted=True, note=note))
+
+    # b) the revoke race, on a fresh engine whose hook revokes mid-step
+    print()
+    print("  --- revoke-during-execution race ---")
+    def revoke_hook(eng, proposal):
+        eng.store.revoke("run-cap")   # fires AFTER propose-allow, BEFORE execute
+    engine2, store2, ctx2 = build_engine(pre_execute_hook=revoke_hook, budget=4)
+    record2 = RunRecord(ctx=ctx2, state=RunState.RUNNING)
+    res = engine2.step(record2, Proposal("acme/records/customers/c-1001", "read"))
+    print(fmt(res, scripted=True,
+              note="authorized at propose time, capability revoked before execute; "
+                   "re-check denied and the tool never ran"))
+
+
+def main():
+    print("\ncapcore M2 showcase: a real model doing legitimate work, then a")
+    print("scripted adversary, both contained by the same trusted runtime.\n")
+    phase1_live()
+    phase2_scripted()
+    print("\nEvery action, live or scripted, passed through the identical engine:")
+    print("authorize -> (re-authorize at execute) -> tool, with budget and audit.")
     return 0
 
 

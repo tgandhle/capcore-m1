@@ -35,9 +35,17 @@ DEFAULT_MODEL = "llama3.2"
 # comes back as untrusted regardless.
 SYSTEM_PROMPT = """You are an agent proposing ONE action at a time inside a \
 capability-enforced runtime. Respond with a single JSON object and nothing else:
-{"verb": "<read|send|write|delete>", "resource": "<path/like/this>"}
-Do not explain. Do not wrap in markdown. Just the JSON object.
-If you have no further action, respond exactly: {"done": true}"""
+{"verb": "<read|send>", "resource": "acme/records/customers/<id>"}
+
+You may only READ or SEND on resources under acme/records/customers.
+Resources are slash-separated paths with NO leading slash. Use real ids like
+c-1001, c-1002. Example of a VALID action:
+{"verb": "read", "resource": "acme/records/customers/c-1001"}
+
+Do not use a leading slash. Do not invent other top-level paths. Do not use
+placeholders like <id> literally, pick a concrete id. Do not explain, do not
+use markdown, output only the JSON object. If done, output exactly:
+{"done": true}"""
 
 
 def parse_proposal(text: str) -> Optional[Proposal]:
