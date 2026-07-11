@@ -310,14 +310,35 @@
       otherwise-valid allow or approval, demonstrating deny > approval > allow.
    ========================================================================= */
 
-/* ---------- resource scope: segment-aware containment ---------- */
-// Split on "/", drop empty trailing segment. "acme/records/" -> ["acme","records"]
-function segs(path){ return String(path).split('/').filter(s => s.length > 0); }
+/* ---------- resource scope: validated, segment-aware containment ---------- */
+// Validate and split a resource path. Rejects (returns null) empty input,
+// "."/".." traversal, empty internal segments, backslashes, percent-encoding,
+// control characters, and "*" (no wildcard grammar yet). Mirrors the Python
+// validate_resource so the demo and core agree.
+const _SEG_RE = /^[A-Za-z0-9._\-]+$/;
+function validateResource(path){
+  if(typeof path !== 'string' || path.length === 0) return null;
+  if(path.indexOf('\\') !== -1) return null;
+  if(path.indexOf('%') !== -1) return null;
+  for(const ch of path){ const c = ch.charCodeAt(0); if(c < 0x20 || c === 0x7F) return null; }
+  let raw = path.split('/');
+  if(raw.length && raw[raw.length-1] === '') raw = raw.slice(0, -1);
+  const out = [];
+  for(const s of raw){
+    if(s === '' || s === '.' || s === '..') return null;
+    if(!_SEG_RE.test(s)) return null;
+    out.push(s);
+  }
+  return out.length ? out : null;
+}
+function isValidResource(path){ return validateResource(path) !== null; }
+// segs returns [] for invalid input so callers fail closed on cover checks.
+function segs(path){ return validateResource(path) || []; }
 // Does scope cover resource? Every scope segment must equal the resource's
-// segment at the same position. "acme/data" covers "acme/data/x" but NOT
-// "acme/database" (segment "data" !== "database").
+// segment at the same position. Invalid scope or resource => no cover.
 function scopeCovers(scope, resource){
-  const s = segs(scope), r = segs(resource);
+  const s = validateResource(scope), r = validateResource(resource);
+  if(s === null || r === null) return false;
   if(s.length > r.length) return false;
   for(let i = 0; i < s.length; i++){ if(s[i] !== r[i]) return false; }
   return true;
@@ -341,13 +362,21 @@ function Capability(spec){
 class CapabilityStore{
   constructor(){ this.caps = new Map(); }
 
-  // Issue a ROOT capability. Fails closed on duplicate id.
-  issue(spec){
+  // Issue a ROOT capability. Rejects a child-shaped cap (parent set), a
+  // duplicate id, or an invalid resource. Mirrors Python issue_root.
+  issueRoot(spec){
+    if(spec.parent != null)
+      throw new StoreError('root capability must not specify a parent; use deriveChild()');
+    if(!isValidResource(spec.resource))
+      throw new StoreError('capability resource is not a valid scope: ' + spec.resource);
     if(this.caps.has(spec.id)) throw new StoreError('duplicate capability id: ' + spec.id);
     const c = Capability(spec);
     this.caps.set(c.id, { cap: c, revoked: false });
     return c.id;
   }
+
+  // Deprecated alias for issueRoot, kept so existing demo code works.
+  issue(spec){ return this.issueRoot(spec); }
 
   // Derive a CHILD from a parent, validating child <= parent on every axis.
   // Returns {ok:true,id} or {ok:false,reason}. This is where attenuation is
@@ -355,6 +384,9 @@ class CapabilityStore{
   deriveChild(parentId, childSpec){
     const pe = this.caps.get(parentId);
     if(!pe) return { ok:false, reason:'parent does not exist' };
+    // A revoked parent is dead as an authority source, including for deriving
+    // new children. Mirrors the Python core (derive_child).
+    if(this.isRevoked(parentId)) return { ok:false, reason:'parent is revoked' };
     const p = pe.cap;
     if(this.caps.has(childSpec.id)) return { ok:false, reason:'duplicate capability id' };
     if(childSpec.tenant !== p.tenant)

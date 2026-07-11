@@ -81,11 +81,14 @@ Each maps to at least one failing test under mutation, and this is reproducible:
 core, runs the suite, and asserts every mutation is caught (exit non-zero if any
 survives). A passing suite means the
 core resists these specific attacks; it does not mean the core resists all
-attacks. The attacker model is BUILD.md Sec. 0.5 M1: hostile model output only.
+attacks. The attacker model is M1: hostile model output only (the model emits
+arbitrary proposed actions; the runtime host, the human reviewer, and the audit
+store are trusted). A passing suite means containment holds against that attacker,
+not all attackers.
 
 ## Post-review fixes (found after the first M1 cut)
 
-Two defects were found in later review and are now fixed and mutation-tested in
+Four defects were found in later review and are now fixed and mutation-tested in
 `test_security_regressions.py`:
 
 8. **Denial reason leaked boundary detail to the model.** `Decision` now splits
@@ -129,10 +132,13 @@ denials, no-derivation-from-revoked-parent. Not yet implemented, honestly marked
   descendants retain independent validity until explicitly revoked, expired, or
   invalidated by policy. Cascade revocation is deferred pending a concrete
   containment requirement. This is a deliberate `[DECISION]`, not an oversight.
-- **Canonical resource type.** Resources are validated as non-empty strings and
-  compared segment-wise, but there is no canonicalization pass rejecting `.`,
-  `..`, encoded separators, or ambiguous wildcard forms. Real hardening, still
-  open.
+- **Canonical resource type.** Resources are now validated (`validate_resource`
+  rejects empty input, `.`/`..` traversal, empty internal segments, backslashes,
+  percent-encoding, control characters, and `*` until a wildcard grammar exists)
+  and compared as canonical segment tuples. The remaining limitation is narrower:
+  resources are still stored and passed as strings rather than a dedicated
+  immutable `ResourceScope` type, so validation happens at each comparison rather
+  than once at construction. Promoting to a real type is the open item.
 
 ## Run
 
