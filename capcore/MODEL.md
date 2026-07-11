@@ -176,9 +176,47 @@ implemented, honestly marked:
   runtime authority is impossible, is a reasonable next tightening. Currently the
   binding is enforced-if-present, not required-on-runtime-caps.
 
+## M2: the trusted execution loop (`capcore/runtime.py`)
+
+M1 is the decision function; M2 is the loop that uses it. `ExecutionEngine`
+drives a run through a trusted state machine (`RunRecord`, `RunState`), enforces
+a per-run `Budget`, and dispatches authorized actions to a `ToolRegistry`. The
+model is abstracted behind `ModelClient`, so the same engine runs against a
+deterministic `ScriptedModel` (all tests, CI) or a real local LLM (`OllamaModel`
+in `capcore/adapters.py`). New security properties, all tested against a scripted
+model so they are reproducible:
+
+- **Trusted state.** Run state lives in `RunRecord`, not in anything the model
+  controls.
+- **Double authorization (revoke race).** Each action is authorized at propose
+  time AND re-authorized immediately before execution. If a capability is revoked
+  in between, the execute-time check denies and the action does not run on a
+  stale authorization. Mutation-tested (`revoke_race_reexecute_skipped`).
+- **Budget.** A run cannot exceed `max_steps`; an exhausted budget aborts the run
+  and denies further actions, and denied attempts count against the budget so a
+  hostile model cannot burn unlimited probes. Enforced at both the run-loop and
+  step level (defense in depth). Mutation-tested (`budget_not_enforced`).
+- **Tool boundary.** Only ALLOWed actions reach a tool; denied and
+  approval-gated actions never touch one. A tool that raises fails the run
+  cleanly (state FAILED) rather than crashing the engine.
+
+The real-LLM path (`OllamaModel`, `scripts/demo_live.py`) is deliberately NOT in
+CI: it needs a local Ollama server and produces nondeterministic output. Its
+PARSING logic (`parse_proposal`) is unit-tested with fixed strings; the live
+network call is verified by running the demo locally. This keeps the security
+properties deterministic and CI-safe while still wiring in a genuine model: the
+LLM's outputs are untrusted and pass through the identical trusted pipeline as a
+scripted proposal.
+
 ## Run
 
 ```
-pip install hypothesis pytest
-python -m pytest capcore/tests/ -v
+pip install -e ".[test]"
+python -m pytest
+python scripts/mutation_check.py      # all 17 mutations must be caught
+
+# live demo (local LLM), not part of CI:
+#   install Ollama, then: ollama pull llama3.2
+pip install -e ".[live]"
+python scripts/demo_live.py
 ```

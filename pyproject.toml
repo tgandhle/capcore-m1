@@ -16,6 +16,11 @@ test = [
     "pytest>=8.0",
     "hypothesis>=6.0",
 ]
+# The live LLM path (Ollama adapter) needs requests. It is NOT required for the
+# test suite or CI, which never make network calls.
+live = [
+    "requests>=2.28",
+]
 
 [tool.setuptools]
 packages = ["capcore", "capcore.tests"]

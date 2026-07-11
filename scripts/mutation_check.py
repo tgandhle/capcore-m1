@@ -35,7 +35,7 @@ CORE_REL = Path("capcore") / "__init__.py"
 PER_MUTATION_TIMEOUT = 120  # seconds; a caught mutation returns well under this
 
 # (name, exact source snippet to find, replacement). `find` must occur exactly
-# once; otherwise the mutation is reported stale. Covers all 15 documented
+# once; otherwise the mutation is reported stale. Covers all 17 documented
 # defects: original seven plus six from hardening review.
 MUTATIONS = [
     ("untrusted_identity_from_proposal",
@@ -83,6 +83,15 @@ MUTATIONS = [
     ("run_binding_ignored",
      "            if cap.run is not None and cap.run != ctx.run:\n                continue",
      "            if False:  # BUG: ignore run binding\n                continue"),
+    # --- M2 runtime mutations (target capcore/runtime.py) ---
+    ("revoke_race_reexecute_skipped",
+     "        second = self._authorize(record.ctx, proposal)\n        if second.verdict != Verdict.ALLOW:",
+     "        second = first  # BUG: skip execute-time re-authorization (revoke race)\n        if second.verdict != Verdict.ALLOW:",
+     "capcore/runtime.py"),
+    ("budget_not_enforced",
+     "        if record.steps_taken >= self.budget.max_steps:\n            record.state = RunState.ABORTED\n            res = StepResult(StepOutcome.BUDGET_EXHAUSTED, proposal,",
+     "        if False:  # BUG: never enforce budget\n            record.state = RunState.ABORTED\n            res = StepResult(StepOutcome.BUDGET_EXHAUSTED, proposal,",
+     "capcore/runtime.py"),
 ]
 
 
@@ -133,16 +142,24 @@ def main() -> int:
             return 2
 
     survivors, stale, errors = [], [], []
-    for name, find, replace in MUTATIONS:
-        if original.count(find) != 1:
+    # cache source of each target file we mutate
+    src_cache: dict[str, str] = {}
+    for mut in MUTATIONS:
+        name, find, replace = mut[0], mut[1], mut[2]
+        target_rel = Path(mut[3]) if len(mut) > 3 else CORE_REL
+        key = str(target_rel)
+        if key not in src_cache:
+            src_cache[key] = (ROOT / target_rel).read_text(encoding="utf-8")
+        target_src = src_cache[key]
+        if target_src.count(find) != 1:
             stale.append(name)
-            print(f"[stale]   {name}: anchor found {original.count(find)} times (expected 1)")
+            print(f"[stale]   {name}: anchor found {target_src.count(find)} times (expected 1)")
             continue
         # a FRESH copy per mutation: no shared state between mutants
         with tempfile.TemporaryDirectory(prefix=f"capcore-mut-{name}-") as td:
             tmp = Path(td)
             fresh_copy(tmp)
-            (tmp / CORE_REL).write_text(original.replace(find, replace, 1), encoding="utf-8")
+            (tmp / target_rel).write_text(target_src.replace(find, replace, 1), encoding="utf-8")
             try:
                 caught = not run_suite(tmp)
             except HarnessError as e:
