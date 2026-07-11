@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "M1 capability core: trusted authorization decision path for a capability-enforced agent runtime"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = "MIT"
 dependencies = []
 
 [project.optional-dependencies]

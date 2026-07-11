@@ -49,6 +49,7 @@ MODEL.md records what is implemented and what is designed-but-not-implemented
 stays Partial until the full M1 milestone is complete. A passing suite means the
 core resists the specific attacks it is tested against, not all attacks.
 
-Pairs with the browser demo (`reference-monitor-demo.html`), the same semantics
-rendered for viewing.
-```
+Pairs with the browser demo (`reference-monitor-demo.html`), a browser
+visualization of the same intended authorization scenarios. The demo's
+JavaScript core mirrors the Python semantics but is not yet executed by an
+automated parity test (a Node-based parity check is a known next step).
