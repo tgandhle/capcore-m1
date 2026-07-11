@@ -1,5 +1,7 @@
 # capcore - M1 capability core
 
+[![CI](https://github.com/tgandhle/capcore-m1/actions/workflows/ci.yml/badge.svg)](https://github.com/tgandhle/capcore-m1/actions/workflows/ci.yml)
+
 **Status: Partial.** The trusted authorization decision path for a
 capability-enforced agent runtime. Given a trusted `RunContext` (identity) and an
 untrusted model `Proposal`, the `ReferenceMonitor` returns ALLOW /
