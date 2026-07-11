@@ -185,6 +185,19 @@ def test_resource_traversal_rejected():
     assert d.verdict == Verdict.DENY
 
 
+def test_asterisk_rejected_until_wildcard_grammar():
+    """'*' is not a permitted resource character: the monitor treats it as a
+    literal, and allowing it invites a wildcard-interpretation bypass in a
+    future adapter. Reject until an explicit wildcard grammar exists.
+    """
+    assert not is_valid_resource("acme/*")
+    assert not is_valid_resource("acme/*/secret")
+    assert not is_valid_resource("*")
+    store = CapabilityStore()
+    with pytest.raises(StoreError):
+        store.issue(Capability("c", "t", "t/*", frozenset({"read"})))
+
+
 def test_empty_scope_does_not_cover_everything():
     """An empty scope must be rejected, not treated as a wildcard."""
     assert not is_valid_resource("")

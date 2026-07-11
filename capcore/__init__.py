@@ -28,8 +28,12 @@ from typing import Optional
 # A segment may contain letters, digits, and a small set of safe punctuation.
 # It must NOT be empty, "." or "..", contain a backslash, a percent sign
 # (blocks percent-encoded separators like %2F), or any control character.
+# '*' is deliberately NOT permitted: the monitor treats it as a literal, and
+# allowing it would be a trap if a future tool adapter interpreted it as a
+# wildcard (the two components would disagree, which is a bypass). Reject it
+# until there is an explicit wildcard grammar with matching containment algebra.
 import re as _re
-_SEGMENT_RE = _re.compile(r"^[A-Za-z0-9._\-*]+$")
+_SEGMENT_RE = _re.compile(r"^[A-Za-z0-9._\-]+$")
 
 
 class ResourceError(ValueError):
