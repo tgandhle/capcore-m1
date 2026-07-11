@@ -1,22 +1,22 @@
-"""Property-based adversarial tests — the M1 deliverable.
+"""Property-based adversarial tests - the M1 deliverable.
 
 Each test maps to a security claim in BUILD.md and states its regime:
 
-  PROOF      — finite domain, exhaustively enumerated. The claim holds for ALL
+  PROOF      - finite domain, exhaustively enumerated. The claim holds for ALL
                inputs in the domain, not a sample.
-  EVIDENCE   — unbounded/large domain, property-tested over random structured
+  EVIDENCE   - unbounded/large domain, property-tested over random structured
                inputs. High-confidence, not proof.
 
 The word "prove" appears only in PROOF tests.
 
 Claims covered:
-  §1 attenuation never widens (all axes)     -> EVIDENCE (test_attenuation_*)
-  §1 combine = union of alternative grants    -> PROOF (enumerated) + EVIDENCE
-  §1 unsatisfiable/no authority -> deny        -> EVIDENCE
-  §1 explicit deny beats allow/approval        -> PROOF (enumerated)
-  §1 expired/revoked/unknown -> deny           -> EVIDENCE
-  §1 two tenants never authorize each other    -> EVIDENCE
-  §0.5 malformed proposal -> deny, never throw -> EVIDENCE
+  Sec. 1 attenuation never widens (all axes)     -> EVIDENCE (test_attenuation_*)
+  Sec. 1 combine = union of alternative grants    -> PROOF (enumerated) + EVIDENCE
+  Sec. 1 unsatisfiable/no authority -> deny        -> EVIDENCE
+  Sec. 1 explicit deny beats allow/approval        -> PROOF (enumerated)
+  Sec. 1 expired/revoked/unknown -> deny           -> EVIDENCE
+  Sec. 1 two tenants never authorize each other    -> EVIDENCE
+  Sec. 0.5 malformed proposal -> deny, never throw -> EVIDENCE
 """
 
 import itertools
@@ -35,7 +35,7 @@ from capcore.tests.strategies import (
 
 # --------------------------------------------------------------------------- #
 # Attenuation: a derived child can never exceed its parent. (EVIDENCE)
-# BUILD.md §1 line 81.
+# BUILD.md Sec. 1 line 81.
 # --------------------------------------------------------------------------- #
 
 @given(parent=capabilities(runtime=False), data=st.data())
@@ -162,7 +162,7 @@ def test_union_grants_evidence(data):
 
 
 # --------------------------------------------------------------------------- #
-# Tenant isolation. (EVIDENCE) BUILD.md §1: two tenants never authorize each
+# Tenant isolation. (EVIDENCE) BUILD.md Sec. 1: two tenants never authorize each
 # other. Identity is from the trusted context; the proposal has no tenant field.
 # --------------------------------------------------------------------------- #
 
@@ -199,8 +199,36 @@ def test_identity_ignores_proposal(cap, prop):
     assert d1.verdict == d2.verdict  # deterministic, identity-stable
 
 
+def test_identity_not_derived_from_resource():
+    """EVIDENCE (direct confused-deputy): identity comes from the trusted context,
+    NOT from the proposal resource's leading segment. A capability under the
+    context's real tenant authorizes even when the proposal resource names a
+    DIFFERENT tenant as its first segment. If identity were (wrongly) derived
+    from the resource, this would deny.
+    """
+    store = CapabilityStore()
+    # capability lives under tenant 'acme', scope 'acme/records'
+    store.issue(Capability("c", "acme", "acme/records", frozenset({"read"})))
+    mon = ReferenceMonitor(store)
+    ctx = RunContext("acme", "p", "r")
+    # resource whose FIRST segment is 'acme' -> allowed (normal case)
+    assert mon.authorize(ctx, Proposal("acme/records/x", "read")).verdict == Verdict.ALLOW
+    # Now the mirror: a capability whose scope's first segment differs from the
+    # tenant would be unusual, but the key confused-deputy check is that a
+    # resource naming another tenant as its prefix does NOT grant cross-tenant.
+    store2 = CapabilityStore()
+    store2.issue(Capability("g", "globex", "globex/records", frozenset({"read"})))
+    mon2 = ReferenceMonitor(store2)
+    # ctx tenant is acme; the globex cap must never authorize, regardless of the
+    # resource naming globex. Under an identity-from-resource bug, deriving tenant
+    # 'globex' from the resource WOULD wrongly match the globex cap.
+    d = mon2.authorize(RunContext("acme", "p", "r"),
+                       Proposal("globex/records/secret", "read"))
+    assert d.verdict == Verdict.DENY
+
+
 # --------------------------------------------------------------------------- #
-# Explicit deny precedence. (PROOF, enumerated) BUILD.md §1: deny > approval >
+# Explicit deny precedence. (PROOF, enumerated) BUILD.md Sec. 1: deny > approval >
 # allow.
 # --------------------------------------------------------------------------- #
 
@@ -248,7 +276,7 @@ def test_revoked_never_authorizes(cap, prop):
 
 
 # --------------------------------------------------------------------------- #
-# Malformed proposals fail closed. (EVIDENCE) BUILD.md §0.5.
+# Malformed proposals fail closed. (EVIDENCE) BUILD.md Sec. 0.5.
 # --------------------------------------------------------------------------- #
 
 @given(bad=st.one_of(

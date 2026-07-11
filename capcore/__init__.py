@@ -185,6 +185,13 @@ class Capability:
     # runtime=False => derivation-only: authorizes deriving children, but is NOT
     # live runtime authority. A revoked child never falls back to it.
     runtime: bool = True
+    # Identity binding. None means "not bound on that axis". A capability that
+    # names a principal/run authorizes only when the trusted RunContext matches.
+    # Roots/parents are typically tenant-only (principal=run=None) because they
+    # exist before any run; the derived RUN capability binds all three. Binding
+    # tightens down the derivation chain (None -> specific), never loosens.
+    principal: Optional[str] = None
+    run: Optional[str] = None
 
     def __post_init__(self):
         # normalize sets to frozensets even if constructed with sets
@@ -327,6 +334,19 @@ class CapabilityStore:
             return DeriveResult(ok=False, reason="child tenant differs from parent")
         if not _covers_safe(parent.resource, child.resource):
             return DeriveResult(ok=False, reason="child scope escapes parent scope")
+        # Identity binding may only TIGHTEN: if the parent binds a principal/run,
+        # the child must keep the same binding (cannot loosen to None or change
+        # to a different value). If the parent is unbound (None), the child may
+        # bind to any specific principal/run. This is attenuation applied to
+        # identity: a derived run capability narrows a tenant-wide parent to a
+        # specific principal+run, never the reverse.
+        if parent.principal is not None and child.principal != parent.principal:
+            return DeriveResult(
+                ok=False,
+                reason="child principal must equal parent's bound principal")
+        if parent.run is not None and child.run != parent.run:
+            return DeriveResult(
+                ok=False, reason="child run must equal parent's bound run")
         if not child.actions <= parent.actions:
             extra = child.actions - parent.actions
             return DeriveResult(
@@ -355,8 +375,15 @@ class CapabilityStore:
     def all_caps(self) -> list[Capability]:
         return list(self._caps.values())
 
-    def get_applicable(self, tenant: str, resource: str) -> list[Capability]:
-        """Live, runtime-bound caps for THIS tenant whose scope covers resource.
+    def get_applicable(self, ctx: "RunContext", resource: str) -> list[Capability]:
+        """Live, runtime-bound caps matching the trusted identity whose scope
+        covers resource.
+
+        Identity match: tenant must always match. If a capability names a
+        principal, it must equal ctx.principal; if it names a run, it must equal
+        ctx.run. A None binding means "not bound on that axis" (tenant-wide or
+        run-agnostic). This is where a capability issued for run A is prevented
+        from authorizing run B.
 
         Not verb-filtered: the per-grant verb check happens in the monitor, so
         union-of-alternative-grants can be expressed correctly.
@@ -367,7 +394,11 @@ class CapabilityStore:
                 continue
             if not cap.runtime:
                 continue
-            if cap.tenant != tenant:
+            if cap.tenant != ctx.tenant:
+                continue
+            if cap.principal is not None and cap.principal != ctx.principal:
+                continue
+            if cap.run is not None and cap.run != ctx.run:
                 continue
             if not _covers_safe(cap.resource, resource):
                 continue
@@ -456,10 +487,9 @@ class ReferenceMonitor:
             trace.append(("schema", "resource/verb must be non-empty strings"))
             return deny("invalid proposal schema")
 
-        tenant = ctx.tenant                 # TRUSTED. Not from proposal.
         resource = proposal.resource
         verb = proposal.verb
-        trace.append(("identity", f"tenant={tenant} (trusted context)"))
+        trace.append(("identity", f"tenant={ctx.tenant} (trusted context)"))
 
         # 1. Explicit platform deny wins over everything.
         deny_reason = platform_denies(self.deny_policies, resource, verb)
@@ -468,11 +498,11 @@ class ReferenceMonitor:
             trace.append(("precedence", "explicit deny beats allow and approval"))
             return deny(deny_reason)
 
-        # 2. Applicable grants for this trusted tenant + resource.
-        applicable = self.store.get_applicable(tenant, resource)
+        # 2. Applicable grants for this trusted identity + resource.
+        applicable = self.store.get_applicable(ctx, resource)
         if not applicable:
             trace.append(("applicable", "none"))
-            return deny(self._why_none(tenant, resource))
+            return deny(self._why_none(ctx, resource))
         trace.append(("applicable", ", ".join(c.id for c in applicable)))
 
         # 3. UNION of alternative grants: any single grant that includes verb?
@@ -502,20 +532,28 @@ class ReferenceMonitor:
         """
         return self.authorize(ctx, proposal).for_model()
 
-    def _why_none(self, tenant: str, resource: str) -> str:
+    def _why_none(self, ctx: "RunContext", resource: str) -> str:
         wrong_tenant = False
         revoked_hit = False
+        identity_mismatch = False
         for cap in self.store.all_caps():
             if not cap.runtime:
                 continue
             cover = _covers_safe(cap.resource, resource)
-            if cover and cap.tenant != tenant:
+            if cover and cap.tenant != ctx.tenant:
                 wrong_tenant = True
-            if cover and cap.tenant == tenant and self.store.is_revoked(cap.id):
+            if cover and cap.tenant == ctx.tenant and self.store.is_revoked(cap.id):
                 revoked_hit = True
+            if (cover and cap.tenant == ctx.tenant and not self.store.is_revoked(cap.id)
+                    and ((cap.principal is not None and cap.principal != ctx.principal)
+                         or (cap.run is not None and cap.run != ctx.run))):
+                identity_mismatch = True
         if revoked_hit:
             return "the runtime capability for this scope is revoked"
         if wrong_tenant:
             return ("a capability covers this resource under a DIFFERENT tenant "
                     "(cross-tenant escape blocked; identity from trusted context)")
+        if identity_mismatch:
+            return ("a capability covers this resource but is bound to a different "
+                    "principal or run (identity binding blocked cross-run/principal use)")
         return "no live runtime capability covers this resource for this tenant"

@@ -259,3 +259,105 @@ def test_scope_covers_never_raises_uncaught_via_safe_path(scope, resource):
     """
     from capcore import _covers_safe
     _covers_safe(scope, resource)  # must not raise
+
+
+# --------------------------------------------------------------------------- #
+# Principal/run binding: a capability bound to a principal/run must not
+# authorize a different principal or run within the same tenant.
+# --------------------------------------------------------------------------- #
+
+def _bound_store():
+    store = CapabilityStore()
+    # a run capability bound to principal p1 in run r1
+    store.issue(Capability(
+        "cap-run", "acme", "acme/records", frozenset({"read"}),
+        principal="p1", run="r1"))
+    return store
+
+
+def test_run_bound_cap_denies_other_run():
+    store = _bound_store()
+    mon = ReferenceMonitor(store)
+    # same principal, DIFFERENT run
+    d = mon.authorize(RunContext("acme", "p1", "r2"),
+                      Proposal("acme/records/x", "read"))
+    assert d.verdict == Verdict.DENY
+    # correct run allows
+    d2 = mon.authorize(RunContext("acme", "p1", "r1"),
+                       Proposal("acme/records/x", "read"))
+    assert d2.verdict == Verdict.ALLOW
+
+
+def test_principal_bound_cap_denies_other_principal():
+    store = _bound_store()
+    mon = ReferenceMonitor(store)
+    # DIFFERENT principal, correct run
+    d = mon.authorize(RunContext("acme", "p2", "r1"),
+                      Proposal("acme/records/x", "read"))
+    assert d.verdict == Verdict.DENY
+
+
+def test_unbound_cap_is_tenant_wide():
+    """A capability with principal=run=None (a root-style grant) authorizes any
+    principal/run in its tenant. This is intentional for derivation-only parents.
+    """
+    store = CapabilityStore()
+    store.issue(Capability("cap-wide", "acme", "acme/records", frozenset({"read"})))
+    mon = ReferenceMonitor(store)
+    for p, r in [("p1", "r1"), ("p2", "r2"), ("pX", "rY")]:
+        d = mon.authorize(RunContext("acme", p, r), Proposal("acme/records/x", "read"))
+        assert d.verdict == Verdict.ALLOW
+
+
+def test_derive_child_may_tighten_identity_not_loosen():
+    store = CapabilityStore()
+    # tenant-wide derivation-only root
+    store.issue(Capability("root", "acme", "acme/records",
+                           frozenset({"read"}), runtime=False))
+    # child tightens to a specific principal+run: allowed
+    ok = store.derive_child("root", Capability(
+        "child-tight", "acme", "acme/records/x", frozenset({"read"}),
+        principal="p1", run="r1"))
+    assert ok.ok
+
+    # now a parent bound to p1/r1
+    store.issue(Capability("root2", "acme", "acme/orders",
+                           frozenset({"read"}), runtime=False,
+                           principal="p1", run="r1"))
+    # child cannot loosen run to None
+    bad1 = store.derive_child("root2", Capability(
+        "c1", "acme", "acme/orders/x", frozenset({"read"}), principal="p1"))
+    assert not bad1.ok and "run" in bad1.reason
+    # child cannot change principal
+    bad2 = store.derive_child("root2", Capability(
+        "c2", "acme", "acme/orders/x", frozenset({"read"}),
+        principal="p2", run="r1"))
+    assert not bad2.ok and "principal" in bad2.reason
+    # child keeping the same binding is fine
+    good = store.derive_child("root2", Capability(
+        "c3", "acme", "acme/orders/x", frozenset({"read"}),
+        principal="p1", run="r1"))
+    assert good.ok
+
+
+@given(data=st.data())
+@settings(max_examples=200)
+def test_bound_cap_never_authorizes_mismatched_identity(data):
+    """EVIDENCE: a cap bound to (p_bound, r_bound) authorizes only when BOTH
+    ctx.principal == p_bound and ctx.run == r_bound (tenant fixed). Any mismatch
+    on a bound axis denies.
+    """
+    p_bound = data.draw(st.sampled_from(["p1", "p2"]))
+    r_bound = data.draw(st.sampled_from(["r1", "r2"]))
+    store = CapabilityStore()
+    store.issue(Capability("c", "acme", "acme/records", frozenset({"read"}),
+                           principal=p_bound, run=r_bound))
+    mon = ReferenceMonitor(store)
+    p_ctx = data.draw(st.sampled_from(["p1", "p2"]))
+    r_ctx = data.draw(st.sampled_from(["r1", "r2"]))
+    d = mon.authorize(RunContext("acme", p_ctx, r_ctx),
+                      Proposal("acme/records/x", "read"))
+    if p_ctx == p_bound and r_ctx == r_bound:
+        assert d.verdict == Verdict.ALLOW
+    else:
+        assert d.verdict == Verdict.DENY
