@@ -1,4 +1,4 @@
-﻿.venv/
+.venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -8,3 +8,11 @@ htmlcov/
 dist/
 build/
 *.egg-info/
+
+# secrets / env (never commit real credentials)
+.env
+.env.*
+*.pem
+*.key
+secrets.*
+*_token.txt

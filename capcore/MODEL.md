@@ -208,15 +208,53 @@ properties deterministic and CI-safe while still wiring in a genuine model: the
 LLM's outputs are untrusted and pass through the identical trusted pipeline as a
 scripted proposal.
 
+## M3: the credential broker (`capcore/broker.py`, `capcore/httptool.py`)
+
+When an authorized action needs a real secret (API key, token) to execute, the
+`CredentialBroker` releases it, but only for the authorized action, and never to
+the model. Security properties, all tested with a known mock secret so
+containment is provable:
+
+- **Secret non-exposure.** `Secret` never renders its value in repr/str/format/
+  logging/exceptions; the raw value is reachable only via an explicit `.reveal()`
+  chokepoint. Tested that a mock secret appears in NONE of those.
+- **Authorized-release only.** `release()` hands over the secret only when the
+  monitor's decision is ALLOW, the credential is bound to the authorizing
+  capability, the verb matches, and the credential scope covers the resource.
+  Any mismatch, or a denied action, yields no secret. Mutation-tested
+  (`broker_releases_on_denied_action`, `broker_ignores_credential_scope`).
+- **Scoped lifetime.** Credentials can be single-use (consumed after one release)
+  and/or TTL-expiring (denied after a deadline). Mutation-tested
+  (`broker_ignores_single_use_and_ttl`).
+- **Audit without secrets.** Every release attempt, granted or refused, is
+  recorded without the secret value. Tested.
+- **Delivery boundary (`HttpTool`).** The tool sends the released secret only in
+  the Authorization header of its fixed allowed URL, never a URL implied by the
+  untrusted proposal, and its returned summary never echoes the secret. The
+  transport is injectable: a `MockTransport` in tests records exactly what was
+  sent (proving the secret went only to the allowed URL); real HTTP is used only
+  in the live demo.
+
+The real-secret/real-network path (`scripts/demo_live_m3.py`) is deliberately
+NOT in CI. It reads a token from the `CAPCORE_DEMO_TOKEN` environment variable
+(never committed) and makes a real HTTPS call to httpbin.org/bearer, which echoes
+the token back so you can see it arrived at the allowed endpoint, and confirm the
+runtime, not the model, put it there. This keeps a real credential out of the
+repo and out of CI logs while still demonstrating real containment: the secret is
+provably absent from every model-facing reason and audit line.
+
 ## Run
 
 ```
 pip install -e ".[test]"
 python -m pytest
-python scripts/mutation_check.py      # all 17 mutations must be caught
+python scripts/mutation_check.py      # all 20 mutations must be caught
 
-# live demo (local LLM), not part of CI:
-#   install Ollama, then: ollama pull llama3.2
+# live demos (local, not part of CI):
 pip install -e ".[live]"
+#   M2 (needs Ollama): ollama pull llama3.2
 python scripts/demo_live.py
+#   M3 (real secret + real HTTPS):
+#   PowerShell: $env:CAPCORE_DEMO_TOKEN = "demo-token-abc123"
+python scripts/demo_live_m3.py
 ```

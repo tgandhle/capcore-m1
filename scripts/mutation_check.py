@@ -35,7 +35,7 @@ CORE_REL = Path("capcore") / "__init__.py"
 PER_MUTATION_TIMEOUT = 120  # seconds; a caught mutation returns well under this
 
 # (name, exact source snippet to find, replacement). `find` must occur exactly
-# once; otherwise the mutation is reported stale. Covers all 17 documented
+# once; otherwise the mutation is reported stale. Covers all 20 documented
 # defects: original seven plus six from hardening review.
 MUTATIONS = [
     ("untrusted_identity_from_proposal",
@@ -92,6 +92,19 @@ MUTATIONS = [
      "        if record.steps_taken >= self.budget.max_steps:\n            record.state = RunState.ABORTED\n            res = StepResult(StepOutcome.BUDGET_EXHAUSTED, proposal,",
      "        if False:  # BUG: never enforce budget\n            record.state = RunState.ABORTED\n            res = StepResult(StepOutcome.BUDGET_EXHAUSTED, proposal,",
      "capcore/runtime.py"),
+    # --- M3 broker mutations (target capcore/broker.py) ---
+    ("broker_releases_on_denied_action",
+     "        if decision.verdict != Verdict.ALLOW:",
+     "        if False:  # BUG: release secret even when not authorized",
+     "capcore/broker.py"),
+    ("broker_ignores_credential_scope",
+     "        if not scope_covers(cred.scope, proposal.resource):",
+     "        if False:  # BUG: ignore credential scope",
+     "capcore/broker.py"),
+    ("broker_ignores_single_use_and_ttl",
+     "        if not cred.is_available(now):",
+     "        if False:  # BUG: ignore consumed/expired credential",
+     "capcore/broker.py"),
 ]
 
 

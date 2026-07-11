@@ -7,10 +7,14 @@ capability-enforced agent runtime. Given a trusted `RunContext` (identity) and a
 untrusted model `Proposal`, the `ReferenceMonitor` returns ALLOW /
 REQUIRE_APPROVAL / DENY. Deny is the default.
 
-This is M1 of the milestone plan: the capability core against a hostile-model
+This spans M1 (capability core), M2 (execution loop), and M3 (credential
+broker) of the milestone plan. It defends against a hostile-model
 attacker (the model emits arbitrary proposed actions, attempting tenant escape,
 over-attenuation, prefix confusion, and use of revoked or forged capabilities).
-No LLM, tools, execution loop, or audit chain yet.
+M2 adds a trusted execution loop (state machine, budgets, tool boundary, and a
+revoke-during-execution race check) driven by a scripted model or a real local
+LLM. M3 adds a credential broker that releases real secrets only to authorized
+actions, never to the model.
 
 ## Install and test
 
@@ -23,7 +27,7 @@ pip install -e ".[test]"
 pytest
 ```
 
-Editable install means imports resolve regardless of working directory. 27 tests
+Editable install means imports resolve regardless of working directory. 73 tests
 should pass. Run `python scripts/mutation_check.py` to confirm the suite catches
 the known defects (it mutates a temporary copy, never your working tree).
 
