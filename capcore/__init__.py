@@ -1,4 +1,4 @@
-"""M1 capability core — capability-enforced agent runtime.
+"""M1 capability core - capability-enforced agent runtime.
 
 This is the trusted decision path: given a RunContext (trusted identity) and a
 Proposal (untrusted, model-emitted), the ReferenceMonitor returns a Decision of
@@ -21,23 +21,100 @@ from typing import Optional
 # Resource scope: segment-aware containment.
 # --------------------------------------------------------------------------- #
 
-def segments(path: str) -> tuple[str, ...]:
-    """Split a resource path into non-empty path segments.
+# --------------------------------------------------------------------------- #
+# Resource scope: validated, segment-aware containment.
+# --------------------------------------------------------------------------- #
 
-    'acme/records/' -> ('acme', 'records')
+# A segment may contain letters, digits, and a small set of safe punctuation.
+# It must NOT be empty, "." or "..", contain a backslash, a percent sign
+# (blocks percent-encoded separators like %2F), or any control character.
+import re as _re
+_SEGMENT_RE = _re.compile(r"^[A-Za-z0-9._\-*]+$")
+
+
+class ResourceError(ValueError):
+    """Raised when a resource path or scope is not canonical/valid."""
+
+
+def validate_resource(path: str) -> tuple[str, ...]:
+    """Validate and canonicalize a resource path into segments.
+
+    Rejects (raising ResourceError):
+      - non-string or empty input
+      - backslashes (Windows-style separators)
+      - percent signs (blocks %2F and other encoded-separator smuggling)
+      - control characters
+      - empty internal segments ("a//b")
+      - "." or ".." segments (path traversal)
+      - segments with characters outside [A-Za-z0-9._-*]
+
+    Returns the tuple of validated segments. This is the ONLY way scopes and
+    resources enter the system; raw strings never reach comparison.
     """
-    return tuple(s for s in str(path).split("/") if s)
+    if not isinstance(path, str) or path == "":
+        raise ResourceError("resource must be a non-empty string")
+    if "\\" in path:
+        raise ResourceError("backslash not allowed in resource path")
+    if "%" in path:
+        raise ResourceError("percent-encoding not allowed in resource path")
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in path):
+        raise ResourceError("control characters not allowed in resource path")
+    raw = path.split("/")
+    # allow a single trailing slash (scope written as "a/b/"), reject others
+    if raw and raw[-1] == "":
+        raw = raw[:-1]
+    segs = []
+    for s in raw:
+        if s == "":
+            raise ResourceError("empty path segment not allowed")
+        if s in (".", ".."):
+            raise ResourceError("'.' and '..' segments not allowed (path traversal)")
+        if not _SEGMENT_RE.match(s):
+            raise ResourceError(f"invalid characters in segment {s!r}")
+        segs.append(s)
+    if not segs:
+        raise ResourceError("resource has no segments")
+    return tuple(segs)
+
+
+def _covers_safe(scope: str, resource: str) -> bool:
+    """scope_covers that returns False instead of raising, for internal call
+    sites that must fail closed rather than propagate a ResourceError.
+    """
+    try:
+        return scope_covers(scope, resource)
+    except ResourceError:
+        return False
+
+
+def is_valid_resource(path: str) -> bool:
+    try:
+        validate_resource(path)
+        return True
+    except ResourceError:
+        return False
+
+
+def segments(path: str) -> tuple[str, ...]:
+    """Split a resource path into validated segments.
+
+    'acme/records/' -> ('acme', 'records'). Raises ResourceError on invalid
+    input (traversal, empty, encoded separators, control chars).
+    """
+    return validate_resource(path)
 
 
 def scope_covers(scope: str, resource: str) -> bool:
     """True iff `scope` is a path-segment prefix of `resource`.
 
-    Segment-aware, NOT raw string prefix: scope 'acme/data' covers
-    'acme/data/x' but does NOT cover 'acme/database' — 'data' != 'database'.
-    This is the fix for the prefix-confusion class of bug.
+    Both sides are validated first; an invalid scope or resource can never
+    match (it raises, and callers treat that as no-cover / deny). Segment-aware,
+    NOT raw string prefix: scope 'acme/data' covers 'acme/data/x' but NOT
+    'acme/database' ('data' != 'database') and NOT 'acme/data/../secret'
+    (rejected as traversal before comparison).
     """
-    s = segments(scope)
-    r = segments(resource)
+    s = validate_resource(scope)
+    r = validate_resource(resource)
     if len(s) > len(r):
         return False
     return all(s[i] == r[i] for i in range(len(s)))
@@ -132,14 +209,18 @@ class Proposal:
 
 
 def valid_proposal(obj) -> bool:
-    """A well-formed proposal has non-empty string resource and verb.
+    """A well-formed proposal has a non-empty string verb and a resource that is
+    a valid canonical path (no traversal, no encoded separators, no empties).
 
-    Anything else must resolve to a deterministic deny, never an exception.
+    Anything else must resolve to a deterministic deny, never an exception. This
+    is where a malformed or traversal resource ('a/../secret') is turned into a
+    fail-closed deny before it can reach scope comparison.
     """
     return (
         isinstance(obj, Proposal)
-        and isinstance(obj.resource, str) and len(obj.resource) > 0
         and isinstance(obj.verb, str) and len(obj.verb) > 0
+        and isinstance(obj.resource, str)
+        and is_valid_resource(obj.resource)
     )
 
 
@@ -162,17 +243,53 @@ class DeriveResult:
 # CapabilityStore: unique ids, revoke, and issue-time attenuation.
 # --------------------------------------------------------------------------- #
 
+def _validate_cap_fields(cap: "Capability") -> None:
+    """Reject capabilities with empty id/tenant, an invalid resource scope, or
+    empty/blank action names. Raises StoreError (fail closed) so a malformed
+    capability can never become live authority.
+    """
+    if not isinstance(cap.id, str) or cap.id == "":
+        raise StoreError("capability id must be a non-empty string")
+    if not isinstance(cap.tenant, str) or cap.tenant == "":
+        raise StoreError("capability tenant must be a non-empty string")
+    if not is_valid_resource(cap.resource):
+        raise StoreError(f"capability resource is not a valid scope: {cap.resource!r}")
+    if not cap.actions:
+        raise StoreError("capability must grant at least one action")
+    for a in cap.actions:
+        if not isinstance(a, str) or a == "":
+            raise StoreError("action names must be non-empty strings")
+
+
 class CapabilityStore:
     def __init__(self):
         self._caps: dict[str, Capability] = {}
         self._revoked: set[str] = set()
 
-    def issue(self, cap: Capability) -> str:
-        """Issue a ROOT capability. Fails closed on duplicate id."""
+    def issue_root(self, cap: Capability) -> str:
+        """Issue a ROOT capability (no parent).
+
+        Rejects, fail-closed:
+          - a capability whose `parent` is set (child-shaped caps must go through
+            derive_child, which validates attenuation; issuing one directly would
+            bypass that validation entirely)
+          - a duplicate id
+          - an empty id or tenant, or an invalid resource scope
+        """
+        if cap.parent is not None:
+            raise StoreError(
+                "root capability must not specify a parent; use derive_child()")
+        _validate_cap_fields(cap)
         if cap.id in self._caps:
             raise StoreError(f"duplicate capability id: {cap.id}")
         self._caps[cap.id] = cap
         return cap.id
+
+    def issue(self, cap: Capability) -> str:
+        """Deprecated alias for issue_root(). Retained so existing callers keep
+        working; new code should call issue_root() for clarity.
+        """
+        return self.issue_root(cap)
 
     def derive_child(self, parent_id: str, child: Capability) -> DeriveResult:
         """Derive a child from a parent, validating child <= parent on every axis.
@@ -194,11 +311,16 @@ class CapabilityStore:
         # EXISTING descendants (that is a separate architecture decision).
         if self.is_revoked(parent_id):
             return DeriveResult(ok=False, reason="parent is revoked")
+        # child fields must be well-formed before any comparison
+        try:
+            _validate_cap_fields(child)
+        except StoreError as e:
+            return DeriveResult(ok=False, reason=str(e))
         if child.id in self._caps:
             return DeriveResult(ok=False, reason="duplicate capability id")
         if child.tenant != parent.tenant:
             return DeriveResult(ok=False, reason="child tenant differs from parent")
-        if not scope_covers(parent.resource, child.resource):
+        if not _covers_safe(parent.resource, child.resource):
             return DeriveResult(ok=False, reason="child scope escapes parent scope")
         if not child.actions <= parent.actions:
             extra = child.actions - parent.actions
@@ -242,7 +364,7 @@ class CapabilityStore:
                 continue
             if cap.tenant != tenant:
                 continue
-            if not scope_covers(cap.resource, resource):
+            if not _covers_safe(cap.resource, resource):
                 continue
             out.append(cap)
         return out
@@ -262,7 +384,7 @@ class DenyPolicy:
 
 def platform_denies(policies: list[DenyPolicy], resource: str, verb: str) -> Optional[str]:
     for p in policies:
-        if p.verb == verb and scope_covers(p.scope, resource):
+        if p.verb == verb and _covers_safe(p.scope, resource):
             return p.reason
     return None
 
@@ -294,7 +416,7 @@ class ReferenceMonitor:
             return Decision(Verdict.DENY, _PUBLIC_REASON[Verdict.DENY],
                             audit_detail, tuple(trace))
 
-        # 0. Schema — malformed proposals fail closed, never throw.
+        # 0. Schema - malformed proposals fail closed, never throw.
         if not valid_proposal(proposal):
             trace.append(("schema", "resource/verb must be non-empty strings"))
             return deny("invalid proposal schema")
@@ -351,7 +473,7 @@ class ReferenceMonitor:
         for cap in self.store.all_caps():
             if not cap.runtime:
                 continue
-            cover = scope_covers(cap.resource, resource)
+            cover = _covers_safe(cap.resource, resource)
             if cover and cap.tenant != tenant:
                 wrong_tenant = True
             if cover and cap.tenant == tenant and self.store.is_revoked(cap.id):

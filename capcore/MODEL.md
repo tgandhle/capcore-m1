@@ -1,4 +1,4 @@
-# M1 capability core — model and test regime
+# M1 capability core - model and test regime
 
 This is the trusted decision path for the capability-enforced agent runtime.
 Given a **trusted** `RunContext` (identity) and an **untrusted** `Proposal`
@@ -22,25 +22,32 @@ Given a **trusted** `RunContext` (identity) and an **untrusted** `Proposal`
   that widens tenant, scope, actions, or drops an approval requirement the parent
   imposes on a shared action. The runtime never re-derives attenuation at
   authorize time.
-- **Precedence is a total order: explicit-deny > require-approval > allow.** A
-  mandatory `DenyPolicy` overrides an otherwise-valid grant.
-- **Fail closed.** Malformed proposals, revoked/unknown capabilities, and any
-  ambiguity resolve to deny. Malformed input never raises.
+- **Precedence.** The effective order is: mandatory explicit-deny, then a valid
+  unconditional capability path (ALLOW), then REQUIRE_APPROVAL when every
+  granting path is approval-gated, then default deny. A mandatory `DenyPolicy`
+  overrides an otherwise-valid grant. Note this is union semantics, not a simple
+  deny>approval>allow ranking: if any single applicable capability grants the
+  verb without approval, the result is ALLOW; approval is required only when all
+  granting capabilities gate it. (Mandatory tenant/platform approval policies,
+  which would override an unconditional capability, are not yet implemented.)
+- **Fail closed.** Malformed proposals, revoked/unknown capabilities, invalid or
+  traversal resources, and any ambiguity resolve to deny. Malformed input on the
+  authorize path never raises.
 
 ## Test regime: proof vs evidence
 
 The suite distinguishes two strengths of claim, and uses the word "prove" only
 for the first.
 
-- **PROOF** — finite domain, exhaustively enumerated. Holds for *all* inputs in
+- **PROOF** - finite domain, exhaustively enumerated. Holds for *all* inputs in
   the domain.
   - `test_union_of_grants_proof`: over the full powerset of a 4-verb universe for
     two same-scope grants, union semantics hold for every combination.
   - `test_deny_beats_everything_proof`: explicit deny wins over every finite
-    capability configuration (grant present/absent × approval-gated/not).
+    capability configuration (grant present/absent x approval-gated/not).
   - `test_prefix_confusion_proof`: enumerated confusable siblings are not covered.
 
-- **EVIDENCE** — unbounded/large domain, property-tested over random structured
+- **EVIDENCE** - unbounded/large domain, property-tested over random structured
   inputs via Hypothesis. High confidence, not proof.
   - attenuation never widens; accepted children stay within parent
   - tenant isolation; identity ignores the proposal
@@ -69,9 +76,12 @@ is green. Verified defects caught:
 6. malformed proposal throws instead of denying
 7. explicit platform deny ignored
 
-Each maps to at least one failing test under mutation. A passing suite means the
+Each maps to at least one failing test under mutation, and this is reproducible:
+`python scripts/mutation_check.py` reintroduces each defect into a copy of the
+core, runs the suite, and asserts every mutation is caught (exit non-zero if any
+survives). A passing suite means the
 core resists these specific attacks; it does not mean the core resists all
-attacks. The attacker model is BUILD.md §0.5 M1: hostile model output only.
+attacks. The attacker model is BUILD.md Sec. 0.5 M1: hostile model output only.
 
 ## Post-review fixes (found after the first M1 cut)
 
@@ -88,6 +98,22 @@ Two defects were found in later review and are now fixed and mutation-tested in
 9. **Derivation from a revoked parent was allowed.** `derive_child` now rejects
    a revoked parent ("parent is revoked"). A revoked capability is dead as an
    authority source, including for creating new grants.
+10. **`issue()` accepted child-shaped capabilities, bypassing attenuation.**
+    A capability with a `parent` set could be issued directly via `issue()`,
+    skipping `derive_child`'s attenuation validation and becoming live authority
+    with arbitrary scope/actions. Fixed: `issue_root()` rejects any capability
+    that names a parent (and `issue()` is now a deprecated alias for it). Root
+    issuance and child derivation are distinct, and only derivation can produce
+    a capability with a parent. Also validates non-empty id/tenant/actions and a
+    valid resource at issue time.
+11. **Resource comparison accepted path traversal and empty scopes.**
+    `scope_covers("acme/data", "acme/data/../secret")` returned True, and an
+    empty scope covered everything. Fixed: `validate_resource` rejects empty
+    input, `.`/`..` segments, empty internal segments, backslashes,
+    percent-encoding, and control characters. Resources and scopes are validated
+    before comparison; a malformed proposal resource fails closed at the schema
+    gate. Internal call sites use a non-raising wrapper (`_covers_safe`) so a
+    stored bad scope denies rather than crashing the monitor.
 
 ## Status and open decisions
 

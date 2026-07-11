@@ -10,7 +10,8 @@ from hypothesis import given, settings, strategies as st
 
 from capcore import (
     Capability, RunContext, Proposal, CapabilityStore, ReferenceMonitor,
-    DenyPolicy, Verdict,
+    DenyPolicy, Verdict, StoreError, is_valid_resource, ResourceError,
+    validate_resource, _covers_safe,
 )
 from capcore.tests.strategies import capabilities, proposals, run_contexts
 
@@ -128,3 +129,76 @@ def test_revoked_parent_derivation_always_denied(data):
     r = store.derive_child(parent.id, child)
     assert not r.ok
     assert r.reason == "parent is revoked"
+
+
+# --------------------------------------------------------------------------- #
+# Defect: issue() accepted child-shaped capabilities, bypassing attenuation.
+# Fix: issue_root rejects any capability with a parent set.
+# --------------------------------------------------------------------------- #
+
+def test_issue_root_rejects_child_shaped_capability():
+    """A capability that names a parent must not be issuable as a root; doing so
+    would skip derive_child's attenuation validation entirely.
+    """
+    store = CapabilityStore()
+    orphan = Capability(id="orphan", tenant="acme", resource="acme/data",
+                        actions=frozenset({"read"}), parent="missing-parent")
+    with pytest.raises(StoreError):
+        store.issue_root(orphan)
+    with pytest.raises(StoreError):
+        store.issue(orphan)  # deprecated alias must reject too
+    # and it must not be live
+    assert store.get("orphan") is None
+
+
+def test_issue_root_rejects_empty_fields():
+    """Empty id, tenant, resource, or action set fail closed at issue."""
+    store = CapabilityStore()
+    bad_caps = [
+        Capability(id="", tenant="t", resource="t/r", actions=frozenset({"read"})),
+        Capability(id="c", tenant="", resource="t/r", actions=frozenset({"read"})),
+        Capability(id="c", tenant="t", resource="", actions=frozenset({"read"})),
+        Capability(id="c", tenant="t", resource="t/r", actions=frozenset()),
+    ]
+    for cap in bad_caps:
+        with pytest.raises(StoreError):
+            store.issue_root(cap)
+
+
+# --------------------------------------------------------------------------- #
+# Defect: resource comparison accepted traversal and empty scopes.
+# Fix: validate_resource rejects them; scope_covers on invalid input fails.
+# --------------------------------------------------------------------------- #
+
+def test_resource_traversal_rejected():
+    """Path traversal must not authorize outside scope."""
+    from capcore import validate_resource, ResourceError
+    for bad in ("acme/data/../secret", "..", "a/../b", "a/./b",
+                "a//b", "", "a\\b", "a/%2e%2e/b", "a/b%2Fc"):
+        assert not is_valid_resource(bad), bad
+    # a valid scope never "covers" a traversal resource: proposal fails closed
+    store = CapabilityStore()
+    store.issue(Capability("c", "acme", "acme/data", frozenset({"read"})))
+    mon = ReferenceMonitor(store)
+    ctx = RunContext("acme", "p", "r")
+    d = mon.authorize(ctx, Proposal("acme/data/../secret", "read"))
+    assert d.verdict == Verdict.DENY
+
+
+def test_empty_scope_does_not_cover_everything():
+    """An empty scope must be rejected, not treated as a wildcard."""
+    assert not is_valid_resource("")
+    store = CapabilityStore()
+    # attempting to issue a cap with empty scope fails closed
+    with pytest.raises(StoreError):
+        store.issue(Capability("c", "t", "", frozenset({"read"})))
+
+
+@given(scope=st.text(min_size=0, max_size=12), resource=st.text(min_size=0, max_size=12))
+@settings(max_examples=300)
+def test_scope_covers_never_raises_uncaught_via_safe_path(scope, resource):
+    """EVIDENCE: the internal fail-closed wrapper never raises, for arbitrary
+    text input including traversal and junk.
+    """
+    from capcore import _covers_safe
+    _covers_safe(scope, resource)  # must not raise
