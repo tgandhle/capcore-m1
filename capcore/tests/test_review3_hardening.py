@@ -252,7 +252,7 @@ def test_single_use_credential_delivered_at_most_once_under_concurrency():
             deliveries.append(s.reveal())  # unlocked: a race would show as >1
             return "ok"
 
-    b.issue_credential(Credential("cred-1", "cap-1", "read", "acme/api",
+    b.issue_credential(Credential("cred-1", "read", "acme/api",
                                   Secret("SEK"), single_use=True))
     b.register_tool(ToolRegistration("t", "read", ToolKind.CREDENTIALED,
                                      Rec(), "1", "cred-1"))
@@ -315,15 +315,25 @@ def test_one_action_id_executes_at_most_once_under_concurrency():
 # --------------------------------------------------------------------------- #
 
 def test_credential_has_no_unenforced_capability_binding():
-    """Either capability_id is enforced, or it is gone. It must not be dead state
-    that implies a binding the broker never checks."""
+    """capability_id is REMOVED (Option B), not left as dead state.
+
+    Under current-authority semantics a credential is constrained by verb, scope,
+    TTL, single-use, tool binding, and live re-authorization. A capability_id that
+    the broker never checks would be a false claim of exact-capability binding, so
+    it is gone from the model entirely.
+    """
     import dataclasses
     field_names = {f.name for f in dataclasses.fields(Credential)}
-    if "capability_id" not in field_names:
-        return  # Option B: removed. Good.
+    assert "capability_id" not in field_names, (
+        "capability_id is still a Credential field; under current-authority "
+        "semantics it is unenforced dead state that implies a binding the broker "
+        "does not check"
+    )
 
-    # Option A: if it survives, it must be ENFORCED. A credential naming a
-    # capability that does not authorize the action must not deliver.
+
+def test_credential_without_capability_id_still_delivers():
+    """Control: removing capability_id does not break legitimate delivery. The
+    real constraints (verb, scope, tool binding, live re-auth) still apply."""
     store, mon, ctx = build()
     b = TrustedExecutionBroker(mon)
     got = []
@@ -333,15 +343,13 @@ def test_credential_has_no_unenforced_capability_binding():
             got.append(s.reveal())
             return "ok"
 
-    b.issue_credential(Credential("cred-1", "NONEXISTENT-CAP", "read",
-                                  "acme/api", Secret("SEK")))
+    b.issue_credential(Credential("cred-1", "read", "acme/api", Secret("SEK")))
     b.register_tool(ToolRegistration("t", "read", ToolKind.CREDENTIALED,
                                      Rec(), "1", "cred-1"))
     b.grant_tool("t", "acme/api")
     action_id = b.register_authorized_execution(ctx, ep())
     result = b.redeem_and_execute(action_id)
 
-    assert got == [], (
-        "credential names a nonexistent capability but was still delivered: "
-        "capability_id is unenforced dead state"
-    )
+    assert result.ok is True
+    assert got == ["SEK"]
+

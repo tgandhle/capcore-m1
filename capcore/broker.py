@@ -226,8 +226,19 @@ class ExecutionProposal:
 
 @dataclass
 class Credential:
+    """A secret plus its binding, under current-authority semantics.
+
+    NOTE: there is deliberately NO `capability_id` field. An earlier version had
+    one, but the broker never checked it: under current-authority semantics a
+    credential is constrained by verb, scope, TTL, single-use state, its tool
+    binding, and LIVE re-authorization through the monitor. `capability_id` was
+    never inspected on any path, so it was dead state that implied an
+    exact-capability binding the system does not enforce, a false security claim.
+    It has been removed rather than enforced, to keep the credential model honest.
+    If issuance provenance is ever needed for audit, add a clearly non-authoritative
+    field (e.g. `provenance`) that the authorization path never reads.
+    """
     id: str
-    capability_id: str
     verb: str
     scope: str
     secret: Secret
@@ -241,8 +252,8 @@ class Credential:
     _consumed: bool = False
 
     def __post_init__(self):
-        if not self.id or not self.capability_id or not self.verb or not self.scope:
-            raise CredentialError("credential id/capability_id/verb/scope must be non-empty")
+        if not self.id or not self.verb or not self.scope:
+            raise CredentialError("credential id/verb/scope must be non-empty")
         if not isinstance(self.secret, Secret):
             raise CredentialError("credential secret must be a Secret")
         if self.ttl_seconds is not None and self.ttl_seconds <= 0:

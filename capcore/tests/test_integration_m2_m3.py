@@ -72,7 +72,7 @@ def build_broker(monitor, plain=None, cred=None, grant_plain=True,
     policy-granted. Registration alone does NOT authorize; grants do."""
     broker = TrustedExecutionBroker(monitor)
     broker.issue_credential(Credential(
-        "cred-1", "cap-1", "read", cred_scope, Secret(SECRET), single_use=False))
+        "cred-1", "read", cred_scope, Secret(SECRET), single_use=False))
     broker.register_tool(ToolRegistration(
         registration_id="plain-read", verb="read", kind=ToolKind.PLAIN,
         adapter=plain or PlainRecorder(), version="1"))
@@ -399,7 +399,7 @@ def test_expired_action_is_denied():
     clock = FakeClock(1000.0)
     broker = TrustedExecutionBroker(monitor, action_ttl_seconds=10.0, clock=clock)
     broker.issue_credential(Credential(
-        "cred-1", "cap-1", "read", "acme/records", Secret(SECRET)))
+        "cred-1", "read", "acme/records", Secret(SECRET)))
     broker.register_tool(ToolRegistration(
         registration_id="cred-read", verb="read", kind=ToolKind.CREDENTIALED,
         adapter=cred, version="1", credential_id="cred-1"))

@@ -36,7 +36,7 @@ def build():
 
 
 def a_credential(**over):
-    kw = dict(id="cred-1", capability_id="cap-run", verb="read",
+    kw = dict(id="cred-1", verb="read",
               scope="acme/records", secret=Secret(MOCK_SECRET))
     kw.update(over)
     return Credential(**kw)
