@@ -33,7 +33,7 @@ Three layers, each with its own trust boundary:
 "Single-process trust model" is load-bearing, not a hedge. See
 [Trust model](#trust-model).
 
-180 tests pass. `python scripts/mutation_check.py` reintroduces 34 known defects
+194 tests pass. `python scripts/mutation_check.py` reintroduces 42 known defects
 one at a time and asserts the suite catches every one (it mutates a temporary
 copy, never your working tree). CI runs Python 3.11-3.13 on Ubuntu and Windows.
 
@@ -226,6 +226,38 @@ Several properties are enforced at the broker that are easy to get subtly wrong:
   atomicity is now a property of the code, not the interpreter, and holds under
   free-threaded builds.
 
+## Isolation of trusted state from callers
+
+Several round-4 hardening properties close aliasing and validation gaps:
+
+- **Stored credentials are vault-owned copies.** `issue_credential` copies the
+  caller's values (including a fresh copy of the secret value) into an immutable
+  `_StoredCredential`; consumption is tracked in a vault-owned set. A caller who
+  retains a reference to the original `Credential` and mutates it, widening scope,
+  resetting single-use, backdating the TTL, or swapping `secret._value`, changes
+  nothing the broker reads.
+- **Engine authority derives from the broker.** The engine takes its monitor and
+  store from `broker.monitor`, so engine and broker cannot authorize against
+  different stores (split authority, which would let a revoke through one be a
+  no-op for the other).
+- **Malformed model results fail closed.** `run()` validates that a `PROPOSAL`
+  result carries an actual `ExecutionProposal` at the boundary, not only in
+  `ModelResult.__post_init__` (a hostile adapter can bypass a constructor). A
+  malformed result yields `RunState.FAILED`, never an escaped exception.
+- **Tool results must be exact built-in `str`.** A `str` subclass could override
+  `encode()` to beat the size cap and carry mutable state into trusted history, so
+  the check is `type(out) is str`, not `isinstance`.
+- **Action budget and loop ceiling are separate.** `Budget(max_actions=...,
+  max_iterations=...)`: `max_iterations` is the unconditional liveness bound,
+  `max_actions` is the execution budget. `Budget(n)` still sets both to n.
+- **Refusals are classified honestly.** The model sees a generic
+  `authorization_refused`; trusted history records the specific reason. Only a
+  live capability re-authorization failure is a `REVOKED_RACE`; an expired or
+  consumed credential, a scope/verb mismatch, or a tool-generation change are
+  distinct `StepOutcome`s.
+- **Action-id collisions fail closed.** A duplicate pending-authorization id
+  cannot overwrite an existing record; minting retries with a fresh id.
+
 ## Terminal state is honest
 
 A run that fails does not report success. `RunRecord.stop_reason` says why a run
@@ -268,7 +300,7 @@ attacks.
 - `capcore/adapters.py` - `OllamaModel` (a real local LLM as an untrusted
   `ModelClient`), `ScriptedModel`, proposal parsing.
 - `capcore/MODEL.md` - semantics, test regime, mutation results, open decisions.
-- `scripts/mutation_check.py` - reintroduces 34 known defects; asserts the suite
+- `scripts/mutation_check.py` - reintroduces 42 known defects; asserts the suite
   catches each.
 - `scripts/demo_live.py` - a real local LLM driven through the full trusted loop.
 - `scripts/demo_live_m3.py` - a real secret over real HTTPS, through the broker.

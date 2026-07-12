@@ -212,11 +212,14 @@ another route.
 
 ### Termination is structural
 
-`run()` is bounded by `for _ in range(budget.max_steps)`, a **local** counter never
+`run()` is bounded by `for _ in range(budget.max_iterations)`, a **local** counter never
 derived from, and never written by, anything the model can reach. The trusted
 `steps_taken` check remains authoritative for the budget verdict; the ceiling is an
 independent second bound. Even if trusted counter state were corrupted by any means,
-the loop cannot iterate more than `max_steps` times. Mutation-tested
+the loop cannot iterate more than `max_iterations` times. The action budget
+(`max_actions`) is a SEPARATE control, enforced in step() when an action is
+attempted, so a denied attempt does not consume liveness and a model is always
+allowed to declare completion. Mutation-tested
 (`budget_not_enforced`, `engine_loop_ceiling_removed`).
 
 ### Terminal state is honest
@@ -371,7 +374,7 @@ demonstrating real containment.
 ```
 pip install -e ".[test]"
 python -m pytest
-python scripts/mutation_check.py      # all 34 mutations must be caught
+python scripts/mutation_check.py      # all 42 mutations must be caught
 
 # live demos (local, not part of CI):
 pip install -e ".[live]"

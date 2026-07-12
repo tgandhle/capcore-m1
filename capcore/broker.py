@@ -287,16 +287,45 @@ class Credential:
         return not self._consumed and not self.is_expired(now)
 
 
+@dataclass(frozen=True)
+class _StoredCredential:
+    """The vault's OWN copy of a credential. Immutable and not caller-reachable.
+
+    The vault copies the caller's `Credential` values into this at issue time and
+    stores THIS, never the caller's object. So a caller who retains a reference to
+    the original `Credential` and mutates it (widening scope, resetting single-use,
+    backdating the TTL, or swapping `secret._value`) changes nothing the broker
+    reads. Consumption state lives in the vault (a set of consumed ids), not on
+    this record, so even the vault does not mutate it.
+
+    The secret is a FRESH `Secret` built from a copied value, so mutating the
+    caller's original `Secret._value` after issuance does not affect this one.
+    """
+    id: str
+    verb: str
+    scope: str
+    secret: Secret
+    single_use: bool
+    ttl_seconds: Optional[float]
+    issued_at: float
+
+    def is_expired(self, now: float) -> bool:
+        if self.ttl_seconds is None:
+            return False
+        return (now - self.issued_at) >= self.ttl_seconds
+
+
 class CredentialVault:
     """Holds credentials. The ONLY place raw secrets live.
 
-    Kept as its own component so the secret-specific logic stays separable from
-    catalog, policy, and dispatch. Nothing outside this module resolves a
-    credential.
+    Stores immutable, vault-owned copies (`_StoredCredential`), never the caller's
+    object, so no retained caller reference can mutate trusted credential state
+    after issuance. Consumption is tracked in a vault-owned set under the lock.
     """
 
     def __init__(self, clock: Clock):
-        self._creds: dict[str, Credential] = {}
+        self._creds: dict[str, _StoredCredential] = {}
+        self._consumed_ids: set[str] = set()
         self._clock = clock
         # Serializes availability-check + consume for single-use credentials, so
         # two concurrent redemptions cannot both see an unconsumed credential and
@@ -306,35 +335,42 @@ class CredentialVault:
     def issue(self, cred: Credential) -> str:
         if cred.id in self._creds:
             raise CredentialError(f"duplicate credential id: {cred.id}")
-        # Stamp the TTL clock HERE, from the trusted clock, not at construction.
-        # This is the only place _issued_at is set, so a caller cannot backdate it.
-        object.__setattr__(cred, "_issued_at", self._clock.now())
-        self._creds[cred.id] = cred
+        # COPY the caller's values into a vault-owned immutable record. The secret
+        # value is copied into a fresh Secret, so mutating the caller's original
+        # (even secret._value) cannot reach the stored copy. The TTL clock is
+        # stamped HERE from the trusted clock, never from the caller.
+        stored = _StoredCredential(
+            id=cred.id,
+            verb=cred.verb,
+            scope=cred.scope,
+            secret=Secret(cred.secret.reveal()),   # fresh, copied value
+            single_use=cred.single_use,
+            ttl_seconds=cred.ttl_seconds,
+            issued_at=self._clock.now(),
+        )
+        self._creds[cred.id] = stored
         return cred.id
 
-    def resolve(self, credential_id: str) -> Optional[Credential]:
+    def resolve(self, credential_id: str) -> Optional[_StoredCredential]:
         return self._creds.get(credential_id)
 
     def claim_credential(self, credential_id: str, now: float) -> tuple[bool, str]:
         """Atomically check availability and consume a single-use credential.
 
-        Returns (ok, reason). On ok=True the credential is available and, if
-        single-use, has been marked consumed IN THE SAME critical section as the
-        availability check, so two concurrent redemptions cannot both pass. On
-        ok=False the reason is one of: "no such credential", "expired",
-        "already consumed". A non-single-use credential is not mutated.
-
-        This does NOT reveal the secret; the caller resolves and uses it. It only
-        owns the consume decision, which is the part that must be atomic.
+        Availability and consumption are decided against vault-owned state (the
+        immutable record plus the consumed-id set), under the lock. Nothing here
+        reads or writes a caller-reachable object.
         """
         with self._lock:
             cred = self._creds.get(credential_id)
             if cred is None:
                 return False, "no such credential"
-            if not cred.is_available(now):
-                return False, "expired" if cred.is_expired(now) else "already consumed"
+            if cred.id in self._consumed_ids:
+                return False, "already consumed"
+            if cred.is_expired(now):
+                return False, "expired"
             if cred.single_use:
-                cred._consumed = True
+                self._consumed_ids.add(cred.id)
             return True, "ok"
 
 
@@ -560,7 +596,18 @@ class PendingAuthorizationStore:
         self._lock = threading.Lock()
 
     def put(self, record: PendingAuthorization) -> None:
-        self._records[record.action_id] = record
+        """Insert a pending authorization. FAILS CLOSED on an id collision.
+
+        Under the store lock, so the check-and-insert is atomic. A security
+        identifier must never silently overwrite an existing authority: an
+        action_id collision (astronomically unlikely with 32 random bytes, but not
+        to be trusted to luck) raises rather than replacing the prior record. The
+        minting caller retries with a fresh id.
+        """
+        with self._lock:
+            if record.action_id in self._records:
+                raise AuthorizationError("action_id collision")
+            self._records[record.action_id] = record
 
     def get(self, action_id: str) -> Optional[PendingAuthorization]:
         return self._records.get(action_id)
@@ -611,15 +658,38 @@ class PendingAuthorizationStore:
 class SanitizedToolResult:
     ok: bool
     body: Optional[str] = None
-    code: Optional[str] = None   # stable generic failure code, never a message
+    code: Optional[str] = None        # generic, MODEL-facing. Never a message.
+    audit_code: Optional[str] = None  # specific, TRUSTED-facing. Distinguishes
+    #                                   WHY a refusal happened so trusted history
+    #                                   is honest. Never shown to the model.
 
     @staticmethod
     def succeeded(body: str) -> "SanitizedToolResult":
         return SanitizedToolResult(ok=True, body=body)
 
     @staticmethod
-    def failed(code: str) -> "SanitizedToolResult":
-        return SanitizedToolResult(ok=False, code=code)
+    def failed(code: str, audit_code: Optional[str] = None) -> "SanitizedToolResult":
+        return SanitizedToolResult(ok=False, code=code, audit_code=audit_code or code)
+
+
+class BrokerRefusal:
+    """Specific refusal reasons the broker reports in `audit_code`.
+
+    The MODEL always sees the generic "authorization_refused" (via `code`);
+    trusted history sees the real reason (via `audit_code`). Only
+    REAUTHORIZATION_FAILED corresponds to a live capability re-authorization
+    failure, i.e. an actual revoke race. Everything else must NOT be labeled a
+    revoke race downstream.
+    """
+    REAUTHORIZATION_FAILED = "reauthorization_failed"   # the real revoke race
+    ACTION_DIGEST_MISMATCH = "action_digest_mismatch"
+    TOOL_CHANGED = "tool_changed"
+    NO_CREDENTIAL = "no_credential"
+    CREDENTIAL_VERB_MISMATCH = "credential_verb_mismatch"
+    CREDENTIAL_SCOPE_MISMATCH = "credential_scope_mismatch"
+    CREDENTIAL_EXPIRED = "credential_expired"
+    CREDENTIAL_CONSUMED = "credential_consumed"
+    CLAIM_REFUSED = "claim_refused"                     # unknown/expired at claim
 
 
 @dataclass(frozen=True)
@@ -660,10 +730,16 @@ def _normalize_tool_result(out) -> tuple[bool, Optional[str]]:
     trusted history. A structured-result path (canonical JSON into a fresh
     immutable value) is a future extension; the inert-str-or-None rule is the v1
     floor.
+
+    EXACT TYPE, not isinstance. A str SUBCLASS can override `encode()` to fake its
+    size (beating the byte cap) and can carry mutable attributes into trusted
+    history. The containment property depends on the built-in's immutability and
+    its real `encode`, so only the exact built-in `str` is accepted. This is the
+    one place exact-type checking is correct rather than overly strict.
     """
     if out is None:
         return True, None
-    if not isinstance(out, str):
+    if type(out) is not str:
         return False, None
     if len(out.encode("utf-8")) > MAX_TOOL_RESULT_BYTES:
         return False, None
@@ -709,6 +785,13 @@ class TrustedExecutionBroker:
         self._pending = PendingAuthorizationStore()
         self._action_ttl = action_ttl_seconds
         self.audit: list[ReleaseAudit] = []
+
+    @property
+    def monitor(self) -> ReferenceMonitor:
+        """The broker's reference monitor. The engine derives its authorization
+        authority from THIS, so engine and broker cannot diverge onto different
+        monitors/stores (the split-authority defect)."""
+        return self._monitor
 
     # -- wiring (trusted setup) --------------------------------------------- #
 
@@ -799,21 +882,31 @@ class TrustedExecutionBroker:
             raise AuthorizationError("tool registration is not authorized")
 
         now = self._clock.now()
-        aid = secrets.token_urlsafe(32)
-        self._pending.put(PendingAuthorization(
-            action_id=aid,
-            context=context,
-            action=action,
-            action_digest=action_digest(action),
-            tool_registration_id=reg.registration_id,
-            tool_version=reg.version,         # audit only
-            tool_generation=gen,              # authenticity: catalog-owned
-            credential_id=reg.credential_id,  # bound: cannot be substituted
-            issued_at=now,
-            expires_at=now + self._action_ttl,
-            state=AuthorizationState.PENDING,
-        ))
-        return aid
+        # A colliding action_id must not overwrite an existing authorization. put()
+        # fails closed on a duplicate; retry with a fresh random id a bounded
+        # number of times, then give up (a persistent collision means the RNG is
+        # broken, which is a fail-closed condition, not something to paper over).
+        for _attempt in range(8):
+            aid = secrets.token_urlsafe(32)
+            record = PendingAuthorization(
+                action_id=aid,
+                context=context,
+                action=action,
+                action_digest=action_digest(action),
+                tool_registration_id=reg.registration_id,
+                tool_version=reg.version,         # audit only
+                tool_generation=gen,              # authenticity: catalog-owned
+                credential_id=reg.credential_id,  # bound: cannot be substituted
+                issued_at=now,
+                expires_at=now + self._action_ttl,
+                state=AuthorizationState.PENDING,
+            )
+            try:
+                self._pending.put(record)
+            except AuthorizationError:
+                continue   # collision: mint a new id and retry
+            return aid
+        raise AuthorizationError("could not mint a unique action_id")
 
     # -- redeem ------------------------------------------------------------- #
 
@@ -834,7 +927,8 @@ class TrustedExecutionBroker:
             rec = self._pending.claim(action_id, now)
         except AuthorizationError as e:
             self._record(action_id, None, None, False, str(e))
-            return SanitizedToolResult.failed("authorization_refused")
+            return SanitizedToolResult.failed("authorization_refused",
+                                              BrokerRefusal.CLAIM_REFUSED)
 
         try:
             # 1. LIVE re-authorization. Current-authority semantics. A capability
@@ -845,14 +939,16 @@ class TrustedExecutionBroker:
                 self._pending.settle(action_id, AuthorizationState.FAILED)
                 self._record(action_id, rec.credential_id, rec.action, False,
                              "re-authorization failed at redemption")
-                return SanitizedToolResult.failed("authorization_refused")
+                return SanitizedToolResult.failed(
+                    "authorization_refused", BrokerRefusal.REAUTHORIZATION_FAILED)
 
             # 2. Internal integrity check on stored state.
             if action_digest(rec.action) != rec.action_digest:
                 self._pending.settle(action_id, AuthorizationState.FAILED)
                 self._record(action_id, rec.credential_id, rec.action, False,
                              "action digest mismatch")
-                return SanitizedToolResult.failed("authorization_refused")
+                return SanitizedToolResult.failed(
+                    "authorization_refused", BrokerRefusal.ACTION_DIGEST_MISMATCH)
 
             # 3. Resolve the tool from the CATALOG, pinned to the exact version
             #    bound at mint. A tool swapped out in between is refused.
@@ -865,7 +961,8 @@ class TrustedExecutionBroker:
                 self._pending.settle(action_id, AuthorizationState.FAILED)
                 self._record(action_id, rec.credential_id, rec.action, False,
                              "tool registration changed since authorization")
-                return SanitizedToolResult.failed("authorization_refused")
+                return SanitizedToolResult.failed(
+                    "authorization_refused", BrokerRefusal.TOOL_CHANGED)
 
             # 4. Dispatch on the REGISTERED kind, not isinstance against a
             #    Protocol (structural, and would match any object with the right
@@ -905,7 +1002,8 @@ class TrustedExecutionBroker:
             self._pending.settle(action_id, AuthorizationState.FAILED)
             self._record(action_id, rec.credential_id, rec.action, False,
                          "no such credential")
-            return SanitizedToolResult.failed("authorization_refused")
+            return SanitizedToolResult.failed(
+                "authorization_refused", BrokerRefusal.NO_CREDENTIAL)
 
         # The credential's own binding must hold independently of the capability
         # check: credential scope is not capability scope, and a credential may be
@@ -914,13 +1012,15 @@ class TrustedExecutionBroker:
             self._pending.settle(action_id, AuthorizationState.FAILED)
             self._record(action_id, cred.id, rec.action, False,
                          "credential verb does not match action")
-            return SanitizedToolResult.failed("authorization_refused")
+            return SanitizedToolResult.failed(
+                "authorization_refused", BrokerRefusal.CREDENTIAL_VERB_MISMATCH)
 
         if not scope_covers(cred.scope, rec.action.resource):
             self._pending.settle(action_id, AuthorizationState.FAILED)
             self._record(action_id, cred.id, rec.action, False,
                          "credential scope does not cover resource")
-            return SanitizedToolResult.failed("authorization_refused")
+            return SanitizedToolResult.failed(
+                "authorization_refused", BrokerRefusal.CREDENTIAL_SCOPE_MISMATCH)
 
         # Availability check AND consume, atomically. Two concurrent redemptions
         # of a single-use credential cannot both pass here: the vault lock
@@ -930,7 +1030,10 @@ class TrustedExecutionBroker:
         if not ok:
             self._pending.settle(action_id, AuthorizationState.FAILED)
             self._record(action_id, cred.id, rec.action, False, f"credential {why}")
-            return SanitizedToolResult.failed("authorization_refused")
+            audit = (BrokerRefusal.CREDENTIAL_EXPIRED if why == "expired"
+                     else BrokerRefusal.CREDENTIAL_CONSUMED if why == "already consumed"
+                     else BrokerRefusal.NO_CREDENTIAL)
+            return SanitizedToolResult.failed("authorization_refused", audit)
 
         # THE CREDENTIAL BOUNDARY.
         # The secret is revealed only inside this try, only to the trusted

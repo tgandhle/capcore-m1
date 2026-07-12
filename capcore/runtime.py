@@ -80,6 +80,9 @@ class StepOutcome(Enum):
     TOOL_ERROR = "tool_error"    # tool raised during execution
     TOOL_NOT_FOUND = "tool_not_found"    # no such registration: NOTHING RAN
     TOOL_NOT_AUTHORIZED = "tool_not_authorized"  # registered but not policy-granted
+    CREDENTIAL_REFUSED = "credential_refused"    # credential expired/consumed/
+    #                     scope/verb mismatch: distinct from a revoke race
+    INTEGRITY_REFUSED = "integrity_refused"      # digest/tool-generation mismatch
 
 
 @dataclass(frozen=True)
@@ -172,7 +175,7 @@ def to_model_view(record: RunRecord, budget: "Budget") -> ModelView:
     """
     return ModelView(
         run_id=record.ctx.run,
-        remaining_steps=max(0, budget.max_steps - record.steps_taken),
+        remaining_steps=max(0, budget.max_actions - record.steps_taken),
         history=tuple(
             ModelStepView(
                 verb=s.proposal.verb,
@@ -191,15 +194,49 @@ def to_model_view(record: RunRecord, budget: "Budget") -> ModelView:
 
 @dataclass(frozen=True)
 class Budget:
-    """Per-run hard limit. max_steps counts EXECUTED actions (and, by default,
-    also counts denied attempts so a model cannot burn infinite attempts).
+    """Two SEPARATE per-run limits. They must never share one counter.
+
+    - `max_iterations` is the unconditional LIVENESS ceiling: the loop in run()
+      cannot ask the model more than this many times, no matter what. It bounds
+      runaway iteration structurally, independent of any model-reachable state.
+
+    - `max_actions` is the AUTHORIZATION/EXECUTION budget: how many actions the
+      run may execute (and, if `count_denied_attempts`, how many attempts it may
+      make). This is a policy limit on work, not a liveness bound.
+
+    Conflating them (the old single `max_steps`) meant `count_denied_attempts=False`
+    could not work: a denied attempt still consumed the shared counter, and a
+    single valid action could never be followed by a model-declared completion.
+
+    Backward compatibility: `Budget(n)` or `Budget(max_steps=n)` sets BOTH limits
+    to n, preserving the previous single-counter behaviour. New code should pass
+    `max_actions` and `max_iterations` explicitly.
     """
-    max_steps: int
+    max_actions: int = None
+    max_iterations: int = None
     count_denied_attempts: bool = True
+    max_steps: int = None            # deprecated alias; sets both when given
 
     def __post_init__(self):
-        if not isinstance(self.max_steps, int) or self.max_steps < 0:
-            raise ValueError("budget max_steps must be a non-negative int")
+        # Resolve the compat alias.
+        if self.max_steps is not None:
+            if self.max_actions is None:
+                object.__setattr__(self, "max_actions", self.max_steps)
+            if self.max_iterations is None:
+                object.__setattr__(self, "max_iterations", self.max_steps)
+        # A single positional (max_actions=n) with no iterations defaults the
+        # ceiling to the same value, preserving old Budget(n) semantics.
+        if self.max_actions is not None and self.max_iterations is None:
+            object.__setattr__(self, "max_iterations", self.max_actions)
+        if self.max_iterations is not None and self.max_actions is None:
+            object.__setattr__(self, "max_actions", self.max_iterations)
+
+        if not isinstance(self.max_actions, int) or self.max_actions < 0:
+            raise ValueError("budget max_actions must be a non-negative int")
+        if not isinstance(self.max_iterations, int) or self.max_iterations < 0:
+            raise ValueError("budget max_iterations must be a non-negative int")
+        # keep max_steps populated for any external reader
+        object.__setattr__(self, "max_steps", self.max_actions)
 
 
 # --------------------------------------------------------------------------- #
@@ -252,6 +289,25 @@ class ModelResult:
     """
     outcome: ModelOutcome
     proposal: Optional["ExecutionProposal"] = None
+
+    def __post_init__(self):
+        # Validate the outcome/payload algebra. A PROPOSAL must carry an actual
+        # ExecutionProposal; any other outcome must carry no proposal. This is a
+        # near-side guard; run() ALSO validates at the boundary, because it does
+        # not control adapter behaviour and a hostile adapter can bypass a
+        # constructor by any number of means.
+        from capcore.broker import ExecutionProposal
+        if self.outcome is ModelOutcome.PROPOSAL:
+            if type(self.proposal) is not ExecutionProposal:
+                raise TypeError(
+                    "a PROPOSAL ModelResult must carry an ExecutionProposal, got "
+                    f"{type(self.proposal).__name__}"
+                )
+        else:
+            if self.proposal is not None:
+                raise TypeError(
+                    f"a {self.outcome.value} ModelResult must not carry a proposal"
+                )
 
     @staticmethod
     def propose(p: "ExecutionProposal") -> "ModelResult":
@@ -325,43 +381,71 @@ PreExecuteHook = Optional[
 class ExecutionEngine:
     def __init__(
         self,
-        monitor: ReferenceMonitor,
-        broker: TrustedExecutionBroker,
-        budget: Budget,
+        monitor_or_broker=None,
+        broker_=None,
+        budget: Budget = None,
         pre_execute_hook: PreExecuteHook = None,
+        *,
+        monitor: ReferenceMonitor = None,
+        broker: "TrustedExecutionBroker" = None,
     ):
-        """The engine authorizes through `monitor` and EXECUTES through `broker`.
+        """The engine derives ALL authorization authority from the broker.
 
-        It owns no tool catalog and holds no adapter. There is no path from here
-        to a running tool that does not go through the broker, which is the point:
-        the credential boundary cannot be bypassed by a caller who happens to have
-        an engine.
+        There is a single source of truth for the monitor and the capability
+        store: `broker.monitor`. The engine no longer accepts a separate monitor,
+        so it is impossible to construct an engine that authorizes control flow
+        through monitor A while the broker executes through monitor B. An earlier
+        version accepted both and only type-checked them, which let engine and
+        broker diverge onto different stores: revoking through one was a silent
+        no-op and the action executed anyway (the split-authority defect, first
+        seen as engine.store vs monitor.store, then again here as engine.monitor
+        vs broker.monitor).
 
-        `self.store` is exactly `monitor.store`, never a second reference. An
-        earlier version took a separate `store` argument, which permitted a
-        divergent state where the monitor authorized against store A while
-        `engine.store` (used by hooks and revocation paths) pointed at store B.
-        Both authorization checks read `monitor.store`, so revoking `engine.store`
-        was a silent no-op and the action executed anyway.
+        Signature note: for backward compatibility with the previous
+        `ExecutionEngine(monitor, broker, budget)` call form, a monitor passed in
+        the first position is accepted and MUST equal `broker.monitor`, else
+        construction fails. New code should call
+        `ExecutionEngine(broker, budget)`.
         """
-        self.monitor = monitor
-        self.store = monitor.store   # the ONLY capability store
-        self.broker = broker
-        self.budget = budget
-        self._pre_execute_hook = pre_execute_hook
+        # Untangle the two accepted call forms:
+        #   new:  ExecutionEngine(broker, budget, pre_execute_hook=...)
+        #   old:  ExecutionEngine(monitor, broker, budget, pre_execute_hook=...)
+        passed_monitor = None
+        if isinstance(monitor_or_broker, TrustedExecutionBroker):
+            # NEW form: ExecutionEngine(broker, budget, ...)
+            broker = monitor_or_broker
+            if budget is None and isinstance(broker_, Budget):
+                budget = broker_
+        elif isinstance(monitor_or_broker, ReferenceMonitor):
+            # OLD form: ExecutionEngine(monitor, broker, budget, ...)
+            passed_monitor = monitor_or_broker
+            if broker is None:
+                broker = broker_
+        if monitor is not None:
+            passed_monitor = monitor
 
-        # Fail closed at construction, not deep in a run.
-        if not isinstance(monitor, ReferenceMonitor):
-            raise TypeError("monitor must be a ReferenceMonitor")
         if not isinstance(broker, TrustedExecutionBroker):
             raise TypeError(
-                "broker must be a TrustedExecutionBroker; the engine no longer "
-                "owns a tool registry and cannot execute anything without one"
+                "ExecutionEngine requires a TrustedExecutionBroker; the engine "
+                "derives its monitor and store from broker.monitor"
             )
         if not isinstance(budget, Budget):
             raise TypeError("budget must be a Budget")
         if pre_execute_hook is not None and not callable(pre_execute_hook):
             raise TypeError("pre_execute_hook must be callable or None")
+
+        # If a monitor was passed (old call form), it MUST be the broker's.
+        if passed_monitor is not None and passed_monitor is not broker.monitor:
+            raise ValueError(
+                "engine monitor differs from broker.monitor: split authority is "
+                "not permitted. Construct with ExecutionEngine(broker, budget)."
+            )
+
+        self.broker = broker
+        self.monitor = broker.monitor           # single source of truth
+        self.store = broker.monitor.store
+        self.budget = budget
+        self._pre_execute_hook = pre_execute_hook
 
     def _authorize(self, ctx: RunContext, action: Proposal) -> Decision:
         return self.monitor.authorize(ctx, action)
@@ -388,7 +472,7 @@ class ExecutionEngine:
         action = proposal.action
 
         # 1. Budget.
-        if record.steps_taken >= self.budget.max_steps:
+        if record.steps_taken >= self.budget.max_actions:
             record.state = RunState.ABORTED
             res = StepResult(StepOutcome.BUDGET_EXHAUSTED, action,
                              audit_reason="run budget exhausted")
@@ -449,8 +533,29 @@ class ExecutionEngine:
             return res
 
         if result.code == "authorization_refused":
-            res = StepResult(StepOutcome.REVOKED_RACE, action,
-                             audit_reason="authorization lost before execution")
+            # Map the broker's SPECIFIC audit_code to an honest outcome. Only a
+            # live capability re-authorization failure is a revoke race; a
+            # credential that expired or was consumed, a scope/verb mismatch, or a
+            # digest/tool-generation change are distinct conditions and must not be
+            # mislabeled REVOKED_RACE. The model still saw only the generic code.
+            from capcore.broker import BrokerRefusal
+            audit = result.audit_code
+            if audit == BrokerRefusal.REAUTHORIZATION_FAILED:
+                outcome, why = StepOutcome.REVOKED_RACE, "authorization lost before execution"
+            elif audit in (BrokerRefusal.CREDENTIAL_EXPIRED,
+                           BrokerRefusal.CREDENTIAL_CONSUMED,
+                           BrokerRefusal.CREDENTIAL_SCOPE_MISMATCH,
+                           BrokerRefusal.CREDENTIAL_VERB_MISMATCH,
+                           BrokerRefusal.NO_CREDENTIAL):
+                outcome, why = StepOutcome.CREDENTIAL_REFUSED, f"credential refused: {audit}"
+            elif audit in (BrokerRefusal.ACTION_DIGEST_MISMATCH,
+                           BrokerRefusal.TOOL_CHANGED):
+                outcome, why = StepOutcome.INTEGRITY_REFUSED, f"integrity refused: {audit}"
+            else:
+                # CLAIM_REFUSED or unknown: an unredeemable authorization. Not a
+                # revoke race; a generic refusal.
+                outcome, why = StepOutcome.REVOKED_RACE, f"authorization refused: {audit}"
+            res = StepResult(outcome, action, audit_reason=why)
             record.history.append(res)
             return res
 
@@ -479,13 +584,12 @@ class ExecutionEngine:
         """
         record = RunRecord(ctx=ctx, state=RunState.RUNNING)
 
-        for _ in range(self.budget.max_steps):
-            # Budget is still checked against trusted state; the ceiling above is
-            # an INDEPENDENT second bound, not a replacement for it.
-            if record.steps_taken >= self.budget.max_steps:
-                record.state = RunState.ABORTED
-                record.stop_reason = StopReason.BUDGET_EXHAUSTED
-                return record
+        for _ in range(self.budget.max_iterations):
+            # The loop is bounded by max_iterations (liveness). The ACTION budget
+            # is enforced in step() when an action is actually attempted, NOT as a
+            # pre-model gate here: gating before asking the model would abort a run
+            # that has spent its actions but whose model still wants to declare
+            # completion. A model must always be allowed to finish.
 
             # The model sees a frozen, redacted copy. Never the record itself.
             try:
@@ -521,8 +625,14 @@ class ExecutionEngine:
                 record.stop_reason = StopReason.ADAPTER_LIMIT_REACHED
                 return record
 
-            if result.proposal is None:
-                # PROPOSAL with nothing to propose is a malformed adapter.
+            # A PROPOSAL must carry a real ExecutionProposal. run() checks this at
+            # the boundary, not only in ModelResult.__post_init__, because it does
+            # not control the adapter: a hostile or buggy adapter can construct a
+            # ModelResult by paths that skip validation, or return a look-alike.
+            # A malformed proposal must FAIL CLOSED here, never reach step() and
+            # crash the loop with an AttributeError.
+            from capcore.broker import ExecutionProposal
+            if type(result.proposal) is not ExecutionProposal:
                 record.state = RunState.FAILED
                 record.stop_reason = StopReason.MODEL_ERROR
                 return record

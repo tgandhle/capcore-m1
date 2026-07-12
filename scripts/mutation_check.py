@@ -90,15 +90,55 @@ MUTATIONS = [
     # the broker's live re-authorization (see broker_skips_reauthorization_at_
     # redemption below). What remains engine-side is the BUDGET.
     ("budget_not_enforced",
-     "        if record.steps_taken >= self.budget.max_steps:\n            record.state = RunState.ABORTED\n            res = StepResult(StepOutcome.BUDGET_EXHAUSTED, action,",
+     "        if record.steps_taken >= self.budget.max_actions:\n            record.state = RunState.ABORTED\n            res = StepResult(StepOutcome.BUDGET_EXHAUSTED, action,",
      "        if False:  # BUG: never enforce budget\n            record.state = RunState.ABORTED\n            res = StepResult(StepOutcome.BUDGET_EXHAUSTED, action,",
      "capcore/runtime.py"),
     # The engine's independent loop ceiling: a hostile model must not be able to
     # produce an unbounded run even if trusted counter state were corrupted.
+    # The action budget (step-level) and the iteration ceiling (loop) must be
+    # separate. Making the loop bound on max_actions instead of max_iterations
+    # re-conflates them: a denied attempt would consume the loop budget.
+    ("loop_bounds_on_actions_not_iterations",
+     "        for _ in range(self.budget.max_iterations):",
+     "        for _ in range(self.budget.max_actions):  # BUG: conflate ceiling and budget",
+     "capcore/runtime.py"),
     ("engine_loop_ceiling_removed",
-     "        for _ in range(self.budget.max_steps):",
+     "        for _ in range(self.budget.max_iterations):",
      "        while True:  # BUG: unbounded loop, no independent ceiling",
      "capcore/runtime.py"),
+    # The engine must derive its monitor from the broker, not accept a divergent
+    # one. Mutating the guard to accept a mismatched monitor reopens split
+    # authority at the engine/broker seam.
+    # run() must validate the proposal type at the boundary, not trust the
+    # adapter. Removing the check lets a malformed PROPOSAL crash the loop.
+    ("run_skips_proposal_type_check",
+     "            if type(result.proposal) is not ExecutionProposal:\n                record.state = RunState.FAILED\n                record.stop_reason = StopReason.MODEL_ERROR\n                return record\n\n            step_result = self.step(record, result.proposal)",
+     "            step_result = self.step(record, result.proposal)  # BUG: no boundary type check",
+     "capcore/runtime.py"),
+    # An expired/consumed credential must not be reported as a revoke race. If the
+    # engine maps every refusal to REVOKED_RACE, trusted history lies about why.
+    ("refusal_mislabeled_as_revoke_race",
+     "            if audit == BrokerRefusal.REAUTHORIZATION_FAILED:",
+     "            if True:  # BUG: label every refusal a revoke race",
+     "capcore/runtime.py"),
+    ("engine_accepts_divergent_monitor",
+     "        if passed_monitor is not None and passed_monitor is not broker.monitor:",
+     "        if False:  # BUG: accept a monitor that differs from broker.monitor",
+     "capcore/runtime.py"),
+    # The vault must store a COPY, not the caller's mutable Credential. Storing
+    # the caller's object lets a retained reference widen scope / reset single-use
+    # / backdate TTL / swap the secret after issuance.
+    ("vault_stores_caller_object",
+     "        stored = _StoredCredential(",
+     "        stored = cred  # BUG: alias the caller's mutable object\n        _ignore = _StoredCredential(",
+     "capcore/broker.py"),
+    # An action_id collision must fail closed, not overwrite an existing pending
+    # authorization. Removing the duplicate check lets a colliding id silently
+    # replace prior authority.
+    ("pending_put_overwrites_on_collision",
+     "            if record.action_id in self._records:\n                raise AuthorizationError(\"action_id collision\")",
+     "            if False:\n                raise AuthorizationError(\"action_id collision\")",
+     "capcore/broker.py"),
     # --- M3 broker mutations (target capcore/broker.py) ---
     # Re-authorization at redemption: if the live monitor no longer allows the
     # action, the secret must not leave. Mutating this to always-allow is the
@@ -150,12 +190,18 @@ MUTATIONS = [
      "            if reg is None:  # BUG: same-version swap inherits authorization",
      "capcore/broker.py"),
     ("credential_issue_time_not_stamped",
-     "        object.__setattr__(cred, \"_issued_at\", self._clock.now())",
-     "        object.__setattr__(cred, \"_issued_at\", 0.0)  # BUG: ignore the clock",
+     "            issued_at=self._clock.now(),",
+     "            issued_at=0.0,  # BUG: ignore the clock, every credential epoch-issued",
      "capcore/broker.py"),
     ("broker_stores_unnormalized_tool_result",
-     "    if not isinstance(out, str):\n        return False, None",
+     "    if type(out) is not str:\n        return False, None",
      "    if False:\n        return False, None  # BUG: store raw adapter output",
+     "capcore/broker.py"),
+    # isinstance would accept a str SUBCLASS that fakes encode() and carries
+    # mutable state. Exact-type is required.
+    ("tool_result_accepts_str_subclass",
+     "    if type(out) is not str:",
+     "    if not isinstance(out, str):  # BUG: accept a hostile str subclass",
      "capcore/broker.py"),
     # A provider failure must not be reported as a completion. This is the
     # difference between "the work is done" and "nothing happened and we lied".
@@ -192,9 +238,13 @@ MUTATIONS = [
      "capcore/httptool.py"),
     # Consumed/expired credentials must be refused. Ignoring availability defeats
     # single-use and TTL.
-    ("broker_ignores_single_use_and_ttl",
-     "        if not cred.is_available(now):",
-     "        if False:  # BUG: ignore consumed/expired credential",
+    ("broker_ignores_credential_expiry",
+     "            if cred.is_expired(now):",
+     "            if False:  # BUG: ignore expired credential",
+     "capcore/broker.py"),
+    ("broker_ignores_single_use_consumption",
+     "                self._consumed_ids.add(cred.id)",
+     "                pass  # BUG: never record consumption, single-use reusable",
      "capcore/broker.py"),
     # The single-use consumption itself: if the record is not claimed atomically,
     # an authorization can be replayed. Mutating the claim guard opens replay.
