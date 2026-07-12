@@ -99,6 +99,43 @@ class CredentialError(Exception):
     pass
 
 
+# --------------------------------------------------------------------------- #
+# Clock. Security time comes from HERE, never from a caller.
+# --------------------------------------------------------------------------- #
+
+class Clock(Protocol):
+    """A monotonic time source. TTL and expiry decisions read it.
+
+    The broker owns one clock, injected at construction. Production methods do
+    NOT accept a `now` argument: an earlier version did, which let a caller mint a
+    far-future expiry or make an expired authorization look current at redemption.
+    Security time must not be caller-controllable.
+    """
+    def now(self) -> float: ...
+
+
+class SystemClock:
+    """The real monotonic clock. The production default."""
+    def now(self) -> float:
+        return time.monotonic()
+
+
+class FakeClock:
+    """A controllable clock for tests. Replaces the removed `now=` backdoor.
+
+    Tests advance time explicitly instead of passing timestamps into production
+    methods, so there is no path through which a caller could do the same.
+    """
+    def __init__(self, value: float = 0.0):
+        self.value = value
+
+    def now(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
+
+
 class AuthorizationError(Exception):
     """Registration or redemption refused. Never carries a secret."""
     pass
@@ -196,7 +233,11 @@ class Credential:
     secret: Secret
     single_use: bool = False
     ttl_seconds: Optional[float] = None
-    _issued_at: float = field(default_factory=time.monotonic)
+    # NOT a constructor field. A caller must not be able to backdate the TTL clock
+    # by supplying _issued_at. The vault stamps it at issue time from the broker's
+    # trusted clock. -1.0 is the "not yet issued" sentinel; is_expired treats an
+    # unissued credential as not-expired (it cannot be redeemed before issue).
+    _issued_at: float = field(init=False, default=-1.0)
     _consumed: bool = False
 
     def __post_init__(self):
@@ -223,13 +264,14 @@ class Credential:
         except ResourceError as exc:
             raise CredentialError(f"invalid credential scope: {self.scope!r}") from exc
 
-    def is_expired(self, now: Optional[float] = None) -> bool:
+    def is_expired(self, now: float) -> bool:
         if self.ttl_seconds is None:
             return False
-        now = time.monotonic() if now is None else now
+        if self._issued_at < 0:
+            return False   # not yet issued; cannot be expired
         return (now - self._issued_at) >= self.ttl_seconds
 
-    def is_available(self, now: Optional[float] = None) -> bool:
+    def is_available(self, now: float) -> bool:
         return not self._consumed and not self.is_expired(now)
 
 
@@ -241,12 +283,16 @@ class CredentialVault:
     credential.
     """
 
-    def __init__(self):
+    def __init__(self, clock: Clock):
         self._creds: dict[str, Credential] = {}
+        self._clock = clock
 
     def issue(self, cred: Credential) -> str:
         if cred.id in self._creds:
             raise CredentialError(f"duplicate credential id: {cred.id}")
+        # Stamp the TTL clock HERE, from the trusted clock, not at construction.
+        # This is the only place _issued_at is set, so a caller cannot backdate it.
+        object.__setattr__(cred, "_issued_at", self._clock.now())
         self._creds[cred.id] = cred
         return cred.id
 
@@ -565,15 +611,24 @@ class TrustedExecutionBroker:
         policy: Optional[ToolPolicy] = None,
         vault: Optional[CredentialVault] = None,
         action_ttl_seconds: float = DEFAULT_ACTION_TTL_SECONDS,
+        clock: Optional[Clock] = None,
     ):
         if not isinstance(monitor, ReferenceMonitor):
             raise TypeError("broker requires a ReferenceMonitor for authorization")
         if action_ttl_seconds <= 0:
             raise ValueError("action_ttl_seconds must be positive")
+        # ONE clock, owned here. All TTL and expiry decisions read it. Production
+        # methods do not accept a caller `now`; tests inject a FakeClock instead.
+        self._clock = clock or SystemClock()
         self._monitor = monitor
         self._catalog = catalog or ToolCatalog()
         self._policy = policy or ToolPolicy()      # deny-by-default when empty
-        self._vault = vault or CredentialVault()
+        # The vault stamps credential issue-time from the same trusted clock, so a
+        # supplied vault must share it. A caller-supplied vault with a different
+        # clock would reintroduce clock divergence, so we hand it ours.
+        self._vault = vault or CredentialVault(self._clock)
+        if vault is not None:
+            self._vault._clock = self._clock
         self._pending = PendingAuthorizationStore()
         self._action_ttl = action_ttl_seconds
         self.audit: list[ReleaseAudit] = []
@@ -622,7 +677,6 @@ class TrustedExecutionBroker:
         self,
         context: RunContext,
         proposal: ExecutionProposal,
-        now: Optional[float] = None,
     ) -> str:
         """Authorize an execution and return an opaque action_id.
 
@@ -666,7 +720,7 @@ class TrustedExecutionBroker:
             self._record("-", None, action, False, "tool registration is not authorized")
             raise AuthorizationError("tool registration is not authorized")
 
-        now = time.monotonic() if now is None else now
+        now = self._clock.now()
         aid = secrets.token_urlsafe(32)
         self._pending.put(PendingAuthorization(
             action_id=aid,
@@ -687,7 +741,6 @@ class TrustedExecutionBroker:
     def redeem_and_execute(
         self,
         action_id: str,
-        now: Optional[float] = None,
     ) -> SanitizedToolResult:
         """Execute exactly the authorization identified by action_id.
 
@@ -696,7 +749,7 @@ class TrustedExecutionBroker:
         state. That is what closes substitution: a valid action_id cannot be aimed
         at a different credential or a different adapter.
         """
-        now = time.monotonic() if now is None else now
+        now = self._clock.now()
 
         try:
             rec = self._pending.claim(action_id, now)

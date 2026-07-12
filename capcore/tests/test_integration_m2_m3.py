@@ -24,6 +24,7 @@ from capcore import (
     Capability, CapabilityStore, Proposal, ReferenceMonitor, RunContext, Verdict,
 )
 from capcore.broker import (
+    FakeClock,
     AuthorizationError, AuthorizationState, CatalogError, Credential,
     CredentialVault, ExecutionProposal, SanitizedToolResult, Secret, ToolCatalog,
     ToolKind, ToolPolicy, ToolRegistration, TrustedExecutionBroker,
@@ -392,11 +393,11 @@ def test_revoke_race_through_the_engine():
 
 
 def test_expired_action_is_denied():
-    import time
     store = build_store()
     monitor = ReferenceMonitor(store)
     cred = CredRecorder()
-    broker = TrustedExecutionBroker(monitor, action_ttl_seconds=10.0)
+    clock = FakeClock(1000.0)
+    broker = TrustedExecutionBroker(monitor, action_ttl_seconds=10.0, clock=clock)
     broker.issue_credential(Credential(
         "cred-1", "cap-1", "read", "acme/records", Secret(SECRET)))
     broker.register_tool(ToolRegistration(
@@ -404,10 +405,10 @@ def test_expired_action_is_denied():
         adapter=cred, version="1", credential_id="cred-1"))
     broker.grant_tool("cred-read", "acme/records")
 
-    t0 = time.monotonic()
-    action_id = broker.register_authorized_execution(ctx(), ep(tool="cred-read"), now=t0)
+    action_id = broker.register_authorized_execution(ctx(), ep(tool="cred-read"))
 
-    result = broker.redeem_and_execute(action_id, now=t0 + 11.0)
+    clock.advance(11.0)       # past the 10s action TTL
+    result = broker.redeem_and_execute(action_id)
 
     assert result.ok is False
     assert cred.delivered == []

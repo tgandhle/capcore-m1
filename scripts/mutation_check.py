@@ -139,6 +139,13 @@ MUTATIONS = [
     # A tool's untrusted return value must be normalized to an inert str before it
     # enters trusted run state. Accepting it raw lets a mutable object reach the
     # model through the shallowly-frozen ModelView.
+    # Credential issue-time must be stamped from the trusted clock, not left at
+    # the -1 sentinel or a caller value. Stamping from a fixed 0 would make every
+    # credential appear issued at epoch, breaking TTL.
+    ("credential_issue_time_not_stamped",
+     "        object.__setattr__(cred, \"_issued_at\", self._clock.now())",
+     "        object.__setattr__(cred, \"_issued_at\", 0.0)  # BUG: ignore the clock",
+     "capcore/broker.py"),
     ("broker_stores_unnormalized_tool_result",
      "    if not isinstance(out, str):\n        return False, None",
      "    if False:\n        return False, None  # BUG: store raw adapter output",

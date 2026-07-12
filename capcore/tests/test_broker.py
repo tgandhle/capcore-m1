@@ -15,6 +15,7 @@ from capcore import (
     Capability, CapabilityStore, Proposal, ReferenceMonitor, RunContext, Verdict,
 )
 from capcore.broker import (
+    FakeClock,
     Secret, Credential, TrustedExecutionBroker, CredentialError,
     AuthorizationError, AuthorizationState, ReleaseAudit, SanitizedToolResult,
     ToolKind, ToolRegistration, ExecutionProposal,
@@ -185,7 +186,8 @@ def test_authorization_is_single_use():
 def test_action_ttl_expiry_denies_after_deadline():
     store, mon, ctx = build()
     rec = Recorder()
-    broker = TrustedExecutionBroker(mon, action_ttl_seconds=10.0)
+    clock = FakeClock(1000.0)
+    broker = TrustedExecutionBroker(mon, action_ttl_seconds=10.0, clock=clock)
     broker.issue_credential(a_credential())
     broker.register_tool(ToolRegistration(
         registration_id="tool-1", verb="read", kind=ToolKind.CREDENTIALED,
@@ -193,16 +195,11 @@ def test_action_ttl_expiry_denies_after_deadline():
     ))
     broker.grant_tool("tool-1", "acme/records")
     prop = Proposal("acme/records/x", "read")
-    decision = mon.authorize(ctx, prop)
-    # The ACTION ttl is self-consistent (expires_at is derived from this same
-    # `now`), so an absolute origin is safe here. Anchoring anyway, so that no
-    # test in this file mixes clock origins and a future credential TTL added to
-    # this fixture cannot silently reintroduce the monotonic-origin bug.
-    t0 = time.monotonic()
     action_id = broker.register_authorized_execution(
-        ctx, ExecutionProposal(action=prop, tool_registration_id="tool-1"), now=t0)
+        ctx, ExecutionProposal(action=prop, tool_registration_id="tool-1"))
 
-    result = broker.redeem_and_execute(action_id, now=t0 + 11.0)
+    clock.advance(11.0)                       # past the 10s action TTL
+    result = broker.redeem_and_execute(action_id)
 
     assert result.ok is False
     assert rec.delivered == []
@@ -302,22 +299,22 @@ def test_expired_credential_refuses_execution():
     """
     store, mon, ctx = build()
     rec = Recorder()
-    broker = TrustedExecutionBroker(mon, action_ttl_seconds=10_000.0)
+    clock = FakeClock(1000.0)
+    broker = TrustedExecutionBroker(mon, action_ttl_seconds=10_000.0, clock=clock)
     cred = a_credential(ttl_seconds=10.0)
-    broker.issue_credential(cred)
+    broker.issue_credential(cred)     # stamped at t=1000 from the clock
     broker.register_tool(ToolRegistration(
         registration_id="tool-1", verb="read", kind=ToolKind.CREDENTIALED,
         adapter=rec, version="1", credential_id="cred-1",
     ))
     broker.grant_tool("tool-1", "acme/records")
-    t0 = cred._issued_at          # anchor everything to the credential's clock
 
     prop = Proposal("acme/records/x", "read")
     action_id = broker.register_authorized_execution(
-        ctx, ExecutionProposal(action=prop, tool_registration_id="tool-1"), now=t0)
+        ctx, ExecutionProposal(action=prop, tool_registration_id="tool-1"))
 
-    # well inside the action TTL (10_000s), well past the CREDENTIAL TTL (10s)
-    result = broker.redeem_and_execute(action_id, now=t0 + 50.0)
+    clock.advance(50.0)   # inside action TTL (10_000s), past credential TTL (10s)
+    result = broker.redeem_and_execute(action_id)
 
     assert result.ok is False
     assert rec.delivered == [], "expired credential must not deliver the secret"
@@ -331,7 +328,8 @@ def test_credential_within_ttl_still_delivers():
     """
     store, mon, ctx = build()
     rec = Recorder()
-    broker = TrustedExecutionBroker(mon, action_ttl_seconds=10_000.0)
+    clock = FakeClock(1000.0)
+    broker = TrustedExecutionBroker(mon, action_ttl_seconds=10_000.0, clock=clock)
     cred = a_credential(ttl_seconds=100.0)
     broker.issue_credential(cred)
     broker.register_tool(ToolRegistration(
@@ -339,13 +337,13 @@ def test_credential_within_ttl_still_delivers():
         adapter=rec, version="1", credential_id="cred-1",
     ))
     broker.grant_tool("tool-1", "acme/records")
-    t0 = cred._issued_at
 
     prop = Proposal("acme/records/x", "read")
     action_id = broker.register_authorized_execution(
-        ctx, ExecutionProposal(action=prop, tool_registration_id="tool-1"), now=t0)
+        ctx, ExecutionProposal(action=prop, tool_registration_id="tool-1"))
 
-    result = broker.redeem_and_execute(action_id, now=t0 + 5.0)   # inside TTL
+    clock.advance(5.0)   # inside the 100s credential TTL
+    result = broker.redeem_and_execute(action_id)
 
     assert result.ok is True
     assert rec.delivered == [MOCK_SECRET]

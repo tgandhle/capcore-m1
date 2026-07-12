@@ -37,6 +37,7 @@ from capcore import (
     RunContext, Verdict,
 )
 from capcore.broker import (
+    FakeClock,
     AuthorizationError, AuthorizationState, Credential, TrustedExecutionBroker,
     CredentialError, ExecutionProposal, PendingAuthorization,
     SanitizedToolResult, Secret, ToolKind, ToolPolicy, ToolRegistration,
@@ -575,7 +576,8 @@ def test_expired_action_is_denied():
     store = build_store()
     monitor = ReferenceMonitor(store)
     calls = MockCalls()
-    broker = TrustedExecutionBroker(monitor, action_ttl_seconds=10.0)
+    clock = FakeClock(1000.0)
+    broker = TrustedExecutionBroker(monitor, action_ttl_seconds=10.0, clock=clock)
     broker.issue_credential(Credential("cred-1", "cap-1", "read", "acme/api",
                                        Secret("LEAKME"), single_use=True))
     broker.register_tool(ToolRegistration(
@@ -586,16 +588,11 @@ def test_expired_action_is_denied():
     broker.grant_tool("http-1", "acme")
     ctx = build_ctx()
     proposal = Proposal("acme/api/x", "read")
-    # Anchor to a single clock origin. The action TTL is self-consistent, but
-    # mixing an absolute `now` with time.monotonic()-based credential state is
-    # how a machine-dependent flake gets in.
-    t0 = time.monotonic()
     action_id = broker.register_authorized_execution(
-        ctx, ExecutionProposal(action=proposal, tool_registration_id="http-1"),
-        now=t0,
-    )
+        ctx, ExecutionProposal(action=proposal, tool_registration_id="http-1"))
 
-    result = broker.redeem_and_execute(action_id, now=t0 + 11.0)
+    clock.advance(11.0)       # past the 10s action TTL
+    result = broker.redeem_and_execute(action_id)
 
     assert result.ok is False
     assert result.code == "authorization_refused"
