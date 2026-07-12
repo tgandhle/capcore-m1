@@ -360,22 +360,48 @@ class ToolCatalog:
     """
 
     def __init__(self):
-        self._tools: dict[str, ToolRegistration] = {}
+        # registration_id -> (registration, generation). The generation is a
+        # monotonic counter the CATALOG owns and the caller cannot set. It is the
+        # authenticity marker for "is this the same tool the authorization was
+        # minted against", replacing the caller-supplied `version` string, which a
+        # caller can repeat or forget to bump and therefore cannot be trusted.
+        self._tools: dict[str, tuple[ToolRegistration, int]] = {}
+        self._next_gen = 0
 
     def register(self, reg: ToolRegistration) -> str:
         if reg.registration_id in self._tools:
             raise CatalogError(f"duplicate tool registration: {reg.registration_id}")
-        self._tools[reg.registration_id] = reg
+        self._tools[reg.registration_id] = (reg, self._next_gen)
+        self._next_gen += 1
         return reg.registration_id
 
     def resolve(self, registration_id: str) -> Optional[ToolRegistration]:
-        return self._tools.get(registration_id)
+        entry = self._tools.get(registration_id)
+        return entry[0] if entry else None
 
-    def replace_for_test(self, reg: ToolRegistration) -> None:
-        """Swap a registration in place. Exists so tests can prove that an
-        authorization minted against version N is refused when version N+1 is
-        registered under the same id."""
-        self._tools[reg.registration_id] = reg
+    def generation(self, registration_id: str) -> Optional[int]:
+        """The catalog-owned generation for a registration, or None if absent.
+
+        A pending authorization stores this. At redemption the current generation
+        must equal the stored one, so any replacement (even under the same id and
+        the same `version` string) breaks the binding: the replacement gets a new
+        generation the caller cannot forge.
+        """
+        entry = self._tools.get(registration_id)
+        return entry[1] if entry else None
+
+    def _replace_unsafe(self, reg: ToolRegistration) -> None:
+        """Force a registration in place, bumping the generation.
+
+        This exists ONLY so tests can prove that a post-authorization swap is
+        refused. It is deliberately named _replace_unsafe (not replace_for_test)
+        and underscored: it is not part of the setup API, and it increments the
+        generation exactly as a real out-of-band mutation would, so the test
+        exercises the real defence rather than a mock of it. Production setup uses
+        register(), which refuses a duplicate id outright.
+        """
+        self._tools[reg.registration_id] = (reg, self._next_gen)
+        self._next_gen += 1
 
 
 # --------------------------------------------------------------------------- #
@@ -461,7 +487,8 @@ class PendingAuthorization:
     action: Proposal
     action_digest: str
     tool_registration_id: str
-    tool_version: str
+    tool_version: str            # audit only; NOT the authenticity check
+    tool_generation: int         # catalog-owned; the authenticity check
     credential_id: Optional[str]
     issued_at: float
     expires_at: float
@@ -707,6 +734,7 @@ class TrustedExecutionBroker:
         if reg is None:
             self._record("-", None, action, False, "unknown tool registration")
             raise AuthorizationError("unknown tool registration")
+        gen = self._catalog.generation(proposal.tool_registration_id)
 
         # ...and serve this action class.
         if reg.verb != action.verb:
@@ -728,7 +756,8 @@ class TrustedExecutionBroker:
             action=action,
             action_digest=action_digest(action),
             tool_registration_id=reg.registration_id,
-            tool_version=reg.version,        # pinned: a swapped tool is refused
+            tool_version=reg.version,         # audit only
+            tool_generation=gen,              # authenticity: catalog-owned
             credential_id=reg.credential_id,  # bound: cannot be substituted
             issued_at=now,
             expires_at=now + self._action_ttl,
@@ -778,7 +807,11 @@ class TrustedExecutionBroker:
             # 3. Resolve the tool from the CATALOG, pinned to the exact version
             #    bound at mint. A tool swapped out in between is refused.
             reg = self._catalog.resolve(rec.tool_registration_id)
-            if reg is None or reg.version != rec.tool_version:
+            gen = self._catalog.generation(rec.tool_registration_id)
+            if reg is None or gen != rec.tool_generation:
+                # The tool was replaced (or removed) after this authorization was
+                # minted. The catalog-owned generation moved; the caller cannot
+                # forge a match. Refuse, even if the `version` string is identical.
                 self._pending.settle(action_id, AuthorizationState.FAILED)
                 self._record(action_id, rec.credential_id, rec.action, False,
                              "tool registration changed since authorization")

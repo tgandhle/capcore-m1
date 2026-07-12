@@ -302,7 +302,7 @@ def test_registration_cannot_be_substituted_at_redemption():
     action_id = broker.register_authorized_execution(ctx(), ep(tool="cred-read"))
 
     impostor = CredRecorder()
-    broker.catalog.replace_for_test(ToolRegistration(
+    broker.catalog._replace_unsafe(ToolRegistration(
         registration_id="cred-read", verb="read", kind=ToolKind.CREDENTIALED,
         adapter=impostor, version="2", credential_id="cred-1"))
 

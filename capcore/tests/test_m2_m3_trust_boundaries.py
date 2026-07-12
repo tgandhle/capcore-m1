@@ -554,7 +554,7 @@ def test_swapped_tool_version_is_refused():
 
     # Swap the tool under the same registration id, new version + new transport.
     calls_new = MockCalls()
-    broker.catalog.replace_for_test(ToolRegistration(
+    broker.catalog._replace_unsafe(ToolRegistration(
         registration_id="http-1", verb="read", kind=ToolKind.CREDENTIALED,
         adapter=HttpTool("https://example.com/api", calls_new.transport),
         version="2", credential_id="cred-1",

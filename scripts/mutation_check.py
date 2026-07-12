@@ -142,6 +142,13 @@ MUTATIONS = [
     # Credential issue-time must be stamped from the trusted clock, not left at
     # the -1 sentinel or a caller value. Stamping from a fixed 0 would make every
     # credential appear issued at epoch, breaking TTL.
+    # The tool's catalog-owned generation is the authenticity check at redemption.
+    # Comparing the caller-supplied version string instead lets a same-version
+    # swap inherit the authorization.
+    ("redemption_ignores_tool_generation",
+     "            if reg is None or gen != rec.tool_generation:",
+     "            if reg is None:  # BUG: same-version swap inherits authorization",
+     "capcore/broker.py"),
     ("credential_issue_time_not_stamped",
      "        object.__setattr__(cred, \"_issued_at\", self._clock.now())",
      "        object.__setattr__(cred, \"_issued_at\", 0.0)  # BUG: ignore the clock",

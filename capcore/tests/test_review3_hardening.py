@@ -226,17 +226,10 @@ def _replace_tool(broker, reg):
     """Replace a registration by whatever mechanism the catalog offers, so this
     test does not depend on the very method it wants removed."""
     cat = broker.catalog
-    if hasattr(cat, "replace_for_test"):
-        cat.replace_for_test(reg)
-    else:
-        # after the fix: replacement goes through register, which should either
-        # refuse a duplicate id or bump an internal generation. Either way the old
-        # authorization must not transfer.
-        try:
-            cat.register(reg)
-        except Exception:
-            cat._tools[reg.registration_id] = reg  # force it, to prove the auth
-            #                                          binding still refuses
+    # _replace_unsafe forces a registration in place and bumps the catalog-owned
+    # generation, exactly as a real out-of-band mutation would. The test proves
+    # the authorization minted against the old generation is refused.
+    cat._replace_unsafe(reg)
 
 
 # --------------------------------------------------------------------------- #
