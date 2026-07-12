@@ -1,93 +1,86 @@
-"""HTTP tool tests, mock transport only (no network, no real secret).
+"""HttpTool tests (credentialed tool, mock transport, no network, no real secret).
 
-Proves: the broker-released secret is sent ONLY to the tool's allowed URL, in
-the Authorization header, and the tool's returned summary never echoes it. The
-tool ignores any URL the (untrusted) proposal might imply, it uses its fixed
-allowed URL.
+Proves the broker-injected secret is sent ONLY to the tool's fixed allowed URL,
+in the Authorization header, and nowhere else. The tool is exercised through the
+broker's redemption path, which is the only path that ever hands it a secret.
 """
 
 from capcore import (
-    Capability, CapabilityStore, Proposal, ReferenceMonitor, RunContext, Verdict,
+    Capability, CapabilityStore, Proposal, ReferenceMonitor, RunContext,
 )
-from capcore.broker import Secret, Credential, CredentialBroker
+from capcore.broker import (
+    Secret, Credential, CredentialBroker, ToolKind, ToolRegistration,
+)
 from capcore.httptool import HttpTool, MockTransport
 
-MOCK_SECRET = "SEKRET-HTTP-999"
+MOCK_SECRET = "SEKRET-TOKEN-12345"
 
 
-def setup():
+def build():
     store = CapabilityStore()
-    store.issue(Capability("cap-run", "acme", "acme/api",
+    store.issue(Capability("cap-run", "acme", "acme/records",
                            frozenset({"read"}), principal="p1", run="r1"))
     mon = ReferenceMonitor(store)
     ctx = RunContext("acme", "p1", "r1")
-    broker = CredentialBroker()
-    broker.issue(Credential("cred-1", "cap-run", "read", "acme/api",
+    return store, mon, ctx
+
+
+def wired(mon, transport, url="https://api.example.com/data"):
+    broker = CredentialBroker(mon)
+    broker.issue(Credential("cred-1", "cap-run", "read", "acme/records",
                             Secret(MOCK_SECRET)))
-    return store, mon, ctx, broker
+    broker.register_tool(ToolRegistration(
+        registration_id="http-1", kind=ToolKind.CREDENTIALED,
+        adapter=HttpTool(url, transport), version="1", credential_id="cred-1",
+    ))
+    return broker
+
+
+def mint(broker, mon, ctx, prop):
+    d = mon.authorize(ctx, prop)
+    return broker.register_authorized_execution(ctx, prop, d, "http-1")
 
 
 def test_secret_sent_only_to_allowed_url_in_auth_header():
-    store, mon, ctx, broker = setup()
+    store, mon, ctx = build()
     transport = MockTransport(status=200)
-    tool = HttpTool("https://api.example.com/data", transport)
+    url = "https://api.example.com/data"
+    broker = wired(mon, transport, url)
+    action_id = mint(broker, mon, ctx, Proposal("acme/records/x", "read"))
 
-    prop = Proposal("acme/api/data", "read")
-    decision = mon.authorize(ctx, prop)
-    secret = broker.release("cred-1", "cap-run", prop, decision)
-    result = tool(prop, secret)
+    result = broker.redeem_and_execute(action_id)
 
-    # exactly one outbound call, to the allowed URL
+    assert result.ok is True
     assert len(transport.calls) == 1
     call = transport.calls[0]
-    assert call["url"] == "https://api.example.com/data"
-    # the secret is in the auth header of THAT call...
-    assert MOCK_SECRET in call["headers"]["Authorization"]
-    # ...and nowhere in the tool's returned summary
-    assert MOCK_SECRET not in result
-    assert "http 200" in result
+    assert call["url"] == url                                  # only the allowed URL
+    assert call["headers"]["Authorization"] == f"Bearer {MOCK_SECRET}"
 
 
-def test_no_secret_no_request_body_leak():
-    store, mon, ctx, broker = setup()
+def test_secret_appears_in_exactly_one_place():
+    store, mon, ctx = build()
     transport = MockTransport()
-    tool = HttpTool("https://api.example.com/data", transport)
-    prop = Proposal("acme/api/data", "read")
-    decision = mon.authorize(ctx, prop)
-    secret = broker.release("cred-1", "cap-run", prop, decision)
-    tool(prop, secret)
-    # the secret appears in exactly one place: the Authorization header of the
-    # single allowed call. Not in the URL, not in the method.
-    call = transport.calls[0]
-    assert MOCK_SECRET not in call["url"]
-    assert MOCK_SECRET not in call["method"]
-    assert sum(MOCK_SECRET in str(v) for v in call["headers"].values()) == 1
+    broker = wired(mon, transport)
+    action_id = mint(broker, mon, ctx, Proposal("acme/records/x", "read"))
+
+    result = broker.redeem_and_execute(action_id)
+
+    # the secret is in the auth header of the single outbound call, and not in
+    # the sanitized result the caller sees
+    assert MOCK_SECRET in transport.calls[0]["headers"]["Authorization"]
+    assert MOCK_SECRET not in (result.body or "")
+    # and not in the URL or method
+    assert MOCK_SECRET not in transport.calls[0]["url"]
 
 
-def test_tool_refuses_without_released_secret():
-    store, mon, ctx, broker = setup()
+def test_no_transport_call_when_action_is_refused():
+    store, mon, ctx = build()
     transport = MockTransport()
-    tool = HttpTool("https://api.example.com/data", transport)
-    # a denied action yields no secret; tool must not call the transport
-    prop = Proposal("acme/api/data", "write")  # write not granted
-    decision = mon.authorize(ctx, prop)
-    assert decision.verdict == Verdict.DENY
-    secret = broker.release("cred-1", "cap-run", prop, decision)  # None
-    result = tool(prop, secret)
-    assert "refused" in result
-    assert len(transport.calls) == 0  # no network attempt without a secret
+    broker = wired(mon, transport)
+    action_id = mint(broker, mon, ctx, Proposal("acme/records/x", "read"))
 
+    store.revoke("cap-run")                 # revoke before redemption
+    result = broker.redeem_and_execute(action_id)
 
-def test_tool_uses_fixed_url_not_proposal():
-    """The tool sends to its CONFIGURED url, never a url implied by the
-    untrusted proposal resource. Even a proposal naming another host does not
-    redirect the request.
-    """
-    store, mon, ctx, broker = setup()
-    transport = MockTransport()
-    tool = HttpTool("https://api.example.com/data", transport)
-    prop = Proposal("acme/api/data", "read")
-    decision = mon.authorize(ctx, prop)
-    secret = broker.release("cred-1", "cap-run", prop, decision)
-    tool(prop, secret)
-    assert transport.calls[0]["url"] == "https://api.example.com/data"
+    assert result.ok is False
+    assert len(transport.calls) == 0        # no network attempt for a revoked action

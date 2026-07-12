@@ -51,10 +51,17 @@ class HttpTool:
         self.transport = transport
         self.method = method
 
-    def __call__(self, proposal: Proposal, secret: Optional[Secret]) -> str:
-        if secret is None:
-            return "refused: no credential released"
+    def execute_with_credential(self, proposal: Proposal, secret: Secret) -> str:
+        """A CredentialedTool. Called ONLY by the broker, inside its boundary.
+
+        This adapter is inside the TCB: it holds the raw secret in order to use
+        it. It must not log it, retain it, or put it anywhere an exception could
+        pick it up. Note the transport may still raise with the header in the
+        message (a hostile or careless transport will), which is exactly why the
+        BROKER catches and discards every exception from this call rather than
+        trusting adapters to sanitize their own errors.
+        """
         headers = {"Authorization": f"Bearer {secret.reveal()}"}
         resp = self.transport(self.method, self.allowed_url, headers)
-        # return a redacted summary; never echo the secret
+        # redacted summary; never echo the secret
         return f"http {resp['status']} from {self.allowed_url}"

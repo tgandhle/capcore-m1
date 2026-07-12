@@ -93,17 +93,30 @@ MUTATIONS = [
      "        if False:  # BUG: never enforce budget\n            record.state = RunState.ABORTED\n            res = StepResult(StepOutcome.BUDGET_EXHAUSTED, proposal,",
      "capcore/runtime.py"),
     # --- M3 broker mutations (target capcore/broker.py) ---
-    ("broker_releases_on_denied_action",
-     "        if decision.verdict != Verdict.ALLOW:",
-     "        if False:  # BUG: release secret even when not authorized",
+    # Re-authorization at redemption: if the live monitor no longer allows the
+    # action, the secret must not leave. Mutating this to always-allow is the
+    # stale-decision / revocation-bypass defect.
+    ("broker_skips_reauthorization_at_redemption",
+     "            if live.verdict != Verdict.ALLOW:",
+     "            if False:  # BUG: skip live re-authorization at redemption",
      "capcore/broker.py"),
+    # Credential scope must cover the resource. Ignoring it lets a credential be
+    # used outside its binding.
     ("broker_ignores_credential_scope",
-     "        if not scope_covers(cred.scope, proposal.resource):",
+     "        if not scope_covers(cred.scope, record.proposal.resource):",
      "        if False:  # BUG: ignore credential scope",
      "capcore/broker.py"),
+    # Consumed/expired credentials must be refused. Ignoring availability defeats
+    # single-use and TTL.
     ("broker_ignores_single_use_and_ttl",
      "        if not cred.is_available(now):",
      "        if False:  # BUG: ignore consumed/expired credential",
+     "capcore/broker.py"),
+    # The single-use consumption itself: if the record is not claimed atomically,
+    # an authorization can be replayed. Mutating the claim guard opens replay.
+    ("broker_allows_replay_of_claimed_action",
+     "        if record.state is not AuthorizationState.PENDING:",
+     "        if False:  # BUG: allow redeeming a non-pending authorization",
      "capcore/broker.py"),
 ]
 
