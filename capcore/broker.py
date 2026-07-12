@@ -91,6 +91,9 @@ from capcore import (
     _covers_safe, scope_covers, valid_proposal, validate_resource,
 )
 
+# Bound on the untrusted tool-registration id the model names.
+MAX_TOOL_ID_BYTES = 128
+
 
 # --------------------------------------------------------------------------- #
 # Errors.
@@ -215,10 +218,14 @@ class ExecutionProposal:
     tool_registration_id: str
 
     def __post_init__(self):
-        if not isinstance(self.action, Proposal):
-            raise AuthorizationError("execution proposal requires a Proposal action")
-        if not isinstance(self.tool_registration_id, str) or not self.tool_registration_id:
-            raise AuthorizationError("execution proposal requires a tool_registration_id")
+        # EXACT types. A Proposal subclass or a str-subclass tool id could carry
+        # different semantics into execution than authorization validated.
+        if type(self.action) is not Proposal:
+            raise AuthorizationError("execution proposal requires an exact Proposal action")
+        if type(self.tool_registration_id) is not str or not self.tool_registration_id:
+            raise AuthorizationError("execution proposal requires an exact str tool_registration_id")
+        if len(self.tool_registration_id.encode("utf-8")) > MAX_TOOL_ID_BYTES:
+            raise AuthorizationError("tool_registration_id exceeds maximum length")
 
 
 # --------------------------------------------------------------------------- #
@@ -638,12 +645,15 @@ class PendingAuthorizationStore:
             if rec is None:
                 # Forged or unknown id: no record, therefore no authorization,
                 # whatever object the caller may have constructed.
-                raise AuthorizationError("unknown authorization")
+                raise ClaimRefused(BrokerRefusal.UNKNOWN_ACTION_ID,
+                                   "unknown authorization")
             if rec.state is not AuthorizationState.PENDING:
-                raise AuthorizationError("authorization is not redeemable")
+                raise ClaimRefused(BrokerRefusal.ACTION_ALREADY_REDEEMED,
+                                   "authorization is not redeemable")
             if now >= rec.expires_at:
                 self._records[action_id] = replace(rec, state=AuthorizationState.FAILED)
-                raise AuthorizationError("authorization expired")
+                raise ClaimRefused(BrokerRefusal.ACTION_EXPIRED,
+                                   "authorization expired")
 
             claimed = replace(rec, state=AuthorizationState.EXECUTING)
             self._records[action_id] = claimed
@@ -689,7 +699,25 @@ class BrokerRefusal:
     CREDENTIAL_SCOPE_MISMATCH = "credential_scope_mismatch"
     CREDENTIAL_EXPIRED = "credential_expired"
     CREDENTIAL_CONSUMED = "credential_consumed"
-    CLAIM_REFUSED = "claim_refused"                     # unknown/expired at claim
+    # Typed claim-refusal reasons. An expired PENDING authorization, an unknown
+    # id, or a non-redeemable state are DISTINCT conditions and none of them is a
+    # revoke race. They previously collapsed into the generic CLAIM_REFUSED, which
+    # the engine mapped to REVOKED_RACE.
+    UNKNOWN_ACTION_ID = "unknown_action_id"
+    ACTION_EXPIRED = "action_expired"
+    ACTION_ALREADY_REDEEMED = "action_already_redeemed"
+    CLAIM_REFUSED = "claim_refused"                     # fallback, unspecified
+
+
+class ClaimRefused(AuthorizationError):
+    """Raised by PendingAuthorizationStore.claim with a TYPED reason.
+
+    Carries a BrokerRefusal code so the redemption path classifies the refusal
+    from a value, not by parsing an exception message.
+    """
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -925,10 +953,9 @@ class TrustedExecutionBroker:
 
         try:
             rec = self._pending.claim(action_id, now)
-        except AuthorizationError as e:
+        except ClaimRefused as e:
             self._record(action_id, None, None, False, str(e))
-            return SanitizedToolResult.failed("authorization_refused",
-                                              BrokerRefusal.CLAIM_REFUSED)
+            return SanitizedToolResult.failed("authorization_refused", e.code)
 
         try:
             # 1. LIVE re-authorization. Current-authority semantics. A capability

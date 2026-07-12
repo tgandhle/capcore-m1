@@ -65,6 +65,22 @@ MUTATIONS = [
     ("issue_root_accepts_child_shaped",
      '        if cap.parent is not None:\n            raise StoreError(\n                "root capability must not specify a parent; use derive_child()")\n',
      ""),
+    # Untrusted proposal fields must be size-bounded. Removing the resource byte
+    # limit lets a remote model amplify memory/CPU across the whole pipeline.
+    # Exact-type at the proposal boundary. isinstance would accept a str subclass
+    # that lies via split()/__str__(), diverging authorization from execution.
+    ("proposal_accepts_str_subclass_resource",
+     "    if type(path) is not str:\n        raise ResourceError(\"resource must be an exact built-in str\")",
+     "    if False:\n        raise ResourceError(\"resource must be an exact built-in str\")",
+     "capcore/__init__.py"),
+    ("proposal_resource_size_unbounded",
+     "    if len(path.encode(\"utf-8\")) > MAX_RESOURCE_BYTES:\n        raise ResourceError(\"resource exceeds maximum length\")",
+     "    if False:\n        raise ResourceError(\"resource exceeds maximum length\")",
+     "capcore/__init__.py"),
+    ("proposal_segment_size_unbounded",
+     "        if len(s.encode(\"utf-8\")) > MAX_SEGMENT_BYTES:\n            raise ResourceError(\"path segment exceeds maximum length\")",
+     "        if False:\n            raise ResourceError(\"path segment exceeds maximum length\")",
+     "capcore/__init__.py"),
     ("resource_traversal_allowed",
      '        if s in (".", ".."):\n            raise ResourceError("\'.\' and \'..\' segments not allowed (path traversal)")\n',
      ""),
@@ -89,6 +105,13 @@ MUTATIONS = [
     # before the credential is touched. The revoke-race mutation therefore targets
     # the broker's live re-authorization (see broker_skips_reauthorization_at_
     # redemption below). What remains engine-side is the BUDGET.
+    # A broker-denied action (nothing executed) must not consume the action
+    # budget when count_denied_attempts is False. Counting it before the mint
+    # re-conflates denial with execution.
+    ("denied_action_consumes_budget",
+     "        # The broker minted an authorization: execution is now being attempted,\n        # which may produce an external effect. Count it exactly once here, for\n        # BOTH budget modes.\n        record.steps_taken += 1",
+     "        pass  # BUG: never count executed actions, or count them before mint",
+     "capcore/runtime.py"),
     ("budget_not_enforced",
      "        if record.steps_taken >= self.budget.max_actions:\n            record.state = RunState.ABORTED\n            res = StepResult(StepOutcome.BUDGET_EXHAUSTED, action,",
      "        if False:  # BUG: never enforce budget\n            record.state = RunState.ABORTED\n            res = StepResult(StepOutcome.BUDGET_EXHAUSTED, action,",
@@ -111,15 +134,34 @@ MUTATIONS = [
     # authority at the engine/broker seam.
     # run() must validate the proposal type at the boundary, not trust the
     # adapter. Removing the check lets a malformed PROPOSAL crash the loop.
+    # An outcome outside the explicit algebra must fail closed. Removing the
+    # final else lets a bogus outcome fall through and execute as a proposal.
+    ("unknown_model_outcome_executes",
+     "            else:\n                # ANY outcome outside the explicit algebra fails closed. This is\n                # the whole point: unknown outcomes must not fall through and be\n                # treated as a proposal. Covers a bypassed __post_init__, a future\n                # enum member the loop does not handle, or a corrupted value.\n                record.state = RunState.FAILED\n                record.stop_reason = StopReason.MODEL_ERROR\n                return record",
+     "            else:\n                pass  # BUG: unknown outcome falls through to proposal dispatch",
+     "capcore/runtime.py"),
     ("run_skips_proposal_type_check",
-     "            if type(result.proposal) is not ExecutionProposal:\n                record.state = RunState.FAILED\n                record.stop_reason = StopReason.MODEL_ERROR\n                return record\n\n            step_result = self.step(record, result.proposal)",
-     "            step_result = self.step(record, result.proposal)  # BUG: no boundary type check",
+     "                if type(result.proposal) is not ExecutionProposal:\n                    record.state = RunState.FAILED\n                    record.stop_reason = StopReason.MODEL_ERROR\n                    return record",
+     "                if False:\n                    record.state = RunState.FAILED\n                    record.stop_reason = StopReason.MODEL_ERROR\n                    return record",
      "capcore/runtime.py"),
     # An expired/consumed credential must not be reported as a revoke race. If the
     # engine maps every refusal to REVOKED_RACE, trusted history lies about why.
+    # An expired PENDING authorization must map to a neutral refusal, not
+    # REVOKED_RACE. Collapsing the claim codes back to REVOKED_RACE re-lies in
+    # trusted history.
+    ("expired_pending_auth_is_revoke_race",
+     "    return StepOutcome.AUTHORIZATION_REFUSED, f\"authorization refused: {audit_code}\"",
+     "    return StepOutcome.REVOKED_RACE, f\"authorization refused: {audit_code}\"  # BUG",
+     "capcore/runtime.py"),
+    # The claim path must raise TYPED reasons, not one generic code. Collapsing
+    # ACTION_EXPIRED into the fallback loses the distinction.
+    ("claim_expiry_not_typed",
+     "                raise ClaimRefused(BrokerRefusal.ACTION_EXPIRED,\n                                   \"authorization expired\")",
+     "                raise ClaimRefused(BrokerRefusal.CLAIM_REFUSED,\n                                   \"authorization expired\")  # BUG: generic",
+     "capcore/broker.py"),
     ("refusal_mislabeled_as_revoke_race",
-     "            if audit == BrokerRefusal.REAUTHORIZATION_FAILED:",
-     "            if True:  # BUG: label every refusal a revoke race",
+     "    if audit_code == BrokerRefusal.REAUTHORIZATION_FAILED:\n        return StepOutcome.REVOKED_RACE, \"authorization lost before execution\"",
+     "    if True:\n        return StepOutcome.REVOKED_RACE, \"authorization lost before execution\"  # BUG: every refusal a revoke race",
      "capcore/runtime.py"),
     ("engine_accepts_divergent_monitor",
      "        if passed_monitor is not None and passed_monitor is not broker.monitor:",
@@ -206,19 +248,19 @@ MUTATIONS = [
     # A provider failure must not be reported as a completion. This is the
     # difference between "the work is done" and "nothing happened and we lied".
     ("provider_error_reported_as_completion",
-     "            if result.outcome is ModelOutcome.ERROR:\n                record.state = RunState.FAILED",
-     "            if result.outcome is ModelOutcome.ERROR:\n                record.state = RunState.COMPLETED  # BUG: failure looks like success",
+     "            if outcome is ModelOutcome.ERROR:\n                record.state = RunState.FAILED",
+     "            if outcome is ModelOutcome.ERROR:\n                record.state = RunState.COMPLETED  # BUG: failure looks like success",
      "capcore/runtime.py"),
     # An adapter that raises is a failed provider, not a finished one.
     ("model_exception_swallowed_as_completion",
-     "                record.state = RunState.FAILED\n                record.stop_reason = StopReason.MODEL_ERROR\n                return record\n\n            if not isinstance(result, ModelResult):",
-     "                record.state = RunState.COMPLETED  # BUG: crash looks like success\n                record.stop_reason = StopReason.MODEL_ERROR\n                return record\n\n            if not isinstance(result, ModelResult):",
+     "            if type(result) is not ModelResult:\n                # An adapter that does not return an exact ModelResult cannot be\n                # trusted to mean \"finished\". A subclass could override behaviour;\n                # a None or look-alike is not the protocol. Fail closed.\n                record.state = RunState.FAILED",
+     "            if type(result) is not ModelResult:\n                record.state = RunState.COMPLETED  # BUG: untyped result looks finished",
      "capcore/runtime.py"),
     # OllamaModel must not turn a transport failure into a clean stop.
     # An adapter hitting its own cap must not report task completion.
     ("adapter_limit_becomes_completion",
-     "            if result.outcome is ModelOutcome.LIMIT_REACHED:\n                # The adapter stopped asking; the model did not say it was done.\n                # That is an abort, not a completion: the task may be unfinished.\n                record.state = RunState.ABORTED",
-     "            if result.outcome is ModelOutcome.LIMIT_REACHED:\n                record.state = RunState.COMPLETED  # BUG: truncated run looks finished",
+     "            elif outcome is ModelOutcome.LIMIT_REACHED:\n                # The adapter stopped asking; the model did not say it was done.\n                # That is an abort, not a completion: the task may be unfinished.\n                record.state = RunState.ABORTED",
+     "            elif outcome is ModelOutcome.LIMIT_REACHED:\n                record.state = RunState.COMPLETED  # BUG: truncated run looks finished",
      "capcore/runtime.py"),
     ("ollama_error_becomes_finished",
      "            return ModelResult.error()\n\n        proposal = parse_proposal(text)",

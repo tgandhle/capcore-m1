@@ -83,6 +83,37 @@ class StepOutcome(Enum):
     CREDENTIAL_REFUSED = "credential_refused"    # credential expired/consumed/
     #                     scope/verb mismatch: distinct from a revoke race
     INTEGRITY_REFUSED = "integrity_refused"      # digest/tool-generation mismatch
+    AUTHORIZATION_REFUSED = "authorization_refused"  # unredeemable pending auth
+    #                     (unknown id, expired, already redeemed): NOT a revoke race
+
+
+def _map_refusal(audit_code: str) -> tuple["StepOutcome", str]:
+    """Map a broker refusal audit_code to an honest StepOutcome.
+
+    Extracted from step() so it is directly testable: exercising the expired /
+    unknown / already-redeemed pending-authorization cases end-to-end through the
+    engine is not reliably possible (time cannot be injected between the engine's
+    internal mint and redeem), so the mapping is unit-tested here instead.
+
+    REVOKED_RACE is reserved for exactly one code: REAUTHORIZATION_FAILED, a live
+    capability re-authorization failure. Every other refusal maps to a distinct,
+    non-revoke-race outcome. Unknown codes fail closed to a neutral refusal.
+    """
+    from capcore.broker import BrokerRefusal
+    if audit_code == BrokerRefusal.REAUTHORIZATION_FAILED:
+        return StepOutcome.REVOKED_RACE, "authorization lost before execution"
+    if audit_code in (BrokerRefusal.CREDENTIAL_EXPIRED,
+                      BrokerRefusal.CREDENTIAL_CONSUMED,
+                      BrokerRefusal.CREDENTIAL_SCOPE_MISMATCH,
+                      BrokerRefusal.CREDENTIAL_VERB_MISMATCH,
+                      BrokerRefusal.NO_CREDENTIAL):
+        return StepOutcome.CREDENTIAL_REFUSED, f"credential refused: {audit_code}"
+    if audit_code in (BrokerRefusal.ACTION_DIGEST_MISMATCH,
+                      BrokerRefusal.TOOL_CHANGED):
+        return StepOutcome.INTEGRITY_REFUSED, f"integrity refused: {audit_code}"
+    # Unredeemable pending authorization (expired / unknown / already redeemed),
+    # and any unrecognized code: a neutral refusal, never REVOKED_RACE.
+    return StepOutcome.AUTHORIZATION_REFUSED, f"authorization refused: {audit_code}"
 
 
 @dataclass(frozen=True)
@@ -481,7 +512,13 @@ class ExecutionEngine:
 
         # 2. Propose-time authorization (control flow + audit).
         first = self._authorize(record.ctx, action)
-        if self.budget.count_denied_attempts or first.verdict == Verdict.ALLOW:
+
+        # Budget accounting for DENIED / APPROVAL happens here ONLY when the run
+        # counts denied attempts. With count_denied_attempts=False, an M1 denial
+        # or approval classification does not consume the ACTION budget; the count
+        # for an authorized action is deferred until the broker actually mints an
+        # authorization (execution attempted). See the mint site below.
+        if self.budget.count_denied_attempts and first.verdict != Verdict.ALLOW:
             record.steps_taken += 1
 
         if first.verdict == Verdict.DENY:
@@ -504,9 +541,13 @@ class ExecutionEngine:
         try:
             action_id = self.broker.register_authorized_execution(record.ctx, proposal)
         except AuthorizationError as e:
-            # The broker refused. WHY it refused matters for audit, and lumping
-            # every refusal under REVOKED_RACE was false reporting: a model naming
-            # a tool that does not exist is not a revocation race.
+            # The broker refused. A refusal here means NOTHING executed and no
+            # executor was even resolved (unknown/unauthorized tool, verb
+            # mismatch). With count_denied_attempts=False this must NOT consume the
+            # action budget: max_actions is the EXECUTION budget, and nothing ran.
+            # With count_denied_attempts=True, every attempt counts.
+            if self.budget.count_denied_attempts:
+                record.steps_taken += 1
             reason = str(e)
             if "unknown tool registration" in reason:
                 outcome = StepOutcome.TOOL_NOT_FOUND
@@ -521,6 +562,11 @@ class ExecutionEngine:
                              audit_reason=f"broker refused authorization: {reason}")
             record.history.append(res)
             return res
+
+        # The broker minted an authorization: execution is now being attempted,
+        # which may produce an external effect. Count it exactly once here, for
+        # BOTH budget modes.
+        record.steps_taken += 1
 
         # 5. Redeem. The broker re-authorizes AGAIN, resolves the tool and
         #    credential from its own state, executes inside its boundary, and
@@ -538,23 +584,7 @@ class ExecutionEngine:
             # credential that expired or was consumed, a scope/verb mismatch, or a
             # digest/tool-generation change are distinct conditions and must not be
             # mislabeled REVOKED_RACE. The model still saw only the generic code.
-            from capcore.broker import BrokerRefusal
-            audit = result.audit_code
-            if audit == BrokerRefusal.REAUTHORIZATION_FAILED:
-                outcome, why = StepOutcome.REVOKED_RACE, "authorization lost before execution"
-            elif audit in (BrokerRefusal.CREDENTIAL_EXPIRED,
-                           BrokerRefusal.CREDENTIAL_CONSUMED,
-                           BrokerRefusal.CREDENTIAL_SCOPE_MISMATCH,
-                           BrokerRefusal.CREDENTIAL_VERB_MISMATCH,
-                           BrokerRefusal.NO_CREDENTIAL):
-                outcome, why = StepOutcome.CREDENTIAL_REFUSED, f"credential refused: {audit}"
-            elif audit in (BrokerRefusal.ACTION_DIGEST_MISMATCH,
-                           BrokerRefusal.TOOL_CHANGED):
-                outcome, why = StepOutcome.INTEGRITY_REFUSED, f"integrity refused: {audit}"
-            else:
-                # CLAIM_REFUSED or unknown: an unredeemable authorization. Not a
-                # revoke race; a generic refusal.
-                outcome, why = StepOutcome.REVOKED_RACE, f"authorization refused: {audit}"
+            outcome, why = _map_refusal(result.audit_code)
             res = StepResult(outcome, action, audit_reason=why)
             record.history.append(res)
             return res
@@ -601,38 +631,51 @@ class ExecutionEngine:
                 record.stop_reason = StopReason.MODEL_ERROR
                 return record
 
-            if not isinstance(result, ModelResult):
-                # An adapter that does not speak the typed protocol cannot be
-                # trusted to mean "finished" by returning None. Treat as failure.
+            if type(result) is not ModelResult:
+                # An adapter that does not return an exact ModelResult cannot be
+                # trusted to mean "finished". A subclass could override behaviour;
+                # a None or look-alike is not the protocol. Fail closed.
                 record.state = RunState.FAILED
                 record.stop_reason = StopReason.MODEL_ERROR
                 return record
 
-            if result.outcome is ModelOutcome.ERROR:
+            from capcore.broker import ExecutionProposal
+            outcome = result.outcome
+
+            if outcome is ModelOutcome.ERROR:
                 record.state = RunState.FAILED
                 record.stop_reason = StopReason.PROVIDER_UNAVAILABLE
                 return record
 
-            if result.outcome is ModelOutcome.FINISHED:
+            elif outcome is ModelOutcome.FINISHED:
                 record.state = RunState.COMPLETED
                 record.stop_reason = StopReason.MODEL_FINISHED
                 return record
 
-            if result.outcome is ModelOutcome.LIMIT_REACHED:
+            elif outcome is ModelOutcome.LIMIT_REACHED:
                 # The adapter stopped asking; the model did not say it was done.
                 # That is an abort, not a completion: the task may be unfinished.
                 record.state = RunState.ABORTED
                 record.stop_reason = StopReason.ADAPTER_LIMIT_REACHED
                 return record
 
-            # A PROPOSAL must carry a real ExecutionProposal. run() checks this at
-            # the boundary, not only in ModelResult.__post_init__, because it does
-            # not control the adapter: a hostile or buggy adapter can construct a
-            # ModelResult by paths that skip validation, or return a look-alike.
-            # A malformed proposal must FAIL CLOSED here, never reach step() and
-            # crash the loop with an AttributeError.
-            from capcore.broker import ExecutionProposal
-            if type(result.proposal) is not ExecutionProposal:
+            elif outcome is ModelOutcome.PROPOSAL:
+                # A PROPOSAL must carry a real ExecutionProposal. run() checks this
+                # at the boundary, not only in ModelResult.__post_init__, because
+                # it does not control the adapter: a hostile or buggy adapter can
+                # construct a ModelResult by paths that skip validation. A
+                # malformed proposal fails closed here, never reaching step().
+                if type(result.proposal) is not ExecutionProposal:
+                    record.state = RunState.FAILED
+                    record.stop_reason = StopReason.MODEL_ERROR
+                    return record
+                # fall through to dispatch below
+
+            else:
+                # ANY outcome outside the explicit algebra fails closed. This is
+                # the whole point: unknown outcomes must not fall through and be
+                # treated as a proposal. Covers a bypassed __post_init__, a future
+                # enum member the loop does not handle, or a corrupted value.
                 record.state = RunState.FAILED
                 record.stop_reason = StopReason.MODEL_ERROR
                 return record

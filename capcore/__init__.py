@@ -35,6 +35,15 @@ from typing import Optional
 import re as _re
 _SEGMENT_RE = _re.compile(r"^[A-Za-z0-9._\-]+$")
 
+# Size limits on UNTRUSTED proposal fields. A remote model provider can return
+# oversized ordinary strings; bounding them stops memory/CPU amplification across
+# validation, hashing, audit, trusted history, and prompt construction. Bounds are
+# in BYTES (utf-8), not characters. Chosen conservatively; a legitimate
+# tenant/path/id is far under these.
+MAX_RESOURCE_BYTES = 4 * 1024      # whole resource path
+MAX_SEGMENT_BYTES = 255           # one path segment
+MAX_VERB_BYTES = 64               # verb
+
 
 class ResourceError(ValueError):
     """Raised when a resource path or scope is not canonical/valid."""
@@ -58,6 +67,19 @@ def validate_resource(path: str) -> tuple[str, ...]:
     """
     if not isinstance(path, str) or path == "":
         raise ResourceError("resource must be a non-empty string")
+    # Exact built-in str only. A subclass can override split()/encode() to make
+    # this function validate a different string than the one the adapter later
+    # uses. validate_resource is the single gate for scopes and resources, so the
+    # exact-type check belongs here too, not only in valid_proposal.
+    if type(path) is not str:
+        raise ResourceError("resource must be an exact built-in str")
+    # Bound the TOTAL length before doing any work. An untrusted remote model can
+    # return an oversized ordinary string (no Python subclassing needed), and it
+    # amplifies across validation, hashing, audit, trusted history, and every
+    # subsequent ModelView and prompt. Bound by BYTES, not characters, since a
+    # multibyte character can be several bytes.
+    if len(path.encode("utf-8")) > MAX_RESOURCE_BYTES:
+        raise ResourceError("resource exceeds maximum length")
     if "\\" in path:
         raise ResourceError("backslash not allowed in resource path")
     if "%" in path:
@@ -72,6 +94,8 @@ def validate_resource(path: str) -> tuple[str, ...]:
     for s in raw:
         if s == "":
             raise ResourceError("empty path segment not allowed")
+        if len(s.encode("utf-8")) > MAX_SEGMENT_BYTES:
+            raise ResourceError("path segment exceeds maximum length")
         if s in (".", ".."):
             raise ResourceError("'.' and '..' segments not allowed (path traversal)")
         if not _SEGMENT_RE.match(s):
@@ -228,10 +252,16 @@ def valid_proposal(obj) -> bool:
     is where a malformed or traversal resource ('a/../secret') is turned into a
     fail-closed deny before it can reach scope comparison.
     """
+    # EXACT TYPE, not isinstance. A str subclass can override split(), __str__(),
+    # or encode(), so authorization would validate one semantic value while the
+    # adapter receives another (a resource whose split() lies, or a verb whose
+    # str() differs from its value). The security property depends on built-in str
+    # behaviour, so only the exact built-in is accepted. Same rule the tool-result
+    # boundary already enforces; applied here for consistency.
     return (
-        isinstance(obj, Proposal)
-        and isinstance(obj.verb, str) and len(obj.verb) > 0
-        and isinstance(obj.resource, str)
+        type(obj) is Proposal
+        and type(obj.verb) is str and 0 < len(obj.verb.encode("utf-8")) <= MAX_VERB_BYTES
+        and type(obj.resource) is str
         and is_valid_resource(obj.resource)
     )
 
