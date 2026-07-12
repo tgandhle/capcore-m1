@@ -515,6 +515,37 @@ class ReleaseAudit:
 
 DEFAULT_ACTION_TTL_SECONDS = 30.0
 
+# A tool's return value is UNTRUSTED and crosses into trusted run state (it is
+# stored in RunRecord.history and shown to the model via ModelView). ModelView is
+# only shallowly frozen, so a mutable return value (a dict, a list, a custom
+# object) would give the model a live handle into trusted history. The boundary
+# therefore accepts only an inert value: a bounded str. Anything else is a
+# sanitized failure, not a stored object.
+MAX_TOOL_RESULT_BYTES = 64 * 1024
+
+
+def _normalize_tool_result(out) -> tuple[bool, Optional[str]]:
+    """Validate an adapter's return value for storage in trusted state.
+
+    Returns (ok, body). A tool may legitimately return None (it did something and
+    has nothing to say); that is an inert, immutable value and is allowed, with a
+    None body. A str under the size cap is allowed as-is. Anything else, a dict, a
+    list, a custom object, an oversized str, cannot be trusted to be immutable or
+    bounded and is rejected: (False, None).
+
+    A str and None are both inert, so neither gives the model a handle into
+    trusted history. A structured-result path (canonical JSON into a fresh
+    immutable value) is a future extension; the inert-str-or-None rule is the v1
+    floor.
+    """
+    if out is None:
+        return True, None
+    if not isinstance(out, str):
+        return False, None
+    if len(out.encode("utf-8")) > MAX_TOOL_RESULT_BYTES:
+        return False, None
+    return True, out
+
 
 class TrustedExecutionBroker:
     """The one interface the engine sees. Internally separated; externally single.
@@ -722,9 +753,15 @@ class TrustedExecutionBroker:
             self._pending.settle(action_id, AuthorizationState.FAILED)
             self._record(action_id, None, rec.action, False, "tool raised")
             return SanitizedToolResult.failed("tool_failed")
+        ok, body = _normalize_tool_result(out)
+        if not ok:
+            self._pending.settle(action_id, AuthorizationState.FAILED)
+            self._record(action_id, None, rec.action, False,
+                         "tool returned an unacceptable result")
+            return SanitizedToolResult.failed("invalid_tool_result")
         self._pending.settle(action_id, AuthorizationState.COMPLETED)
         self._record(action_id, None, rec.action, True, "executed")
-        return SanitizedToolResult.succeeded(out)
+        return SanitizedToolResult.succeeded(body)
 
     def _execute_credentialed(self, action_id, reg, rec, now) -> SanitizedToolResult:
         cred = self._vault.resolve(rec.credential_id)
@@ -774,6 +811,12 @@ class TrustedExecutionBroker:
                          "credentialed tool failed")
             return SanitizedToolResult.failed("credentialed_tool_execution_failed")
 
+        ok, body = _normalize_tool_result(out)
+        if not ok:
+            self._pending.settle(action_id, AuthorizationState.FAILED)
+            self._record(action_id, cred.id, rec.action, False,
+                         "tool returned an unacceptable result")
+            return SanitizedToolResult.failed("invalid_tool_result")
         self._pending.settle(action_id, AuthorizationState.COMPLETED)
         self._record(action_id, cred.id, rec.action, True, "executed")
-        return SanitizedToolResult.succeeded(out)
+        return SanitizedToolResult.succeeded(body)

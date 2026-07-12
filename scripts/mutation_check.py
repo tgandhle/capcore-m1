@@ -136,6 +136,13 @@ MUTATIONS = [
      "            raise ValueError(f\"invalid tool-grant scope: {self.scope!r}\") from exc",
      "            pass  # BUG: swallow an invalid tool-grant scope",
      "capcore/broker.py"),
+    # A tool's untrusted return value must be normalized to an inert str before it
+    # enters trusted run state. Accepting it raw lets a mutable object reach the
+    # model through the shallowly-frozen ModelView.
+    ("broker_stores_unnormalized_tool_result",
+     "    if not isinstance(out, str):\n        return False, None",
+     "    if False:\n        return False, None  # BUG: store raw adapter output",
+     "capcore/broker.py"),
     # A provider failure must not be reported as a completion. This is the
     # difference between "the work is done" and "nothing happened and we lied".
     ("provider_error_reported_as_completion",
