@@ -4,26 +4,19 @@ Deliberately deferred work, tracked here so it survives across sessions rather
 than living in memory. None of these is a defect; each is a known, documented
 gap or a cleanup with its own reason to be a separate change.
 
-## 1. Focused mutation selectors (harness)
+## 1. Focused mutation selectors (harness) — DONE (commit 6dffc4e)
 
-Requested in review round 5. Give each mutation in `scripts/mutation_check.py` a
-`tests=(...)` selector naming the smallest test(s) that prove its invariant, and
-add `--focused` / `--full` modes:
+Delivered: `--focused` / `--full` modes; optional per-mutation `tests=(...)`
+selectors; the four safety semantics (green-before, applied-once, red-after,
+collection-error/timeout-as-harness-error); and self-tests for the harness in
+`capcore/tests/test_mutation_harness.py`.
 
-- `--focused` (PR / routine CI): run only the selected tests per mutation. Fast.
-- `--full` (nightly / manual): run the whole suite per mutation. Deep.
-
-Safety semantics the harness MUST enforce so a mispaired selector cannot create
-false confidence:
-
-- The selected tests pass on the UNMUTATED copy (green-before).
-- The mutation is applied exactly once (already checked: stale detection).
-- The selected tests FAIL on the mutated copy (red-after).
-- A collection error or timeout is reported as a HARNESS ERROR, not a kill.
-- The original source is unchanged after the run.
-
-Rationale for a separate commit: this changes the assurance mechanism itself, so
-it must be independently reviewable.
+ONGOING CONVENTION (not a separate task, just a habit): selectors are declared on
+only 3 of 49 mutations so far. A mutation without selectors falls back to the full
+suite in focused mode (safe, just slower). When adding a NEW mutation, give it a
+selector while the relevant test is fresh; back-filling the existing 46 is
+low-value grunt work and a wrong selector is worse than none, so let them accrue
+rather than bulk-adding.
 
 ## 2. Dual-form `ExecutionEngine` constructor cleanup
 
