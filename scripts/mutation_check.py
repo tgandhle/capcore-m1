@@ -2,23 +2,43 @@
 """Reproducible, crash-safe, reliable mutation check for capcore.
 
 For each known defect, this reintroduces the bug into a FRESH TEMPORARY COPY of
-the package (never the live source), runs the test suite against that copy, and
-asserts the suite FAILS. If any mutation is not caught, it is a survivor and the
-script exits non-zero.
+the package (never the live source), runs tests against that copy, and asserts
+the tests FAIL. If any mutation is not caught, it is a survivor and the script
+exits non-zero.
 
-Reliability properties:
-  - The live working tree is never modified (crash-safe): all mutation happens
-    in throwaway temp dirs that are deleted afterward. Interrupt/timeout/crash
-    cannot leave your source mutated.
-  - A FRESH temp copy per mutation (no shared bytecode or Hypothesis state
-    accumulating across runs, which could wedge the run).
+MODES:
+  python scripts/mutation_check.py            # full (default): whole suite per mutation
+  python scripts/mutation_check.py --full     # same as default
+  python scripts/mutation_check.py --focused  # fast: only each mutation's declared selectors
+
+  Full mode is the deep, always-correct path (nightly / release). Focused mode is
+  the fast path for routine feedback (PRs): each mutation runs only the specific
+  tests declared to prove its invariant. A mutation with no declared selectors
+  falls back to the full suite even in focused mode (safe: slower, never wrong).
+
+SELECTORS:
+  A mutation entry may carry a 5th element: a tuple of pytest node ids that prove
+  its invariant, e.g.
+    ("resource_size_unbounded", find, replace, "capcore/__init__.py",
+     ("capcore/tests/test_review5_hardening.py::test_proposal_resource_length_is_bounded",))
+
+SAFETY (why a mispaired selector cannot create false confidence):
+  For every focused mutation the harness enforces, in order:
+    1. GREEN-BEFORE: the selected tests PASS on the unmutated copy. A selector
+       that fails here is mispaired/broken; its red-after would be meaningless.
+       Reported as a HARNESS ERROR, never a caught mutation.
+    2. APPLIED ONCE: the anchor occurs exactly once (else 'stale').
+    3. RED-AFTER: the selected tests FAIL on the mutated copy (that is 'caught').
+    4. Collection/usage errors and timeouts are HARNESS ERRORS, not kills: a
+       mutation is 'caught' only when tests RUN and FAIL (pytest exit code 1),
+       never when they fail to collect (exit >= 2).
+  The live working tree is never modified; all mutation happens in throwaway temp
+  dirs. Interrupt/timeout/crash cannot leave your source mutated.
+
+Reliability properties (unchanged):
+  - A FRESH temp copy per mutation (no shared bytecode or Hypothesis state).
   - PYTHONDONTWRITEBYTECODE and an isolated Hypothesis storage dir per run.
-  - A per-mutation subprocess timeout. A timeout is a HARNESS ERROR, not a
-    caught mutation, and fails the run.
-  - pytest -x stops at the first failing test, so a caught mutation returns fast.
-
-Run:
-    python scripts/mutation_check.py
+  - A per-mutation subprocess timeout, reported as a harness error.
 """
 
 from __future__ import annotations
@@ -72,15 +92,19 @@ MUTATIONS = [
     ("proposal_accepts_str_subclass_resource",
      "    if type(path) is not str:\n        raise ResourceError(\"resource must be an exact built-in str\")",
      "    if False:\n        raise ResourceError(\"resource must be an exact built-in str\")",
-     "capcore/__init__.py"),
+     "capcore/__init__.py",
+     ("capcore/tests/test_review5_hardening.py::test_resource_str_subclass_is_rejected",
+      "capcore/tests/test_review5_hardening.py::test_validate_resource_directly_rejects_str_subclass")),
     ("proposal_resource_size_unbounded",
      "    if len(path.encode(\"utf-8\")) > MAX_RESOURCE_BYTES:\n        raise ResourceError(\"resource exceeds maximum length\")",
      "    if False:\n        raise ResourceError(\"resource exceeds maximum length\")",
-     "capcore/__init__.py"),
+     "capcore/__init__.py",
+     ("capcore/tests/test_review5_hardening.py::test_proposal_resource_length_is_bounded",)),
     ("proposal_segment_size_unbounded",
      "        if len(s.encode(\"utf-8\")) > MAX_SEGMENT_BYTES:\n            raise ResourceError(\"path segment exceeds maximum length\")",
      "        if False:\n            raise ResourceError(\"path segment exceeds maximum length\")",
-     "capcore/__init__.py"),
+     "capcore/__init__.py",
+     ("capcore/tests/test_review5_hardening.py::test_proposal_resource_segment_length_is_bounded",)),
     ("resource_traversal_allowed",
      '        if s in (".", ".."):\n            raise ResourceError("\'.\' and \'..\' segments not allowed (path traversal)")\n',
      ""),
@@ -301,9 +325,32 @@ class HarnessError(Exception):
     pass
 
 
-def run_suite(pkg_parent: Path):
-    """Run the suite against the copy at pkg_parent. Returns True if it passes.
-    Raises HarnessError on timeout (which must not be mistaken for 'caught').
+def _pytest_target(pkg_parent: Path, selectors):
+    """The pytest target list: specific node ids if selectors given, else the
+    whole tests dir. Node ids are made absolute against the temp copy so pytest
+    resolves them inside the mutated tree, not the live tree."""
+    if not selectors:
+        return [str(pkg_parent / "capcore" / "tests")]
+    targets = []
+    for sel in selectors:
+        # sel looks like "capcore/tests/test_x.py::test_y"; rebase the file part
+        # onto pkg_parent so it points into the temp copy.
+        if "::" in sel:
+            path_part, node = sel.split("::", 1)
+            targets.append(f"{pkg_parent / path_part}::{node}")
+        else:
+            targets.append(str(pkg_parent / sel))
+    return targets
+
+
+def run_suite(pkg_parent: Path, selectors=None):
+    """Run tests against the copy at pkg_parent. Returns True iff they PASS.
+
+    If `selectors` is given, only those pytest node ids run (focused mode);
+    otherwise the whole tests dir runs (full mode). Raises HarnessError on
+    timeout or on a pytest collection/usage error (exit code >= 2), which must
+    NOT be mistaken for a caught mutation: a mutation is only 'caught' when the
+    tests RUN and FAIL, never when they fail to collect.
     """
     env = os.environ.copy()
     env["PYTHONPATH"] = str(pkg_parent) + os.pathsep + env.get("PYTHONPATH", "")
@@ -311,27 +358,68 @@ def run_suite(pkg_parent: Path):
     env["HYPOTHESIS_STORAGE_DIRECTORY"] = str(pkg_parent / ".hypothesis")
     try:
         result = subprocess.run(
-            [sys.executable, "-B", "-m", "pytest", "-x", "-q", "--no-header", "-p", "no:cacheprovider",
-             str(pkg_parent / "capcore" / "tests")],
+            [sys.executable, "-B", "-m", "pytest", "-x", "-q", "--no-header",
+             "-p", "no:cacheprovider", *_pytest_target(pkg_parent, selectors)],
             cwd=pkg_parent, capture_output=True, text=True, env=env,
             timeout=PER_MUTATION_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
         raise HarnessError("pytest exceeded per-mutation timeout")
-    return result.returncode == 0
+    # pytest exit codes: 0 = all passed, 1 = tests failed, 2 = usage error,
+    # 3 = internal error, 4 = usage error, 5 = no tests collected. Only 0 (pass)
+    # and 1 (ran-and-failed) are meaningful for us; anything else is a harness
+    # error (a bad selector, a collection failure), NOT a caught mutation.
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    raise HarnessError(
+        f"pytest returned {result.returncode} (collection/usage error, not a "
+        f"test failure): {result.stdout[-500:]}"
+    )
 
 
 def fresh_copy(dst: Path):
     shutil.copytree(
         ROOT / "capcore", dst / "capcore",
-        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".hypothesis", ".pytest_cache"),
+        ignore=shutil.ignore_patterns(
+            "__pycache__", "*.pyc", ".hypothesis", ".pytest_cache",
+            # The harness self-tests (test_mutation_harness.py) import this script
+            # from scripts/, which is NOT copied into the mutated tree, and they
+            # test the HARNESS, not capcore. Excluding them keeps the mutated-copy
+            # suite focused on the package under mutation and avoids a spurious
+            # collection failure in the temp copy.
+            "test_mutation_harness.py",
+        ),
     )
 
 
-def main() -> int:
-    original = (ROOT / CORE_REL).read_text(encoding="utf-8")
+def _selectors_of(mut):
+    """The optional test selectors for a mutation entry: the 5th element if
+    present (a tuple/list of pytest node ids), else None."""
+    if len(mut) >= 5 and mut[4]:
+        return tuple(mut[4])
+    return None
 
-    # baseline: a fresh unmutated copy must pass
+
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    focused = "--focused" in argv
+    full = "--full" in argv
+    if focused and full:
+        print("ABORT: choose --focused or --full, not both", file=sys.stderr)
+        return 2
+    # Default is full (the deep, always-correct path). --focused is the fast path
+    # for routine feedback and requires each mutation to declare its selectors.
+    mode_focused = focused
+
+    original_ok = True
+    survivors, stale, errors, no_selector = [], [], [], []
+    src_cache: dict[str, str] = {}
+
+    # baseline: a fresh unmutated copy must pass the FULL suite regardless of
+    # mode. Focused mode still needs the whole tree green before it can trust any
+    # per-mutation result.
     with tempfile.TemporaryDirectory(prefix="capcore-mut-base-") as td:
         base = Path(td)
         fresh_copy(base)
@@ -343,12 +431,10 @@ def main() -> int:
             print(f"ABORT: baseline run failed: {e}", file=sys.stderr)
             return 2
 
-    survivors, stale, errors = [], [], []
-    # cache source of each target file we mutate
-    src_cache: dict[str, str] = {}
     for mut in MUTATIONS:
         name, find, replace = mut[0], mut[1], mut[2]
-        target_rel = Path(mut[3]) if len(mut) > 3 else CORE_REL
+        target_rel = Path(mut[3]) if len(mut) > 3 and mut[3] else CORE_REL
+        selectors = _selectors_of(mut)
         key = str(target_rel)
         if key not in src_cache:
             src_cache[key] = (ROOT / target_rel).read_text(encoding="utf-8")
@@ -357,17 +443,46 @@ def main() -> int:
             stale.append(name)
             print(f"[stale]   {name}: anchor found {target_src.count(find)} times (expected 1)")
             continue
-        # a FRESH copy per mutation: no shared state between mutants
+
+        # In focused mode a mutation without selectors falls back to the FULL
+        # suite (safe: slower but never wrong). Record it so the operator can see
+        # coverage of the focused path.
+        run_selectors = selectors if mode_focused else None
+        if mode_focused and selectors is None:
+            no_selector.append(name)
+            run_selectors = None   # full suite for this one
+
         with tempfile.TemporaryDirectory(prefix=f"capcore-mut-{name}-") as td:
             tmp = Path(td)
             fresh_copy(tmp)
-            (tmp / target_rel).write_text(target_src.replace(find, replace, 1), encoding="utf-8")
+
+            # SAFETY: green-before. If we are about to trust a focused selector,
+            # that selector MUST pass on the UNMUTATED copy first. A selector that
+            # fails green-before is mispaired or broken; its later red-after would
+            # be meaningless (it would "fail" regardless of the mutation). Treat as
+            # a harness error, never a caught mutation.
+            if run_selectors is not None:
+                try:
+                    if not run_suite(tmp, selectors=run_selectors):
+                        errors.append(name)
+                        print(f"[ERROR]   {name}: selectors do not pass on the "
+                              f"unmutated copy (mispaired selector): {run_selectors}")
+                        continue
+                except HarnessError as e:
+                    errors.append(name)
+                    print(f"[ERROR]   {name}: selector green-before check failed: {e}")
+                    continue
+
+            # Apply the mutation and require red-after.
+            (tmp / target_rel).write_text(
+                target_src.replace(find, replace, 1), encoding="utf-8")
             try:
-                caught = not run_suite(tmp)
+                caught = not run_suite(tmp, selectors=run_selectors)
             except HarnessError as e:
                 errors.append(name)
                 print(f"[ERROR]   {name}: {e}")
                 continue
+
         if caught:
             print(f"[caught]  {name}")
         else:
@@ -375,10 +490,15 @@ def main() -> int:
             print(f"[SURVIVED]{name}  <-- not detected by any test")
 
     print()
+    if mode_focused:
+        covered = len(MUTATIONS) - len(no_selector) - len(stale)
+        print(f"focused mode: {covered} mutation(s) ran against declared selectors, "
+              f"{len(no_selector)} fell back to the full suite")
     if stale:
         print(f"{len(stale)} stale mutation(s): {', '.join(stale)}")
     if errors:
-        print(f"FAIL: {len(errors)} mutation(s) errored (timeout/harness): {', '.join(errors)}")
+        print(f"FAIL: {len(errors)} mutation(s) errored "
+              f"(timeout/harness/mispaired selector): {', '.join(errors)}")
     if survivors:
         print(f"FAIL: {len(survivors)} mutation(s) survived: {', '.join(survivors)}")
     if survivors or errors:
