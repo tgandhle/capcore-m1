@@ -33,7 +33,7 @@ Three layers, each with its own trust boundary:
 "Single-process trust model" is load-bearing, not a hedge. See
 [Trust model](#trust-model).
 
-163 tests pass. `python scripts/mutation_check.py` reintroduces 30 known defects
+180 tests pass. `python scripts/mutation_check.py` reintroduces 34 known defects
 one at a time and asserts the suite catches every one (it mutates a temporary
 copy, never your working tree). CI runs Python 3.11-3.13 on Ubuntu and Windows.
 
@@ -173,10 +173,42 @@ are contained by the broker boundary*, not *secrets never appear in exceptions*.
 userinfo, explicit host allowlist, explicit port policy, redirects disabled (a 3xx
 would otherwise re-send the header to an attacker-chosen `Location`).
 
+## Broker hardening
+
+Several properties are enforced at the broker that are easy to get subtly wrong:
+
+- **Tool results are inert.** An adapter's return value is untrusted and crosses
+  into trusted run state (`RunRecord.history`, then `ModelView`). Only a bounded
+  `str` (or `None`) is stored; a dict, list, or object is rejected
+  (`invalid_tool_result`), so the model cannot receive a mutable handle into
+  trusted history.
+- **Security time is broker-owned.** The broker holds a `Clock` (injected at
+  construction; `SystemClock` in production, `FakeClock` in tests). Production
+  methods do NOT accept a caller-supplied `now`: an earlier version did, which
+  let a caller mint a far-future expiry or make an expired authorization look
+  current. Credential issue-time is stamped by the vault from the same clock, so
+  a TTL cannot be backdated.
+- **Tool binding is by catalog generation, not a version string.** The catalog
+  owns a monotonic generation the caller cannot forge. A tool replaced after an
+  authorization is minted, even under the same id and the same `version` string,
+  gets a new generation, and redemption refuses it.
+- **Credentials carry no unenforced binding.** There is deliberately no
+  `capability_id` on a credential. Under current-authority semantics the
+  credential is constrained by verb, scope, TTL, single-use state, tool binding,
+  and live re-authorization; a `capability_id` the broker never checked would be
+  a false claim of exact-capability binding, so it was removed.
+- **Redemption is synchronized.** The `PENDING -> EXECUTING` transition and
+  single-use credential consumption are each lock-guarded, so concurrent
+  redemptions cannot both succeed. On stock CPython the GIL masks the race, but
+  atomicity is now a property of the code, not the interpreter, and holds under
+  free-threaded builds.
+
 ## Terminal state is honest
 
 A run that fails does not report success. `RunRecord.stop_reason` says why a run
 ended: `MODEL_FINISHED`, `BUDGET_EXHAUSTED`, `CEILING_REACHED`, `MODEL_ERROR`,
+`PROVIDER_UNAVAILABLE`, `TOOL_FAILED`, `ADAPTER_LIMIT_REACHED` (the adapter hit
+its own cap; not a task completion),
 `PROVIDER_UNAVAILABLE`, `TOOL_FAILED`.
 
 Previously `None` from a `ModelClient` meant both "I am done" and "my provider is
@@ -212,7 +244,7 @@ attacks.
 - `capcore/adapters.py` - `OllamaModel` (a real local LLM as an untrusted
   `ModelClient`), `ScriptedModel`, proposal parsing.
 - `capcore/MODEL.md` - semantics, test regime, mutation results, open decisions.
-- `scripts/mutation_check.py` - reintroduces 30 known defects; asserts the suite
+- `scripts/mutation_check.py` - reintroduces 34 known defects; asserts the suite
   catches each.
 - `scripts/demo_live.py` - a real local LLM driven through the full trusted loop.
 - `scripts/demo_live_m3.py` - a real secret over real HTTPS, through the broker.

@@ -213,7 +213,7 @@ the loop cannot iterate more than `max_steps` times. Mutation-tested
 
 ### Terminal state is honest
 
-`RunRecord.stop_reason` says **why** a run ended: `MODEL_FINISHED`,
+`RunRecord.stop_reason` says **why** a run ended, now including `ADAPTER_LIMIT_REACHED` (a ModelClient hit its own cap, which is an abort, not a task completion): `MODEL_FINISHED`,
 `BUDGET_EXHAUSTED`, `CEILING_REACHED`, `MODEL_ERROR`, `PROVIDER_UNAVAILABLE`, or
 `TOOL_FAILED`.
 
@@ -363,7 +363,7 @@ demonstrating real containment.
 ```
 pip install -e ".[test]"
 python -m pytest
-python scripts/mutation_check.py      # all 30 mutations must be caught
+python scripts/mutation_check.py      # all 34 mutations must be caught
 
 # live demos (local, not part of CI):
 pip install -e ".[live]"

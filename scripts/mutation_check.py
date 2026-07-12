@@ -169,6 +169,11 @@ MUTATIONS = [
      "                record.state = RunState.COMPLETED  # BUG: crash looks like success\n                record.stop_reason = StopReason.MODEL_ERROR\n                return record\n\n            if not isinstance(result, ModelResult):",
      "capcore/runtime.py"),
     # OllamaModel must not turn a transport failure into a clean stop.
+    # An adapter hitting its own cap must not report task completion.
+    ("adapter_limit_becomes_completion",
+     "            if result.outcome is ModelOutcome.LIMIT_REACHED:\n                # The adapter stopped asking; the model did not say it was done.\n                # That is an abort, not a completion: the task may be unfinished.\n                record.state = RunState.ABORTED",
+     "            if result.outcome is ModelOutcome.LIMIT_REACHED:\n                record.state = RunState.COMPLETED  # BUG: truncated run looks finished",
+     "capcore/runtime.py"),
     ("ollama_error_becomes_finished",
      "            return ModelResult.error()\n\n        proposal = parse_proposal(text)",
      "            return ModelResult.finished()  # BUG: provider failure as completion\n\n        proposal = parse_proposal(text)",
