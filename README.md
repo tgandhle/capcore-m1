@@ -33,7 +33,7 @@ Three layers, each with its own trust boundary:
 "Single-process trust model" is load-bearing, not a hedge. See
 [Trust model](#trust-model).
 
-194 tests pass. `python scripts/mutation_check.py` reintroduces 42 known defects
+207 tests pass. `python scripts/mutation_check.py` reintroduces 49 known defects
 one at a time and asserts the suite catches every one (it mutates a temporary
 copy, never your working tree). CI runs Python 3.11-3.13 on Ubuntu and Windows.
 
@@ -258,6 +258,39 @@ Several round-4 hardening properties close aliasing and validation gaps:
 - **Action-id collisions fail closed.** A duplicate pending-authorization id
   cannot overwrite an existing record; minting retries with a fresh id.
 
+## Untrusted input boundaries
+
+Round-5 hardening tightens what crosses the untrusted-data boundary:
+
+- **Untrusted fields are size-bounded.** A remote model can return oversized
+  ordinary JSON strings; resource (4 KiB), path segment (255 B), verb (64 B), and
+  tool-registration id (128 B) are bounded in bytes before validation, hashing,
+  audit, or history. This is the one round-5 defect reachable from the real
+  adversary (remote model output), not just in-process code.
+- **Proposal fields require exact built-in types.** `type(x) is str`, not
+  `isinstance`, at the action boundary. A `str` subclass can override
+  `split()`/`__str__()`/`encode()` so authorization validates one value while the
+  adapter receives another; exact types close that divergence, matching the rule
+  already enforced on tool results.
+- **Unknown model outcomes fail closed.** `run()` handles the outcome algebra
+  with an explicit `else` that fails to `MODEL_ERROR`; an outcome outside
+  ERROR/FINISHED/LIMIT_REACHED/PROPOSAL never falls through to execute.
+- **The action budget counts execution, not denial.** With
+  `count_denied_attempts=False`, a broker refusal (unknown or unauthorized tool,
+  nothing executed) does not consume `max_actions`; the count happens only after
+  the broker mints an authorization.
+- **Refusals are typed, not string-parsed.** The broker reports a specific
+  `BrokerRefusal` code (an expired pending authorization, an unknown id, a
+  credential mismatch); the engine maps by code. `REVOKED_RACE` is reserved for a
+  genuine live re-authorization failure; every other refusal is a distinct,
+  honestly-labeled outcome.
+
+The exact-type and unknown-outcome changes are boundary-consistency and
+fail-closed-completeness properties: under the single-process trust model they
+require in-process (TCB) code to trigger, but the runtime documents proposal data
+as untrusted and enforces the invariant uniformly. The size limits are the one
+directly reachable from untrusted remote output.
+
 ## Terminal state is honest
 
 A run that fails does not report success. `RunRecord.stop_reason` says why a run
@@ -300,7 +333,7 @@ attacks.
 - `capcore/adapters.py` - `OllamaModel` (a real local LLM as an untrusted
   `ModelClient`), `ScriptedModel`, proposal parsing.
 - `capcore/MODEL.md` - semantics, test regime, mutation results, open decisions.
-- `scripts/mutation_check.py` - reintroduces 42 known defects; asserts the suite
+- `scripts/mutation_check.py` - reintroduces 49 known defects; asserts the suite
   catches each.
 - `scripts/demo_live.py` - a real local LLM driven through the full trusted loop.
 - `scripts/demo_live_m3.py` - a real secret over real HTTPS, through the broker.

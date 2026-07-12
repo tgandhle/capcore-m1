@@ -35,7 +35,7 @@ CORE_REL = Path("capcore") / "__init__.py"
 PER_MUTATION_TIMEOUT = 120  # seconds; a caught mutation returns well under this
 
 # (name, exact source snippet to find, replacement). `find` must occur exactly
-# once; otherwise the mutation is reported stale. Covers all 20 documented
+# once; otherwise the mutation is reported stale. Covers all documented
 # defects: original seven plus six from hardening review.
 MUTATIONS = [
     ("untrusted_identity_from_proposal",
