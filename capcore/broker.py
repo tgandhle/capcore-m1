@@ -206,6 +206,22 @@ class Credential:
             raise CredentialError("credential secret must be a Secret")
         if self.ttl_seconds is not None and self.ttl_seconds <= 0:
             raise CredentialError("ttl_seconds must be positive if set")
+        # FAIL CLOSED AT ISSUANCE, not at use.
+        #
+        # A credential scope of "../bad" used to be accepted here and only blow up
+        # later, inside redeem, as a ResourceError from scope_covers. That is the
+        # wrong place and the wrong time: a malformed scope is a configuration
+        # defect, and it should be impossible to hold a credential whose binding
+        # cannot be evaluated. Deferring the check to use also means the failure
+        # surfaces during a live action, when a secret is already in play.
+        #
+        # validate_resource is the same canonicalizer M1 uses for capabilities and
+        # deny policies: it rejects traversal, encoded separators, empty segments,
+        # backslashes, control characters, and wildcards.
+        try:
+            validate_resource(self.scope)
+        except ResourceError as exc:
+            raise CredentialError(f"invalid credential scope: {self.scope!r}") from exc
 
     def is_expired(self, now: Optional[float] = None) -> bool:
         if self.ttl_seconds is None:

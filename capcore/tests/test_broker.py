@@ -358,3 +358,45 @@ def test_redeem_and_execute_never_returns_a_secret():
     result = broker.redeem_and_execute(action_id)
     assert isinstance(result, SanitizedToolResult)
     assert not isinstance(result.body, Secret)
+
+
+# --------------------------------------------------------------------------- #
+# Fail closed at CONSTRUCTION, not at use.
+#
+# A malformed scope used to be accepted and only blow up later, inside redeem, as
+# a ResourceError from scope_covers. That is the wrong place and the wrong time:
+# the failure surfaces during a live action, with a secret already in play. These
+# scopes must be impossible to hold.
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("bad_scope", [
+    "../bad",            # traversal
+    "acme/../secret",    # traversal, mid-path
+    "acme//records",     # empty segment
+    "acme/records/..",   # traversal, trailing
+    "*",                 # wildcard (no wildcard grammar)
+    "acme\\records",     # backslash separator
+    "acme/%2Frecords",   # encoded separator smuggling
+])
+def test_credential_scope_is_validated_at_issuance(bad_scope):
+    with pytest.raises(CredentialError):
+        a_credential(scope=bad_scope)
+
+
+@pytest.mark.parametrize("bad_scope", [
+    "../bad", "acme/../secret", "acme//records", "*", "acme\\records",
+])
+def test_tool_grant_scope_is_validated_at_construction(bad_scope):
+    """A grant is an authorization rule. A malformed one that silently vanished at
+    check time would be an allow-by-omission, the same fail-open direction that
+    made a malformed DenyPolicy dangerous in M1."""
+    from capcore.broker import ToolGrant
+    with pytest.raises(ValueError):
+        ToolGrant("some-tool", bad_scope)
+
+
+def test_valid_scopes_are_still_accepted():
+    """Control: the validator must not reject legitimate scopes."""
+    from capcore.broker import ToolGrant
+    assert a_credential(scope="acme/records").scope == "acme/records"
+    assert ToolGrant("t", "acme/records/customers").scope == "acme/records/customers"

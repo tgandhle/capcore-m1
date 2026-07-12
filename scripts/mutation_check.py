@@ -124,6 +124,30 @@ MUTATIONS = [
      "        if reg.verb != action.verb:",
      "        if False:  # BUG: any tool may serve any verb",
      "capcore/broker.py"),
+    # A malformed credential scope must fail closed AT ISSUANCE, not blow up
+    # mid-action with a secret already in play.
+    ("credential_scope_not_validated_at_issue",
+     "            raise CredentialError(f\"invalid credential scope: {self.scope!r}\") from exc",
+     "            pass  # BUG: swallow an invalid credential scope (fail open)",
+     "capcore/broker.py"),
+    # A malformed TOOL GRANT scope must also fail closed at construction: a grant
+    # that vanished at check time would be an allow-by-omission.
+    ("tool_grant_scope_not_validated",
+     "            raise ValueError(f\"invalid tool-grant scope: {self.scope!r}\") from exc",
+     "            pass  # BUG: swallow an invalid tool-grant scope",
+     "capcore/broker.py"),
+    # --- M3 destination policy (target capcore/httptool.py) ---
+    # The URL is where a real credential is SENT. https-only is what keeps the
+    # Authorization header off a cleartext wire.
+    ("httptool_allows_any_scheme",
+     "    if scheme not in ALLOWED_SCHEMES:",
+     "    if False:  # BUG: send credentials over any scheme",
+     "capcore/httptool.py"),
+    # Embedded userinfo leaks credentials into logs, proxies, and exceptions.
+    ("httptool_allows_embedded_userinfo",
+     "    if parts.username is not None or parts.password is not None:",
+     "    if False:  # BUG: permit https://user:pw@host",
+     "capcore/httptool.py"),
     # Consumed/expired credentials must be refused. Ignoring availability defeats
     # single-use and TTL.
     ("broker_ignores_single_use_and_ttl",
