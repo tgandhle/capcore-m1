@@ -9,7 +9,8 @@ from capcore import (
     Capability, CapabilityStore, Proposal, ReferenceMonitor, RunContext,
 )
 from capcore.broker import (
-    Secret, Credential, CredentialBroker, ToolKind, ToolRegistration,
+    Secret, Credential, TrustedExecutionBroker, ToolKind, ToolRegistration,
+    ExecutionProposal,
 )
 from capcore.httptool import HttpTool, MockTransport
 
@@ -26,19 +27,20 @@ def build():
 
 
 def wired(mon, transport, url="https://api.example.com/data"):
-    broker = CredentialBroker(mon)
-    broker.issue(Credential("cred-1", "cap-run", "read", "acme/records",
-                            Secret(MOCK_SECRET)))
+    broker = TrustedExecutionBroker(mon)
+    broker.issue_credential(Credential("cred-1", "cap-run", "read", "acme/records",
+                                       Secret(MOCK_SECRET)))
     broker.register_tool(ToolRegistration(
-        registration_id="http-1", kind=ToolKind.CREDENTIALED,
+        registration_id="http-1", verb="read", kind=ToolKind.CREDENTIALED,
         adapter=HttpTool(url, transport), version="1", credential_id="cred-1",
     ))
+    broker.grant_tool("http-1", "acme/records")
     return broker
 
 
 def mint(broker, mon, ctx, prop):
-    d = mon.authorize(ctx, prop)
-    return broker.register_authorized_execution(ctx, prop, d, "http-1")
+    return broker.register_authorized_execution(
+        ctx, ExecutionProposal(action=prop, tool_registration_id="http-1"))
 
 
 def test_secret_sent_only_to_allowed_url_in_auth_header():

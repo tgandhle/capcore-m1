@@ -1,65 +1,77 @@
-"""M3 credential broker: a credential BOUNDARY, not a secret getter.
+"""M3: the trusted execution boundary.
 
-WHY THIS IS SHAPED THIS WAY.
+The engine does not execute tools. It asks THIS component to, and receives only a
+sanitized result. That is the whole point: there is exactly one path from an
+authorized proposal to a running adapter, and it goes through here.
 
-The previous broker took a caller-supplied `Decision` and checked
+WHY THE BROKER REDEEMS INSTEAD OF INSPECTING.
+
+An earlier broker took a caller-supplied `Decision` and checked
 `decision.verdict == ALLOW`. That is authorization by INSPECTION, and inspection
 cannot establish authenticity in Python: `Decision(Verdict.ALLOW, "authorized")`
-is one constructor call away, so any caller could mint an ALLOW and obtain a real
-secret. Enriching the object does not help. A frozen dataclass carrying a digest,
-a capability version and an expiry is integrity-preserving after construction,
-but it is still not AUTHENTIC: an attacker who can call the constructor can set
-whatever fields the broker wants to see.
+is one constructor call away. Enriching the object does not help. A frozen
+dataclass carrying a digest, a version and an expiry is integrity-preserving
+after construction but still not AUTHENTIC, because an attacker who can call the
+constructor sets whatever fields the checker wants to see.
 
-So the broker REDEEMS rather than INSPECTS.
+So this component REDEEMS:
 
-  1. The engine, having obtained a real ALLOW from the reference monitor, asks
-     the broker to register the exact execution it intends. The broker builds a
-     PendingAuthorization in ITS OWN state and returns an opaque random
-     `action_id`.
-  2. To execute, the caller presents ONLY that id: redeem_and_execute(id). The
-     broker looks it up in its own table. A forged authorization object is
-     irrelevant, because the broker never reads a caller-supplied one.
+  1. register_authorized_execution(context, execution_proposal) -> action_id
+     The broker authorizes INDEPENDENTLY through its own monitor (it does not
+     accept a decision from the caller at all), resolves the tool from its own
+     catalog, checks the tool policy, and stores a PendingAuthorization in its
+     own state. It returns an opaque random id.
+  2. redeem_and_execute(action_id) -> SanitizedToolResult
+     The caller presents ONLY the id. Everything else, the proposal, the tool,
+     the version, the credential, is read from the stored record.
 
 The action_id is not the authority. It is a lookup key. The authority is the
 broker-held record.
 
-This closes four attacks at once:
+This closes:
 
-  FORGERY       A fabricated authorization has no record. Lookup fails.
+  FORGERY       A fabricated authorization has no record; lookup fails. And a
+                forged Decision buys nothing because the broker never reads one.
   REPLAY        Redemption atomically claims PENDING -> EXECUTING. A second
-                redemption finds a non-PENDING record and is refused. Single-use
-                is a state machine, not a deletion.
+                redemption finds a non-PENDING record. Single-use is a state
+                machine, not a deletion.
   STALENESS     The broker re-authorizes through the LIVE monitor immediately
-                before touching the secret. A capability revoked after mint means
-                the secret never leaves.
-  SUBSTITUTION  The caller supplies neither the tool nor the credential at
-                redemption. Both are bound at mint time and resolved by the
-                broker from its own registries. A valid action_id cannot be aimed
-                at a different credential, a different adapter, or a same-named
-                tool swapped out in between (the record pins registration id AND
-                version).
+                before touching the credential. Revoked after mint means the
+                secret never leaves.
+  SUBSTITUTION  The caller supplies neither tool nor credential at redemption.
+                Both are bound at mint and resolved from broker state. The record
+                pins registration id AND version, so a tool swapped out after
+                authorization is refused.
+  MIS-ROUTING   Catalog existence is NOT authorization. `read_customer_record`
+                and `read_payroll_database` may both satisfy verb=read. A model
+                that picks its own executor must not thereby choose which one
+                runs. ToolPolicy authorizes the exact registration for the exact
+                action, deny-by-default.
 
-And the secret never leaves the boundary: redeem_and_execute injects the
-credential, calls the trusted adapter itself, catches everything, and returns a
-sanitized result. There is no API that hands a Secret back to general code.
+STRUCTURE. One interface outward, separated responsibilities inward:
 
-RE-AUTHORIZATION SEMANTICS (a deliberate choice, documented).
-The broker asks the monitor: "is this action authorized RIGHT NOW, through any
-valid capability path?" That is CURRENT-AUTHORITY semantics. It is NOT
+    TrustedExecutionBroker
+      ├── ToolCatalog                registration_id -> ToolRegistration
+      ├── ToolPolicy                 may THIS registration serve THIS action?
+      ├── PendingAuthorizationStore  action_id -> record + state machine
+      ├── CredentialVault            credential_id -> Credential (secret logic)
+      └── ReferenceMonitor           authorizes at register AND at redeem
+
+RE-AUTHORIZATION SEMANTICS (deliberate, documented).
+Redemption asks the monitor: "is this action authorized RIGHT NOW, through any
+valid capability path?" That is CURRENT-AUTHORITY semantics, not
 original-capability-continuity: if the capability that originally authorized the
 action is revoked but a different valid capability would independently authorize
-the same action, redemption still succeeds. That is intended for v1 and it is the
-question a revocation check is actually asking. Binding to the exact original
-capability path would need the monitor to return the granting capability ids,
-which it does not currently do.
+it, redemption still succeeds. Intended for v1; it is the question a revocation
+check actually asks. Binding to the exact original capability path would need the
+monitor to return granting capability ids, which it does not.
 
 KNOWN LIMIT (stated, not hidden).
-The broker keeps the credential away from the engine, the model, and general
+This boundary keeps the credential away from the engine, the model, and general
 application code. It CANNOT protect the credential from a malicious credentialed
 adapter in the same process: the adapter receives the secret in order to use it,
 and could log, retain, or exfiltrate it. Every CredentialedTool is therefore
-inside the trusted computing base. Acceptable for v1, but it must stay explicit.
+inside the trusted computing base. Acceptable for v1, and it must stay explicit.
 Real isolation means running credentialed adapters in a separate process behind
 restricted IPC.
 """
@@ -74,9 +86,26 @@ from enum import Enum
 from typing import Optional, Protocol
 
 from capcore import (
-    Proposal, ReferenceMonitor, RunContext, Verdict, scope_covers,
-    valid_proposal,
+    Proposal, ReferenceMonitor, ResourceError, RunContext, Verdict,
+    _covers_safe, scope_covers, valid_proposal, validate_resource,
 )
+
+
+# --------------------------------------------------------------------------- #
+# Errors.
+# --------------------------------------------------------------------------- #
+
+class CredentialError(Exception):
+    pass
+
+
+class AuthorizationError(Exception):
+    """Registration or redemption refused. Never carries a secret."""
+    pass
+
+
+class CatalogError(Exception):
+    pass
 
 
 # --------------------------------------------------------------------------- #
@@ -89,8 +118,8 @@ class Secret:
     SCOPE OF THIS PROTECTION. This protects the WRAPPER. Once .reveal() is called
     and the value is interpolated into (say) an Authorization header, the result
     is an ordinary Python string with no protection at all, and any exception
-    carrying it carries the credential. That is precisely why .reveal() is now
-    called ONLY inside the broker's execution boundary, where exceptions are
+    carrying that string carries the credential. That is exactly why .reveal() is
+    called ONLY inside this module's execution boundary, where exceptions are
     caught and discarded. The wrapper defends against accidental logging, not
     against a hostile adapter.
     """
@@ -120,17 +149,42 @@ class Secret:
         return hash(("Secret", self._value))
 
 
-class CredentialError(Exception):
-    pass
+# --------------------------------------------------------------------------- #
+# ExecutionProposal: an M1 action PLUS the concrete executor to run it.
+# --------------------------------------------------------------------------- #
 
+@dataclass(frozen=True)
+class ExecutionProposal:
+    """What the model proposes at the execution layer.
 
-class AuthorizationError(Exception):
-    """Redemption refused. Never carries a secret or a boundary detail."""
-    pass
+    Deliberately a SEPARATE type from M1's `Proposal`, not an extra optional
+    field on it. The layers mean different things:
+
+        Proposal            the requested security ACTION (verb + resource)
+        ExecutionProposal   that action, plus WHICH concrete executor runs it
+
+    M1's Proposal stays exactly as reviewed: the reference monitor authorizes
+    `.action` and knows nothing about executors. Making the registration id an
+    optional field with an empty default would have created two definitions of a
+    valid proposal and left `Proposal(resource=..., verb=..., tool_registration_id="")`
+    passing M1 validation while being unusable for execution. A required field on
+    a separate type makes an incomplete executable proposal unrepresentable.
+
+    `tool_registration_id` is UNTRUSTED. The model may name whichever executor it
+    likes; naming it does not authorize it. ToolPolicy decides.
+    """
+    action: Proposal
+    tool_registration_id: str
+
+    def __post_init__(self):
+        if not isinstance(self.action, Proposal):
+            raise AuthorizationError("execution proposal requires a Proposal action")
+        if not isinstance(self.tool_registration_id, str) or not self.tool_registration_id:
+            raise AuthorizationError("execution proposal requires a tool_registration_id")
 
 
 # --------------------------------------------------------------------------- #
-# Credential.
+# Credentials and the vault that holds them.
 # --------------------------------------------------------------------------- #
 
 @dataclass
@@ -163,9 +217,29 @@ class Credential:
         return not self._consumed and not self.is_expired(now)
 
 
+class CredentialVault:
+    """Holds credentials. The ONLY place raw secrets live.
+
+    Kept as its own component so the secret-specific logic stays separable from
+    catalog, policy, and dispatch. Nothing outside this module resolves a
+    credential.
+    """
+
+    def __init__(self):
+        self._creds: dict[str, Credential] = {}
+
+    def issue(self, cred: Credential) -> str:
+        if cred.id in self._creds:
+            raise CredentialError(f"duplicate credential id: {cred.id}")
+        self._creds[cred.id] = cred
+        return cred.id
+
+    def resolve(self, credential_id: str) -> Optional[Credential]:
+        return self._creds.get(credential_id)
+
+
 # --------------------------------------------------------------------------- #
-# Tools. A plain tool never sees a credential. A credentialed tool does, and is
-# therefore inside the TCB.
+# Tools and the catalog that holds them.
 # --------------------------------------------------------------------------- #
 
 class ToolKind(Enum):
@@ -180,38 +254,130 @@ class PlainTool(Protocol):
 class CredentialedTool(Protocol):
     """Executes an authorized action WITH a credential.
 
-    A distinct method name, not an optional `secret=None` on PlainTool. Making
-    the secret optional would let a credentialed adapter be dispatched down the
-    plain path (running silently unauthenticated) and would bury the trust
-    boundary in a default argument. These are different kinds of thing and the
-    types say so.
+    A distinct method name, not an optional `secret=None` on PlainTool. An
+    optional secret would let a credentialed adapter be dispatched down the plain
+    path (running silently unauthenticated) and would bury the trust boundary in
+    a default argument. These are different kinds of thing; the types say so.
     """
     def execute_with_credential(self, proposal: Proposal, secret: Secret) -> str: ...
 
 
 @dataclass(frozen=True)
 class ToolRegistration:
-    """A tool as the broker knows it.
+    """A concrete executor.
 
-    `version` exists so an authorization cannot be redeemed against a tool that
-    was swapped out after the authorization was minted. The record pins
-    registration_id AND version; if either moved, redemption is refused.
+    `verb` is the action class this executor serves; it must match the proposed
+    action's verb. `version` is pinned into an authorization so a tool swapped out
+    between authorization and redemption cannot inherit the old grant.
     """
     registration_id: str
+    verb: str
     kind: ToolKind
-    adapter: object                       # PlainTool | CredentialedTool
+    adapter: object                        # PlainTool | CredentialedTool
     version: str = "1"
-    credential_id: Optional[str] = None   # required iff kind is CREDENTIALED
+    credential_id: Optional[str] = None    # required iff CREDENTIALED
 
     def __post_init__(self):
+        if not self.registration_id:
+            raise CatalogError("tool registration_id must be non-empty")
+        if not self.verb:
+            raise CatalogError("tool registration must name a verb")
         if self.kind is ToolKind.CREDENTIALED and not self.credential_id:
-            raise CredentialError("a credentialed tool must name its credential")
+            raise CatalogError("a credentialed tool must name its credential")
         if self.kind is ToolKind.PLAIN and self.credential_id:
-            raise CredentialError("a plain tool must not name a credential")
+            raise CatalogError("a plain tool must not name a credential")
+
+
+class ToolCatalog:
+    """The SOLE tool registry.
+
+    The engine does not have one. There is exactly one mapping from a
+    registration id to an adapter, and it lives here. Two registries that must be
+    kept in sync is the same split-authority defect as a monitor and an engine
+    holding different capability stores; it is not repeated.
+    """
+
+    def __init__(self):
+        self._tools: dict[str, ToolRegistration] = {}
+
+    def register(self, reg: ToolRegistration) -> str:
+        if reg.registration_id in self._tools:
+            raise CatalogError(f"duplicate tool registration: {reg.registration_id}")
+        self._tools[reg.registration_id] = reg
+        return reg.registration_id
+
+    def resolve(self, registration_id: str) -> Optional[ToolRegistration]:
+        return self._tools.get(registration_id)
+
+    def replace_for_test(self, reg: ToolRegistration) -> None:
+        """Swap a registration in place. Exists so tests can prove that an
+        authorization minted against version N is refused when version N+1 is
+        registered under the same id."""
+        self._tools[reg.registration_id] = reg
 
 
 # --------------------------------------------------------------------------- #
-# Authorization state machine.
+# Tool policy: catalog existence is NOT authorization.
+# --------------------------------------------------------------------------- #
+
+@dataclass(frozen=True)
+class ToolGrant:
+    """Permission for ONE registration to serve actions under ONE scope.
+
+    Validated at construction and FAILS CLOSED on a malformed scope, mirroring
+    DenyPolicy in M1: a grant that silently vanished at check time would be an
+    allow-by-omission, which is the wrong direction for an authorization rule.
+    """
+    registration_id: str
+    scope: str
+
+    def __post_init__(self):
+        if not isinstance(self.registration_id, str) or not self.registration_id:
+            raise ValueError("tool-grant registration_id must be a non-empty string")
+        try:
+            validate_resource(self.scope)
+        except ResourceError as exc:
+            raise ValueError(f"invalid tool-grant scope: {self.scope!r}") from exc
+
+
+class ToolPolicy:
+    """Which registration may serve which action. DENY BY DEFAULT.
+
+    Resolving a tool from the catalog proves only that it EXISTS. It does not
+    prove the model may route this action to that executor. Consider:
+
+        tool A: read_customer_record   verb=read
+        tool B: read_payroll_database  verb=read
+
+    Both satisfy verb=read. If resource scope does not happen to separate them,
+    an unconstrained model picks its own executor. That is a real escalation and
+    a catalog lookup does not catch it.
+
+    So: nothing is permitted unless explicitly granted. An empty policy authorizes
+    no tool at all. This is the same posture as capability default-deny in M1, and
+    it is deliberately strict: an allow-unless-denied default would reintroduce
+    exactly the hole above for every newly registered tool.
+    """
+
+    def __init__(self, grants: Optional[list[ToolGrant]] = None):
+        self._grants: list[ToolGrant] = list(grants or [])
+
+    def grant(self, registration_id: str, scope: str) -> None:
+        self._grants.append(ToolGrant(registration_id, scope))
+
+    def allows(self, registration_id: str, action: Proposal) -> bool:
+        for g in self._grants:
+            if g.registration_id != registration_id:
+                continue
+            # _covers_safe: the RESOURCE is model-supplied, so a malformed one
+            # must deny rather than match a grant by raising.
+            if _covers_safe(g.scope, action.resource):
+                return True
+        return False
+
+
+# --------------------------------------------------------------------------- #
+# Pending authorizations and their state machine.
 # --------------------------------------------------------------------------- #
 
 class AuthorizationState(Enum):
@@ -225,13 +391,13 @@ class AuthorizationState(Enum):
 class PendingAuthorization:
     """Broker-held record of one authorized execution. Never leaves the broker.
 
-    NOT a token the caller carries. Trusted state the broker keeps. The caller
-    receives only `action_id`: an opaque random key with no authority of its own.
+    NOT a token the caller carries: trusted state the broker keeps. The caller
+    gets only `action_id`, an opaque random key with no authority of its own.
     """
     action_id: str
     context: RunContext
-    proposal: Proposal
-    proposal_digest: str
+    action: Proposal
+    action_digest: str
     tool_registration_id: str
     tool_version: str
     credential_id: Optional[str]
@@ -240,20 +406,66 @@ class PendingAuthorization:
     state: AuthorizationState = AuthorizationState.PENDING
 
 
-def proposal_digest(proposal: Proposal) -> str:
-    """Canonical digest of a proposal, computed BY THE BROKER.
+def action_digest(action: Proposal) -> str:
+    """Canonical digest, computed BY THE BROKER from the action it stored.
 
-    A caller-supplied digest would be worthless: an attacker who can forge an
-    authorization can forge its digest too. The broker computes this from the
-    proposal it stored, so the digest is an internal integrity check, never an
-    authorization input.
+    A caller-supplied digest is worthless: whoever can forge an authorization can
+    forge its digest. This is an internal integrity check, never an authorization
+    input.
     """
-    canonical = f"{proposal.verb}\x00{proposal.resource}".encode("utf-8")
+    canonical = f"{action.verb}\x00{action.resource}".encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
 
 
+class PendingAuthorizationStore:
+    """Holds pending authorizations and owns the single-use state transition."""
+
+    def __init__(self):
+        self._records: dict[str, PendingAuthorization] = {}
+
+    def put(self, record: PendingAuthorization) -> None:
+        self._records[record.action_id] = record
+
+    def get(self, action_id: str) -> Optional[PendingAuthorization]:
+        return self._records.get(action_id)
+
+    def state_of(self, action_id: str) -> Optional[AuthorizationState]:
+        rec = self._records.get(action_id)
+        return rec.state if rec else None
+
+    def settle(self, action_id: str, state: AuthorizationState) -> None:
+        rec = self._records.get(action_id)
+        if rec is not None:
+            self._records[action_id] = replace(rec, state=state)
+
+    def claim(self, action_id: str, now: float) -> PendingAuthorization:
+        """Atomically move PENDING -> EXECUTING, or refuse.
+
+        The transition happens BEFORE the credential is resolved and before any
+        external side effect. If execution later crashes, the record stays
+        non-PENDING and cannot be redeemed again. That deliberately favours
+        preventing a duplicate side effect over automatic retry: an ambiguous
+        remote failure must NOT silently return the authorization to PENDING. A
+        retry needs a fresh authorization.
+        """
+        rec = self._records.get(action_id)
+        if rec is None:
+            # Forged or unknown id: no record, therefore no authorization,
+            # whatever object the caller may have constructed.
+            raise AuthorizationError("unknown authorization")
+        if rec.state is not AuthorizationState.PENDING:
+            raise AuthorizationError("authorization is not redeemable")
+        if now >= rec.expires_at:
+            self._records[action_id] = replace(rec, state=AuthorizationState.FAILED)
+            raise AuthorizationError("authorization expired")
+
+        claimed = replace(rec, state=AuthorizationState.EXECUTING)
+        self._records[action_id] = claimed
+        return claimed
+
+
 # --------------------------------------------------------------------------- #
-# Sanitized result. Nothing crossing this boundary carries a secret.
+# Results and audit. Nothing crossing this boundary carries a secret.
 # --------------------------------------------------------------------------- #
 
 @dataclass(frozen=True)
@@ -282,139 +494,148 @@ class ReleaseAudit:
 
 
 # --------------------------------------------------------------------------- #
-# Broker.
+# The trusted execution boundary.
 # --------------------------------------------------------------------------- #
 
 DEFAULT_ACTION_TTL_SECONDS = 30.0
 
 
-class CredentialBroker:
-    """Owns credentials, tool registrations, pending authorizations, dispatch.
+class TrustedExecutionBroker:
+    """The one interface the engine sees. Internally separated; externally single.
 
-    This is a large TCB surface and that is a real cost. The alternative, a broker
-    that only hands out secrets, cannot structurally stop the secret escaping into
-    general code, surfacing in an exception, or being reused after revocation. For
-    a project whose central claim is a credential boundary, the boundary has to
-    actually be one.
+    This is a large TCB surface and that is a real, acknowledged cost. The
+    alternative, a component that merely hands out secrets, cannot structurally
+    stop the secret escaping into general code, surfacing in an exception, or
+    being reused after revocation. And splitting the tool catalog between engine
+    and broker would recreate the split-authority defect this project exists to
+    prevent. One boundary, deliberately.
     """
 
-    def __init__(self, monitor: ReferenceMonitor,
-                 action_ttl_seconds: float = DEFAULT_ACTION_TTL_SECONDS):
+    def __init__(
+        self,
+        monitor: ReferenceMonitor,
+        catalog: Optional[ToolCatalog] = None,
+        policy: Optional[ToolPolicy] = None,
+        vault: Optional[CredentialVault] = None,
+        action_ttl_seconds: float = DEFAULT_ACTION_TTL_SECONDS,
+    ):
         if not isinstance(monitor, ReferenceMonitor):
-            raise TypeError("broker requires a ReferenceMonitor for re-authorization")
+            raise TypeError("broker requires a ReferenceMonitor for authorization")
         if action_ttl_seconds <= 0:
             raise ValueError("action_ttl_seconds must be positive")
         self._monitor = monitor
+        self._catalog = catalog or ToolCatalog()
+        self._policy = policy or ToolPolicy()      # deny-by-default when empty
+        self._vault = vault or CredentialVault()
+        self._pending = PendingAuthorizationStore()
         self._action_ttl = action_ttl_seconds
-        self._creds: dict[str, Credential] = {}
-        self._tools: dict[str, ToolRegistration] = {}
-        self._pending: dict[str, PendingAuthorization] = {}
         self.audit: list[ReleaseAudit] = []
 
-    # -- registration ------------------------------------------------------- #
+    # -- wiring (trusted setup) --------------------------------------------- #
 
-    def issue(self, cred: Credential) -> str:
-        if cred.id in self._creds:
-            raise CredentialError(f"duplicate credential id: {cred.id}")
-        self._creds[cred.id] = cred
-        return cred.id
+    def issue_credential(self, cred: Credential) -> str:
+        return self._vault.issue(cred)
 
     def register_tool(self, reg: ToolRegistration) -> str:
-        if reg.registration_id in self._tools:
-            raise CredentialError(f"duplicate tool registration: {reg.registration_id}")
-        if reg.kind is ToolKind.CREDENTIALED and reg.credential_id not in self._creds:
-            raise CredentialError("credentialed tool names an unknown credential")
-        self._tools[reg.registration_id] = reg
-        return reg.registration_id
+        if reg.kind is ToolKind.CREDENTIALED and self._vault.resolve(reg.credential_id) is None:
+            raise CatalogError("credentialed tool names an unknown credential")
+        return self._catalog.register(reg)
 
-    def get_tool(self, registration_id: str) -> Optional[ToolRegistration]:
-        return self._tools.get(registration_id)
+    def grant_tool(self, registration_id: str, scope: str) -> None:
+        """Authorize a registration to serve actions under `scope`.
+
+        Required: registering a tool does NOT authorize it. Deny-by-default.
+        """
+        if self._catalog.resolve(registration_id) is None:
+            raise CatalogError("cannot grant an unregistered tool")
+        self._policy.grant(registration_id, scope)
+
+    @property
+    def catalog(self) -> ToolCatalog:
+        return self._catalog
+
+    def authorization_state(self, action_id: str) -> Optional[AuthorizationState]:
+        return self._pending.state_of(action_id)
+
+    # -- audit -------------------------------------------------------------- #
+
+    def _record(self, action_id, cred_id, action, granted, reason):
+        self.audit.append(ReleaseAudit(
+            action_id=action_id,
+            credential_id=cred_id,
+            verb=action.verb if action is not None else "?",
+            resource=action.resource if action is not None else "?",
+            granted=granted,
+            reason=reason,
+        ))
 
     # -- mint --------------------------------------------------------------- #
 
     def register_authorized_execution(
         self,
         context: RunContext,
-        proposal: Proposal,
-        decision,
-        tool_registration_id: str,
+        proposal: ExecutionProposal,
         now: Optional[float] = None,
     ) -> str:
-        """Record an authorized execution; return an opaque action_id.
+        """Authorize an execution and return an opaque action_id.
 
-        Called ONLY by the trusted execution engine, after the monitor returned
-        ALLOW. Registration by itself releases nothing: no credential is touched
-        here, and redemption re-authorizes independently. So even if this were
-        called with a bogus decision, the secret still would not leave, because
-        redeem_and_execute asks the live monitor again.
+        Takes NO caller-supplied Decision. The broker authorizes independently
+        through its own monitor. A caller cannot hand it a verdict to trust,
+        because it does not read one.
+
+        Three separate checks, all of which must pass:
+          1. The MONITOR authorizes the ACTION (verb + resource).
+          2. The registered tool's verb MATCHES the proposed action's verb.
+          3. The POLICY authorizes THIS registration for THIS action. Catalog
+             existence is not authorization.
         """
-        if decision is None or decision.verdict != Verdict.ALLOW:
-            raise AuthorizationError("cannot register an unauthorized action")
-        if not valid_proposal(proposal):
-            raise AuthorizationError("cannot register a malformed proposal")
+        if not isinstance(proposal, ExecutionProposal):
+            raise AuthorizationError("register requires an ExecutionProposal")
+        action = proposal.action
+        if not valid_proposal(action):
+            raise AuthorizationError("cannot register a malformed action")
 
-        reg = self._tools.get(tool_registration_id)
+        # 1. Independent authorization of the ACTION.
+        decision = self._monitor.authorize(context, action)
+        if decision.verdict is not Verdict.ALLOW:
+            self._record("-", None, action, False, "action is not authorized")
+            raise AuthorizationError("action is not authorized")
+
+        # 2. The executor must exist...
+        reg = self._catalog.resolve(proposal.tool_registration_id)
         if reg is None:
+            self._record("-", None, action, False, "unknown tool registration")
             raise AuthorizationError("unknown tool registration")
 
-        now = time.monotonic() if now is None else now
-        action_id = secrets.token_urlsafe(32)
+        # ...and serve this action class.
+        if reg.verb != action.verb:
+            self._record("-", None, action, False, "tool verb does not match action")
+            raise AuthorizationError("tool verb does not match proposed action")
 
-        self._pending[action_id] = PendingAuthorization(
-            action_id=action_id,
+        # 3. ...and be POLICY-AUTHORIZED for this exact action. This is the check
+        #    that stops a model routing `read` at read_payroll_database when it
+        #    was only ever meant to reach read_customer_record.
+        if not self._policy.allows(reg.registration_id, action):
+            self._record("-", None, action, False, "tool registration is not authorized")
+            raise AuthorizationError("tool registration is not authorized")
+
+        now = time.monotonic() if now is None else now
+        aid = secrets.token_urlsafe(32)
+        self._pending.put(PendingAuthorization(
+            action_id=aid,
             context=context,
-            proposal=proposal,
-            proposal_digest=proposal_digest(proposal),
+            action=action,
+            action_digest=action_digest(action),
             tool_registration_id=reg.registration_id,
-            tool_version=reg.version,          # pinned: a swapped tool is refused
-            credential_id=reg.credential_id,   # bound: cannot be substituted
+            tool_version=reg.version,        # pinned: a swapped tool is refused
+            credential_id=reg.credential_id,  # bound: cannot be substituted
             issued_at=now,
             expires_at=now + self._action_ttl,
             state=AuthorizationState.PENDING,
-        )
-        return action_id
+        ))
+        return aid
 
     # -- redeem ------------------------------------------------------------- #
-
-    def _claim(self, action_id: str, now: float) -> PendingAuthorization:
-        """Atomically move PENDING -> EXECUTING, or refuse.
-
-        The transition happens BEFORE the secret is resolved and before any
-        external side effect. If execution later crashes, the record stays
-        non-PENDING and cannot be redeemed again. That deliberately favours
-        preventing a duplicate side effect over automatic retry: an ambiguous
-        remote failure must NOT silently return the authorization to PENDING. A
-        retry needs a fresh authorization.
-        """
-        record = self._pending.get(action_id)
-        if record is None:
-            # Forged or unknown id: the broker holds no record, so there is no
-            # authorization, whatever object the caller may have constructed.
-            raise AuthorizationError("unknown authorization")
-        if record.state is not AuthorizationState.PENDING:
-            raise AuthorizationError("authorization is not redeemable")
-        if now >= record.expires_at:
-            self._pending[action_id] = replace(record, state=AuthorizationState.FAILED)
-            raise AuthorizationError("authorization expired")
-
-        claimed = replace(record, state=AuthorizationState.EXECUTING)
-        self._pending[action_id] = claimed
-        return claimed
-
-    def _settle(self, action_id: str, state: AuthorizationState) -> None:
-        record = self._pending.get(action_id)
-        if record is not None:
-            self._pending[action_id] = replace(record, state=state)
-
-    def _record(self, action_id, cred_id, proposal, granted, reason):
-        self.audit.append(ReleaseAudit(
-            action_id=action_id,
-            credential_id=cred_id,
-            verb=proposal.verb if proposal is not None else "?",
-            resource=proposal.resource if proposal is not None else "?",
-            granted=granted,
-            reason=reason,
-        ))
 
     def redeem_and_execute(
         self,
@@ -423,102 +644,99 @@ class CredentialBroker:
     ) -> SanitizedToolResult:
         """Execute exactly the authorization identified by action_id.
 
-        The caller supplies ONLY the id. Not the tool, not the credential, not
-        the proposal. All three were bound at mint time and are resolved here
-        from the broker's own state. That is what closes substitution: a valid
-        action_id cannot be aimed at a different credential or a different
-        adapter.
+        The caller supplies ONLY the id. Not the tool, not the credential, not the
+        action. All three were bound at mint and are resolved here from broker
+        state. That is what closes substitution: a valid action_id cannot be aimed
+        at a different credential or a different adapter.
         """
         now = time.monotonic() if now is None else now
 
         try:
-            record = self._claim(action_id, now)
+            rec = self._pending.claim(action_id, now)
         except AuthorizationError as e:
             self._record(action_id, None, None, False, str(e))
             return SanitizedToolResult.failed("authorization_refused")
 
         try:
-            # 1. LIVE re-authorization (current-authority semantics; see module
-            #    docstring). A capability revoked since mint stops us here,
-            #    BEFORE the secret is resolved.
-            live = self._monitor.authorize(record.context, record.proposal)
-            if live.verdict != Verdict.ALLOW:
-                self._settle(action_id, AuthorizationState.FAILED)
-                self._record(action_id, record.credential_id, record.proposal,
-                             False, "re-authorization failed at redemption")
+            # 1. LIVE re-authorization. Current-authority semantics. A capability
+            #    revoked since mint stops us here, BEFORE the credential is
+            #    resolved.
+            live = self._monitor.authorize(rec.context, rec.action)
+            if live.verdict is not Verdict.ALLOW:
+                self._pending.settle(action_id, AuthorizationState.FAILED)
+                self._record(action_id, rec.credential_id, rec.action, False,
+                             "re-authorization failed at redemption")
                 return SanitizedToolResult.failed("authorization_refused")
 
-            # 2. Internal integrity check. The stored proposal must still hash to
-            #    the digest minted with it. The caller cannot influence either.
-            if proposal_digest(record.proposal) != record.proposal_digest:
-                self._settle(action_id, AuthorizationState.FAILED)
-                self._record(action_id, record.credential_id, record.proposal,
-                             False, "proposal digest mismatch")
+            # 2. Internal integrity check on stored state.
+            if action_digest(rec.action) != rec.action_digest:
+                self._pending.settle(action_id, AuthorizationState.FAILED)
+                self._record(action_id, rec.credential_id, rec.action, False,
+                             "action digest mismatch")
                 return SanitizedToolResult.failed("authorization_refused")
 
-            # 3. Resolve the tool from the BROKER's registry, pinned to the exact
-            #    version bound at mint. A tool swapped out in between is refused.
-            reg = self._tools.get(record.tool_registration_id)
-            if reg is None or reg.version != record.tool_version:
-                self._settle(action_id, AuthorizationState.FAILED)
-                self._record(action_id, record.credential_id, record.proposal,
-                             False, "tool registration changed since authorization")
+            # 3. Resolve the tool from the CATALOG, pinned to the exact version
+            #    bound at mint. A tool swapped out in between is refused.
+            reg = self._catalog.resolve(rec.tool_registration_id)
+            if reg is None or reg.version != rec.tool_version:
+                self._pending.settle(action_id, AuthorizationState.FAILED)
+                self._record(action_id, rec.credential_id, rec.action, False,
+                             "tool registration changed since authorization")
                 return SanitizedToolResult.failed("authorization_refused")
 
             # 4. Dispatch on the REGISTERED kind, not isinstance against a
-            #    Protocol (which is structural and would match any object with
-            #    the right attribute names).
+            #    Protocol (structural, and would match any object with the right
+            #    attribute names).
             if reg.kind is ToolKind.PLAIN:
-                return self._execute_plain(action_id, reg, record)
-            return self._execute_credentialed(action_id, reg, record, now)
+                return self._execute_plain(action_id, reg, rec)
+            return self._execute_credentialed(action_id, reg, rec, now)
 
         except Exception:
             # Exception, not BaseException: KeyboardInterrupt and SystemExit must
             # not be swallowed by the credential boundary.
-            self._settle(action_id, AuthorizationState.FAILED)
-            self._record(action_id, record.credential_id, record.proposal,
-                         False, "execution failed")
+            self._pending.settle(action_id, AuthorizationState.FAILED)
+            self._record(action_id, rec.credential_id, rec.action, False,
+                         "execution failed")
             return SanitizedToolResult.failed("execution_failed")
 
-    def _execute_plain(self, action_id, reg, record) -> SanitizedToolResult:
+    def _execute_plain(self, action_id, reg, rec) -> SanitizedToolResult:
         try:
-            out = reg.adapter(record.proposal)
+            out = reg.adapter(rec.action)
         except Exception:
-            self._settle(action_id, AuthorizationState.FAILED)
-            self._record(action_id, None, record.proposal, False, "tool raised")
+            self._pending.settle(action_id, AuthorizationState.FAILED)
+            self._record(action_id, None, rec.action, False, "tool raised")
             return SanitizedToolResult.failed("tool_failed")
-        self._settle(action_id, AuthorizationState.COMPLETED)
-        self._record(action_id, None, record.proposal, True, "executed")
+        self._pending.settle(action_id, AuthorizationState.COMPLETED)
+        self._record(action_id, None, rec.action, True, "executed")
         return SanitizedToolResult.succeeded(out)
 
-    def _execute_credentialed(self, action_id, reg, record, now) -> SanitizedToolResult:
-        cred = self._creds.get(record.credential_id)
+    def _execute_credentialed(self, action_id, reg, rec, now) -> SanitizedToolResult:
+        cred = self._vault.resolve(rec.credential_id)
         if cred is None:
-            self._settle(action_id, AuthorizationState.FAILED)
-            self._record(action_id, record.credential_id, record.proposal,
-                         False, "no such credential")
+            self._pending.settle(action_id, AuthorizationState.FAILED)
+            self._record(action_id, rec.credential_id, rec.action, False,
+                         "no such credential")
             return SanitizedToolResult.failed("authorization_refused")
 
         # The credential's own binding must hold independently of the capability
-        # check: credential scope is not capability scope, and a credential may
-        # be strictly narrower than the capability that authorized the action.
-        if cred.verb != record.proposal.verb:
-            self._settle(action_id, AuthorizationState.FAILED)
-            self._record(action_id, cred.id, record.proposal, False,
+        # check: credential scope is not capability scope, and a credential may be
+        # strictly narrower than the capability that authorized the action.
+        if cred.verb != rec.action.verb:
+            self._pending.settle(action_id, AuthorizationState.FAILED)
+            self._record(action_id, cred.id, rec.action, False,
                          "credential verb does not match action")
             return SanitizedToolResult.failed("authorization_refused")
 
-        if not scope_covers(cred.scope, record.proposal.resource):
-            self._settle(action_id, AuthorizationState.FAILED)
-            self._record(action_id, cred.id, record.proposal, False,
+        if not scope_covers(cred.scope, rec.action.resource):
+            self._pending.settle(action_id, AuthorizationState.FAILED)
+            self._record(action_id, cred.id, rec.action, False,
                          "credential scope does not cover resource")
             return SanitizedToolResult.failed("authorization_refused")
 
         if not cred.is_available(now):
             why = "expired" if cred.is_expired(now) else "already consumed"
-            self._settle(action_id, AuthorizationState.FAILED)
-            self._record(action_id, cred.id, record.proposal, False,
-                         f"credential {why}")
+            self._pending.settle(action_id, AuthorizationState.FAILED)
+            self._record(action_id, cred.id, rec.action, False, f"credential {why}")
             return SanitizedToolResult.failed("authorization_refused")
 
         if cred.single_use:
@@ -530,22 +748,16 @@ class CredentialBroker:
         # object is never inspected, formatted, re-raised, chained, or logged: a
         # transport that raises RuntimeError(headers["Authorization"]) carries the
         # credential in its message, and the only safe thing to do with such an
-        # object is drop it on the floor. This is why the failure code below is a
-        # constant and not derived from the exception in any way.
+        # object is drop it. That is why the failure code below is a constant and
+        # is not derived from the exception in any way.
         try:
-            out = reg.adapter.execute_with_credential(record.proposal, cred.secret)
+            out = reg.adapter.execute_with_credential(rec.action, cred.secret)
         except Exception:
-            self._settle(action_id, AuthorizationState.FAILED)
-            self._record(action_id, cred.id, record.proposal, False,
+            self._pending.settle(action_id, AuthorizationState.FAILED)
+            self._record(action_id, cred.id, rec.action, False,
                          "credentialed tool failed")
             return SanitizedToolResult.failed("credentialed_tool_execution_failed")
 
-        self._settle(action_id, AuthorizationState.COMPLETED)
-        self._record(action_id, cred.id, record.proposal, True, "executed")
+        self._pending.settle(action_id, AuthorizationState.COMPLETED)
+        self._record(action_id, cred.id, rec.action, True, "executed")
         return SanitizedToolResult.succeeded(out)
-
-    # -- introspection (trusted callers; carries no secret) ------------------ #
-
-    def authorization_state(self, action_id: str) -> Optional[AuthorizationState]:
-        record = self._pending.get(action_id)
-        return record.state if record else None

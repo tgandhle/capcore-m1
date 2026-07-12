@@ -31,6 +31,10 @@ from capcore import (
     Capability, CapabilityStore, Proposal, ReferenceMonitor, RunContext,
     Verdict, Decision,
 )
+from capcore.broker import (
+    AuthorizationError, ExecutionProposal, SanitizedToolResult,
+    TrustedExecutionBroker,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -60,6 +64,7 @@ class StepResult:
     proposal: Proposal
     # audit-only detail; never surfaced to the model
     audit_reason: str = ""
+    # The SANITIZED result from the broker. Never a Secret, never a raw exception.
     tool_result: Optional[str] = None
 
 
@@ -167,23 +172,25 @@ class Budget:
 # Tool boundary.
 # --------------------------------------------------------------------------- #
 
-class Tool(Protocol):
-    """A tool executes an authorized action. In M2 tools are mock/local; no real
-    network. A tool is only ever called for an ALLOWed action.
-    """
-    def __call__(self, proposal: Proposal) -> str: ...
-
-
-class ToolRegistry:
-    """Maps a verb to a tool. Only authorized actions are dispatched here."""
-    def __init__(self):
-        self._tools: dict[str, Tool] = {}
-
-    def register(self, verb: str, tool: Tool) -> None:
-        self._tools[verb] = tool
-
-    def get(self, verb: str) -> Optional[Tool]:
-        return self._tools.get(verb)
+# NOTE: the engine has NO tool registry.
+#
+# There was a `ToolRegistry` here, keyed by verb. It is gone, and its absence is
+# a security property, not a simplification:
+#
+#   1. TWO REGISTRIES CAN DISAGREE. An engine-side verb->tool map plus a
+#      broker-side registration->adapter map is two trusted structures that must
+#      be kept in sync. That is precisely the monitor-store / engine-store defect
+#      in a new costume, and it is not repeated. There is exactly ONE catalog and
+#      the broker owns it.
+#
+#   2. VERB IS NOT AN EXECUTOR. Routing by verb collapses the action class into
+#      the concrete tool: one `read` implementation, forever. But
+#      `read_customer_record` and `read_payroll_database` are both `read`. The
+#      executor is named by the model (untrusted) and authorized by the broker's
+#      ToolPolicy, which is deny-by-default.
+#
+# The engine therefore cannot dispatch around the broker. It has no adapter to
+# call. Tests assert `not hasattr(engine, "tools")`.
 
 
 # --------------------------------------------------------------------------- #
@@ -191,17 +198,20 @@ class ToolRegistry:
 # --------------------------------------------------------------------------- #
 
 class ModelClient(Protocol):
-    """Produces the next Proposal given the run so far, or None to stop.
+    """Produces the next ExecutionProposal, or None to stop.
 
-    The engine treats every proposal as UNTRUSTED. The model may be a script, a
-    mock, or a real local LLM; the engine does not care.
+    The engine treats every proposal as UNTRUSTED, including the executor the
+    model names. An ExecutionProposal carries BOTH the security action (verb +
+    resource, which the monitor authorizes) AND the concrete tool the model wants
+    to run it (which the broker's deny-by-default ToolPolicy authorizes
+    separately). Naming a tool does not entitle the model to it.
 
-    A ModelClient receives a ModelView, NOT a RunRecord. This is a trust
-    boundary, not a convenience: a ModelClient implementation is untrusted code
-    (it wraps an untrusted provider), so it must not be able to reach trusted
-    execution state. See RunRecord's docstring for what happened when it could.
+    A ModelClient receives a ModelView, NOT a RunRecord. This is a trust boundary,
+    not a convenience: a ModelClient implementation is untrusted code (it wraps an
+    untrusted provider), so it must not be able to reach trusted execution state.
+    See RunRecord's docstring for what happened when it could.
     """
-    def next_proposal(self, view: ModelView) -> Optional[Proposal]: ...
+    def next_proposal(self, view: ModelView) -> Optional[ExecutionProposal]: ...
 
 
 class ScriptedModel:
@@ -209,11 +219,11 @@ class ScriptedModel:
     stops. Used by all tests and CI so the engine's security properties are
     reproducible.
     """
-    def __init__(self, proposals: list[Proposal]):
+    def __init__(self, proposals: list[ExecutionProposal]):
         self._proposals = list(proposals)
         self._i = 0
 
-    def next_proposal(self, view: ModelView) -> Optional[Proposal]:
+    def next_proposal(self, view: ModelView) -> Optional[ExecutionProposal]:
         if self._i >= len(self._proposals):
             return None
         p = self._proposals[self._i]
@@ -228,129 +238,139 @@ class ScriptedModel:
 # A hook the tests use to inject an event (e.g. a revocation) BETWEEN the
 # propose-time authorization and the execute-time re-check, to exercise the
 # revoke race deterministically. In production this is None.
-PreExecuteHook = Optional[Callable[["ExecutionEngine", Proposal], None]]
+# The hook receives the LIVE RunRecord as well as the engine and proposal. Tests
+# use it to fire a revocation between propose-time authorization and dispatch, and
+# to corrupt trusted counter state in order to prove that run()'s loop ceiling
+# bounds the run INDEPENDENTLY of that counter. Production passes None.
+PreExecuteHook = Optional[
+    Callable[["ExecutionEngine", ExecutionProposal, "RunRecord"], None]
+]
 
 
 class ExecutionEngine:
     def __init__(
         self,
         monitor: ReferenceMonitor,
-        tools: ToolRegistry,
+        broker: TrustedExecutionBroker,
         budget: Budget,
         pre_execute_hook: PreExecuteHook = None,
     ):
-        """The engine authorizes exclusively through `monitor`, and its capability
-        store is, by construction, the monitor's store.
+        """The engine authorizes through `monitor` and EXECUTES through `broker`.
 
-        The engine used to take a separate `store` argument. That permitted a
-        divergent state where `monitor` authorized against store A while
-        `engine.store` (used by hooks and any revocation path) pointed at store B.
+        It owns no tool catalog and holds no adapter. There is no path from here
+        to a running tool that does not go through the broker, which is the point:
+        the credential boundary cannot be bypassed by a caller who happens to have
+        an engine.
+
+        `self.store` is exactly `monitor.store`, never a second reference. An
+        earlier version took a separate `store` argument, which permitted a
+        divergent state where the monitor authorized against store A while
+        `engine.store` (used by hooks and revocation paths) pointed at store B.
         Both authorization checks read `monitor.store`, so revoking `engine.store`
-        was a silent no-op and the action executed anyway. The store was a
-        parallel reference with no authority that looked like it had some.
-
-        There is now no way to supply a second store. `self.store` is exactly the
-        monitor's store, so anything that revokes through `engine.store` revokes
-        the store the monitor actually reads. See
-        tests/test_m2_m3_trust_boundaries.py::test_engine_store_must_be_the_monitors_store.
+        was a silent no-op and the action executed anyway.
         """
         self.monitor = monitor
-        self.store = monitor.store   # the ONLY capability store; not a copy, not a second ref
-        self.tools = tools
+        self.store = monitor.store   # the ONLY capability store
+        self.broker = broker
         self.budget = budget
         self._pre_execute_hook = pre_execute_hook
 
-        # Validate at construction so misuse fails closed HERE, not deep in a run.
-        # Removing the old `store` parameter means an old-style call
-        # ExecutionEngine(monitor, store, tools, budget) would otherwise bind
-        # `store` into `tools` and `tools` into `budget` and construct silently,
-        # surfacing only as a confusing AttributeError mid-run. Reject that now.
+        # Fail closed at construction, not deep in a run.
         if not isinstance(monitor, ReferenceMonitor):
             raise TypeError("monitor must be a ReferenceMonitor")
-        if not isinstance(tools, ToolRegistry):
+        if not isinstance(broker, TrustedExecutionBroker):
             raise TypeError(
-                "tools must be a ToolRegistry; the engine no longer takes a "
-                "separate store argument (it derives store from monitor)"
+                "broker must be a TrustedExecutionBroker; the engine no longer "
+                "owns a tool registry and cannot execute anything without one"
             )
         if not isinstance(budget, Budget):
             raise TypeError("budget must be a Budget")
         if pre_execute_hook is not None and not callable(pre_execute_hook):
             raise TypeError("pre_execute_hook must be callable or None")
 
-    def _authorize(self, ctx: RunContext, proposal: Proposal) -> Decision:
-        return self.monitor.authorize(ctx, proposal)
+    def _authorize(self, ctx: RunContext, action: Proposal) -> Decision:
+        return self.monitor.authorize(ctx, action)
 
-    def step(self, record: RunRecord, proposal: Proposal) -> StepResult:
-        """Run one proposal through the trusted pipeline.
+    def step(self, record: RunRecord, proposal: ExecutionProposal) -> StepResult:
+        """Run one ExecutionProposal through the trusted pipeline.
 
-        Order matters and is security-relevant:
-          1. Budget check (fail closed if exhausted).
-          2. Authorize at PROPOSE time.
+        Order is security-relevant:
+          1. Budget (fail closed if exhausted).
+          2. Authorize the ACTION at propose time. This drives control flow and
+             audit. It is NOT what the broker trusts.
           3. [hook: a revocation may fire here in tests]
-          4. Re-authorize at EXECUTE time (double authorization). If the second
-             decision is not ALLOW, the action does NOT execute, even though it
-             was allowed a moment ago. This closes the revoke-during-execution
-             race: authorization is checked against current state at the instant
-             of execution, not against a stale earlier decision.
-          5. Dispatch to the tool only on a confirmed ALLOW.
+          4. Hand off to the broker, which authorizes INDEPENDENTLY at mint and
+             AGAIN at redemption. The engine's decision is never passed along as
+             proof of anything: the broker does not accept caller-supplied
+             verdicts.
+
+        The double-authorization that used to live here (propose-time then
+        execute-time re-check) has not been weakened; it has MOVED INTO the
+        broker, where the re-check happens immediately before the credential is
+        touched. A capability revoked between propose and execute stops the
+        action at redemption, and the tool never runs.
         """
+        action = proposal.action
+
         # 1. Budget.
         if record.steps_taken >= self.budget.max_steps:
             record.state = RunState.ABORTED
-            res = StepResult(StepOutcome.BUDGET_EXHAUSTED, proposal,
+            res = StepResult(StepOutcome.BUDGET_EXHAUSTED, action,
                              audit_reason="run budget exhausted")
             record.history.append(res)
             return res
 
-        # 2. Authorize at propose time.
-        first = self._authorize(record.ctx, proposal)
-        # Count the attempt against the budget (denied attempts count too, so a
-        # hostile model cannot burn unlimited attempts probing the boundary).
+        # 2. Propose-time authorization (control flow + audit).
+        first = self._authorize(record.ctx, action)
         if self.budget.count_denied_attempts or first.verdict == Verdict.ALLOW:
             record.steps_taken += 1
 
         if first.verdict == Verdict.DENY:
-            res = StepResult(StepOutcome.DENIED, proposal,
+            res = StepResult(StepOutcome.DENIED, action,
                              audit_reason=first.audit_reason)
             record.history.append(res)
             return res
         if first.verdict == Verdict.REQUIRE_APPROVAL:
-            res = StepResult(StepOutcome.APPROVAL, proposal,
+            res = StepResult(StepOutcome.APPROVAL, action,
                              audit_reason=first.audit_reason)
             record.history.append(res)
             return res
 
-        # 3. Test hook: a revocation may fire here, between the two checks.
+        # 3. Test hook: a revocation may fire here, between propose and execute.
         if self._pre_execute_hook is not None:
-            self._pre_execute_hook(self, proposal)
+            self._pre_execute_hook(self, proposal, record)
 
-        # 4. Re-authorize at execute time (double authorization / revoke race).
-        second = self._authorize(record.ctx, proposal)
-        if second.verdict != Verdict.ALLOW:
-            res = StepResult(StepOutcome.REVOKED_RACE, proposal,
-                             audit_reason="authorization lost between propose and "
-                                          "execute (revoke race); action not executed")
-            record.history.append(res)
-            return res
-
-        # 5. Dispatch to the tool (only reached on a confirmed ALLOW).
-        tool = self.tools.get(proposal.verb)
-        if tool is None:
-            # No tool for an authorized verb: treat as executed no-op with note.
-            res = StepResult(StepOutcome.EXECUTED, proposal,
-                             audit_reason="authorized; no tool registered",
-                             tool_result=None)
-            record.history.append(res)
-            return res
+        # 4. Mint. The broker re-authorizes on its own; it does not take `first`.
+        #    A tool the model named but is not policy-authorized dies here.
         try:
-            out = tool(proposal)
-        except Exception as e:  # a tool failure must not crash the run
-            record.state = RunState.FAILED
-            res = StepResult(StepOutcome.TOOL_ERROR, proposal,
-                             audit_reason=f"tool raised: {type(e).__name__}: {e}")
+            action_id = self.broker.register_authorized_execution(record.ctx, proposal)
+        except AuthorizationError as e:
+            # Authorization was lost between propose and mint (revoke race), or
+            # the model named a tool it may not use.
+            res = StepResult(StepOutcome.REVOKED_RACE, action,
+                             audit_reason=f"broker refused authorization: {e}")
             record.history.append(res)
             return res
-        res = StepResult(StepOutcome.EXECUTED, proposal, tool_result=out)
+
+        # 5. Redeem. The broker re-authorizes AGAIN, resolves the tool and
+        #    credential from its own state, executes inside its boundary, and
+        #    returns a sanitized result. No Secret crosses back.
+        result: SanitizedToolResult = self.broker.redeem_and_execute(action_id)
+
+        if result.ok:
+            res = StepResult(StepOutcome.EXECUTED, action, tool_result=result.body)
+            record.history.append(res)
+            return res
+
+        if result.code == "authorization_refused":
+            res = StepResult(StepOutcome.REVOKED_RACE, action,
+                             audit_reason="authorization lost before execution")
+            record.history.append(res)
+            return res
+
+        record.state = RunState.FAILED
+        res = StepResult(StepOutcome.TOOL_ERROR, action,
+                         audit_reason=f"tool failed: {result.code}")
         record.history.append(res)
         return res
 

@@ -30,8 +30,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from capcore import Capability, CapabilityStore, ReferenceMonitor, RunContext, Proposal
+from capcore.broker import (
+    ExecutionProposal, ToolKind, ToolRegistration, TrustedExecutionBroker,
+)
 from capcore.runtime import (
-    Budget, ToolRegistry, ExecutionEngine, RunRecord, RunState, StepOutcome,
+    Budget, ExecutionEngine, RunRecord, RunState, StepOutcome,
 )
 from capcore.adapters import OllamaModel
 
@@ -51,10 +54,14 @@ def build_engine(pre_execute_hook=None, budget=8):
         principal=PRINCIPAL, run=RUN))
     assert d.ok, d.reason
     mon = ReferenceMonitor(store)
-    reg = ToolRegistry()
-    reg.register("read", lambda p: f"[data for {p.resource}]")
-    reg.register("send", lambda p: f"[sent {p.resource}]")
-    engine = ExecutionEngine(mon, reg, Budget(budget),
+    broker = TrustedExecutionBroker(mon)
+    for verb, fn in (("read", lambda a: f"[data for {a.resource}]"),
+                     ("send", lambda a: f"[sent {a.resource}]")):
+        broker.register_tool(ToolRegistration(
+            registration_id=f"{verb}-records", verb=verb, kind=ToolKind.PLAIN,
+            adapter=fn, version="1"))
+        broker.grant_tool(f"{verb}-records", "acme/records")
+    engine = ExecutionEngine(mon, broker, Budget(budget),
                              pre_execute_hook=pre_execute_hook)
     ctx = RunContext(TENANT, PRINCIPAL, RUN)
     return engine, store, ctx
@@ -125,7 +132,7 @@ def phase2_scripted():
     # b) the revoke race, on a fresh engine whose hook revokes mid-step
     print()
     print("  --- revoke-during-execution race ---")
-    def revoke_hook(eng, proposal):
+    def revoke_hook(eng, proposal, record):
         eng.store.revoke("run-cap")   # fires AFTER propose-allow, BEFORE execute
     engine2, store2, ctx2 = build_engine(pre_execute_hook=revoke_hook, budget=4)
     record2 = RunRecord(ctx=ctx2, state=RunState.RUNNING)

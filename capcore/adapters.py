@@ -24,6 +24,7 @@ import re
 from typing import Optional
 
 from capcore import Proposal
+from capcore.broker import ExecutionProposal
 from capcore.runtime import ModelView
 
 
@@ -35,12 +36,13 @@ DEFAULT_MODEL = "llama3.2"
 # comes back as untrusted regardless.
 SYSTEM_PROMPT = """You are an agent proposing ONE action at a time inside a \
 capability-enforced runtime. Respond with a single JSON object and nothing else:
-{"verb": "<read|send>", "resource": "acme/records/customers/<id>"}
+{"verb": "<read|send>", "resource": "acme/records/customers/<id>", "tool": "<tool-id>"}
 
 You may only READ or SEND on resources under acme/records/customers.
 Resources are slash-separated paths with NO leading slash. Use real ids like
-c-1001, c-1002. Example of a VALID action:
-{"verb": "read", "resource": "acme/records/customers/c-1001"}
+c-1001, c-1002. The "tool" field names the concrete executor, e.g. "read-records"
+or "send-records". Example of a VALID action:
+{"verb": "read", "resource": "acme/records/customers/c-1001", "tool": "read-records"}
 
 Do not use a leading slash. Do not invent other top-level paths. Do not use
 placeholders like <id> literally, pick a concrete id. Do not explain, do not
@@ -48,9 +50,14 @@ use markdown, output only the JSON object. If done, output exactly:
 {"done": true}"""
 
 
-def parse_proposal(text: str) -> Optional[Proposal]:
-    """Extract a Proposal from raw model text. Returns None if the model
-    signals done or the text has no usable JSON object.
+def parse_proposal(text: str) -> Optional[ExecutionProposal]:
+    """Extract an ExecutionProposal from raw model text. None if the model signals
+    done or the text has no usable JSON object.
+
+    The model names BOTH the action (verb + resource) and the executor ("tool").
+    All three are UNTRUSTED. Naming a tool does not authorize it: the broker's
+    deny-by-default ToolPolicy decides whether this registration may serve this
+    action, and an unauthorized executor is refused at mint.
 
     This is deliberately forgiving on FORMAT (small models wrap things in prose
     or markdown) but strict on CONTENT: it only accepts a non-empty string verb
@@ -77,11 +84,17 @@ def parse_proposal(text: str) -> Optional[Proposal]:
         return None
     verb = obj.get("verb")
     resource = obj.get("resource")
+    tool = obj.get("tool")
     if not isinstance(verb, str) or not verb:
         return None
     if not isinstance(resource, str) or not resource:
         return None
-    return Proposal(resource=resource, verb=verb)
+    if not isinstance(tool, str) or not tool:
+        return None
+    return ExecutionProposal(
+        action=Proposal(resource=resource, verb=verb),
+        tool_registration_id=tool,
+    )
 
 
 def render_history(view: ModelView, max_items: int = 6) -> str:

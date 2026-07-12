@@ -15,9 +15,9 @@ from capcore import (
     Capability, CapabilityStore, Proposal, ReferenceMonitor, RunContext, Verdict,
 )
 from capcore.broker import (
-    Secret, Credential, CredentialBroker, CredentialError, AuthorizationError,
-    AuthorizationState, ReleaseAudit, SanitizedToolResult, ToolKind,
-    ToolRegistration,
+    Secret, Credential, TrustedExecutionBroker, CredentialError,
+    AuthorizationError, AuthorizationState, ReleaseAudit, SanitizedToolResult,
+    ToolKind, ToolRegistration, ExecutionProposal,
 )
 
 MOCK_SECRET = "SEKRET-TOKEN-12345"
@@ -52,21 +52,28 @@ class Recorder:
         return "tool-ok"
 
 
-def wired(monitor, recorder=None, cred=None, tool_version="1"):
+def ep(resource, verb="read", tool="tool-1"):
+    return ExecutionProposal(action=Proposal(resource, verb),
+                             tool_registration_id=tool)
+
+
+def wired(monitor, recorder=None, cred=None, tool_version="1", verb="read"):
     """A broker with one credential and one credentialed tool bound to it."""
-    broker = CredentialBroker(monitor)
-    broker.issue(cred or a_credential())
+    broker = TrustedExecutionBroker(monitor)
+    broker.issue_credential(cred or a_credential())
     broker.register_tool(ToolRegistration(
-        registration_id="tool-1", kind=ToolKind.CREDENTIALED,
+        registration_id="tool-1", verb=verb, kind=ToolKind.CREDENTIALED,
         adapter=recorder or Recorder(), version=tool_version,
         credential_id="cred-1",
     ))
+    broker.grant_tool("tool-1", "acme/records")
     return broker
 
 
 def mint(broker, mon, ctx, prop, tool="tool-1"):
-    decision = mon.authorize(ctx, prop)
-    return broker.register_authorized_execution(ctx, prop, decision, tool)
+    """prop is an M1 Proposal; wrap it for the execution layer."""
+    return broker.register_authorized_execution(
+        ctx, ExecutionProposal(action=prop, tool_registration_id=tool))
 
 
 # --------------------------------------------------------------------------- #
@@ -115,21 +122,23 @@ def test_execute_on_authorized_action_delivers_secret_to_tool():
 
 
 def test_cannot_register_a_denied_action():
+    """The broker authorizes independently; a denied action never mints."""
     store, mon, ctx = build()
-    broker = wired(mon, cred=a_credential(verb="send", scope="acme/records"))
-    # rebind tool credential to the send credential for a coherent fixture
+    broker = wired(mon)
     prop = Proposal("acme/records/x", "write")  # write not granted -> deny
-    decision = mon.authorize(ctx, prop)
-    assert decision.verdict == Verdict.DENY
+    assert mon.authorize(ctx, prop).verdict == Verdict.DENY
     with pytest.raises(AuthorizationError):
-        broker.register_authorized_execution(ctx, prop, decision, "tool-1")
+        mint(broker, mon, ctx, prop)
 
 
 def test_no_delivery_verb_mismatch():
+    """The CREDENTIAL is bound to `send` while the action is `read`. The tool and
+    the capability both permit read, so this isolates the credential's own binding
+    check, which is independent of capability scope."""
     store, mon, ctx = build()
     rec = Recorder()
     broker = wired(mon, rec, cred=a_credential(verb="send"))  # cred for send
-    action_id = mint(broker, mon, ctx, Proposal("acme/records/x", "read"))  # read
+    action_id = mint(broker, mon, ctx, Proposal("acme/records/x", "read"))
 
     result = broker.redeem_and_execute(action_id)
 
@@ -176,12 +185,13 @@ def test_authorization_is_single_use():
 def test_action_ttl_expiry_denies_after_deadline():
     store, mon, ctx = build()
     rec = Recorder()
-    broker = CredentialBroker(mon, action_ttl_seconds=10.0)
-    broker.issue(a_credential())
+    broker = TrustedExecutionBroker(mon, action_ttl_seconds=10.0)
+    broker.issue_credential(a_credential())
     broker.register_tool(ToolRegistration(
-        registration_id="tool-1", kind=ToolKind.CREDENTIALED,
+        registration_id="tool-1", verb="read", kind=ToolKind.CREDENTIALED,
         adapter=rec, version="1", credential_id="cred-1",
     ))
+    broker.grant_tool("tool-1", "acme/records")
     prop = Proposal("acme/records/x", "read")
     decision = mon.authorize(ctx, prop)
     # The ACTION ttl is self-consistent (expires_at is derived from this same
@@ -189,7 +199,8 @@ def test_action_ttl_expiry_denies_after_deadline():
     # test in this file mixes clock origins and a future credential TTL added to
     # this fixture cannot silently reintroduce the monotonic-origin bug.
     t0 = time.monotonic()
-    action_id = broker.register_authorized_execution(ctx, prop, decision, "tool-1", now=t0)
+    action_id = broker.register_authorized_execution(
+        ctx, ExecutionProposal(action=prop, tool_registration_id="tool-1"), now=t0)
 
     result = broker.redeem_and_execute(action_id, now=t0 + 11.0)
 
@@ -237,7 +248,7 @@ def test_secret_reaches_only_authorized_tool_not_model_facing():
     assert MOCK_SECRET not in model_view.public_reason
     assert MOCK_SECRET not in str(model_view.trace)
 
-    action_id = broker.register_authorized_execution(ctx, prop, decision, "tool-1")
+    action_id = mint(broker, mon, ctx, prop)
     result = broker.redeem_and_execute(action_id)
 
     assert rec.delivered == [MOCK_SECRET]       # reached the tool, once
@@ -247,10 +258,10 @@ def test_secret_reaches_only_authorized_tool_not_model_facing():
 
 def test_duplicate_credential_id_rejected():
     store, mon, ctx = build()
-    broker = CredentialBroker(mon)
-    broker.issue(a_credential())
+    broker = TrustedExecutionBroker(mon)
+    broker.issue_credential(a_credential())
     with pytest.raises(CredentialError):
-        broker.issue(a_credential())
+        broker.issue_credential(a_credential())
 
 
 def test_consumed_credential_refuses_a_fresh_authorization():
@@ -291,18 +302,19 @@ def test_expired_credential_refuses_execution():
     """
     store, mon, ctx = build()
     rec = Recorder()
-    broker = CredentialBroker(mon, action_ttl_seconds=10_000.0)
+    broker = TrustedExecutionBroker(mon, action_ttl_seconds=10_000.0)
     cred = a_credential(ttl_seconds=10.0)
-    broker.issue(cred)
+    broker.issue_credential(cred)
     broker.register_tool(ToolRegistration(
-        registration_id="tool-1", kind=ToolKind.CREDENTIALED,
+        registration_id="tool-1", verb="read", kind=ToolKind.CREDENTIALED,
         adapter=rec, version="1", credential_id="cred-1",
     ))
+    broker.grant_tool("tool-1", "acme/records")
     t0 = cred._issued_at          # anchor everything to the credential's clock
 
     prop = Proposal("acme/records/x", "read")
-    decision = mon.authorize(ctx, prop)
-    action_id = broker.register_authorized_execution(ctx, prop, decision, "tool-1", now=t0)
+    action_id = broker.register_authorized_execution(
+        ctx, ExecutionProposal(action=prop, tool_registration_id="tool-1"), now=t0)
 
     # well inside the action TTL (10_000s), well past the CREDENTIAL TTL (10s)
     result = broker.redeem_and_execute(action_id, now=t0 + 50.0)
@@ -319,18 +331,19 @@ def test_credential_within_ttl_still_delivers():
     """
     store, mon, ctx = build()
     rec = Recorder()
-    broker = CredentialBroker(mon, action_ttl_seconds=10_000.0)
+    broker = TrustedExecutionBroker(mon, action_ttl_seconds=10_000.0)
     cred = a_credential(ttl_seconds=100.0)
-    broker.issue(cred)
+    broker.issue_credential(cred)
     broker.register_tool(ToolRegistration(
-        registration_id="tool-1", kind=ToolKind.CREDENTIALED,
+        registration_id="tool-1", verb="read", kind=ToolKind.CREDENTIALED,
         adapter=rec, version="1", credential_id="cred-1",
     ))
+    broker.grant_tool("tool-1", "acme/records")
     t0 = cred._issued_at
 
     prop = Proposal("acme/records/x", "read")
-    decision = mon.authorize(ctx, prop)
-    action_id = broker.register_authorized_execution(ctx, prop, decision, "tool-1", now=t0)
+    action_id = broker.register_authorized_execution(
+        ctx, ExecutionProposal(action=prop, tool_registration_id="tool-1"), now=t0)
 
     result = broker.redeem_and_execute(action_id, now=t0 + 5.0)   # inside TTL
 

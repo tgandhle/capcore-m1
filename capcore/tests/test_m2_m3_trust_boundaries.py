@@ -37,14 +37,13 @@ from capcore import (
     RunContext, Verdict,
 )
 from capcore.broker import (
-    AuthorizationError, AuthorizationState, Credential, CredentialBroker,
-    CredentialError, PendingAuthorization, SanitizedToolResult, Secret,
-    ToolKind, ToolRegistration,
+    AuthorizationError, AuthorizationState, Credential, TrustedExecutionBroker,
+    CredentialError, ExecutionProposal, PendingAuthorization,
+    SanitizedToolResult, Secret, ToolKind, ToolPolicy, ToolRegistration,
 )
 from capcore.httptool import HttpTool
 from capcore.runtime import (
     Budget, ExecutionEngine, RunRecord, RunState, ScriptedModel, StepOutcome,
-    ToolRegistry,
 )
 
 
@@ -66,12 +65,25 @@ def build_ctx() -> RunContext:
     return RunContext(TENANT, PRINCIPAL, RUN)
 
 
-def recording_registry():
-    """A registry whose `read` tool records every execution."""
+def ep(resource="acme/api/x", verb="read", tool="tool-read"):
+    return ExecutionProposal(action=Proposal(resource, verb),
+                             tool_registration_id=tool)
+
+
+def recording_broker(monitor, grant=True):
+    """A broker with one plain `read` tool that records every execution.
+
+    Returns (broker, calls). `calls` is the ground truth for "did the action
+    actually run": if a check refused it, calls must be empty.
+    """
     calls = []
-    registry = ToolRegistry()
-    registry.register("read", lambda p: calls.append(p.resource) or "ok")
-    return registry, calls
+    broker = TrustedExecutionBroker(monitor)
+    broker.register_tool(ToolRegistration(
+        registration_id="tool-read", verb="read", kind=ToolKind.PLAIN,
+        adapter=lambda a: calls.append(a.resource) or "ok", version="1"))
+    if grant:
+        broker.grant_tool("tool-read", "acme")
+    return broker, calls
 
 
 class MockCalls:
@@ -155,9 +167,10 @@ class MutatingModel:
 def test_model_cannot_mutate_trusted_budget_counter():
     """A hostile model must not bypass the budget, corrupt state, or hang the run."""
     store = build_store()
-    registry, calls = recording_registry()
-    engine = ExecutionEngine(ReferenceMonitor(store), registry, Budget(1))
-    model = MutatingModel(Proposal("acme/api/x", "read"))
+    monitor = ReferenceMonitor(store)
+    broker, calls = recording_broker(monitor)
+    engine = ExecutionEngine(monitor, broker, Budget(1))
+    model = MutatingModel(ep())
 
     record = engine.run(build_ctx(), model)
 
@@ -191,12 +204,12 @@ def test_model_cannot_mutate_trusted_budget_counter():
 def test_missing_tool_is_not_reported_as_executed():
     """Dispatching an authorized verb with no registered tool executed nothing."""
     store = build_store()
-    engine = ExecutionEngine(
-        ReferenceMonitor(store), ToolRegistry(), Budget(2)
-    )
+    monitor = ReferenceMonitor(store)
+    broker = TrustedExecutionBroker(monitor)      # empty catalog: no tools at all
+    engine = ExecutionEngine(monitor, broker, Budget(2))
     record = RunRecord(ctx=build_ctx(), state=RunState.RUNNING)
 
-    result = engine.step(record, Proposal("acme/api/x", "read"))
+    result = engine.step(record, ep(tool="not-registered"))
 
     assert result.outcome != StepOutcome.EXECUTED, (
         "no tool was registered and nothing ran, but the engine reported "
@@ -233,17 +246,17 @@ def test_revoking_through_engine_store_actually_stops_the_action():
     """
     store = build_store()
     monitor = ReferenceMonitor(store)
-    registry, calls = recording_registry()
+    broker, calls = recording_broker(monitor)
 
-    def revoke_via_engine(engine, proposal):
+    def revoke_via_engine(engine, proposal, record):
         engine.store.revoke("cap-1")
 
     engine = ExecutionEngine(
-        monitor, registry, Budget(2), pre_execute_hook=revoke_via_engine
+        monitor, broker, Budget(2), pre_execute_hook=revoke_via_engine
     )
     record = RunRecord(ctx=build_ctx(), state=RunState.RUNNING)
 
-    result = engine.step(record, Proposal("acme/api/x", "read"))
+    result = engine.step(record, ep())
 
     assert calls == [], (
         "the capability was revoked through engine.store before execution, but "
@@ -256,7 +269,7 @@ def test_engine_store_identity_invariant():
     """After the fix, the engine must expose exactly the monitor's store."""
     store = build_store()
     monitor = ReferenceMonitor(store)
-    engine = ExecutionEngine(monitor, ToolRegistry(), Budget(1))
+    engine = ExecutionEngine(monitor, TrustedExecutionBroker(monitor), Budget(1))
 
     assert engine.store is engine.monitor.store
     assert engine.monitor.store is store
@@ -269,7 +282,7 @@ def test_engine_rejects_a_second_store():
     monitor = ReferenceMonitor(store_a)
 
     with pytest.raises((TypeError, ValueError)):
-        ExecutionEngine(monitor, store_b, ToolRegistry(), Budget(1))
+        ExecutionEngine(monitor, store_b, TrustedExecutionBroker(monitor), Budget(1))
 
 
 # --------------------------------------------------------------------------- #
@@ -343,9 +356,8 @@ def test_engine_cannot_distinguish_model_completion_from_model_failure():
     model result (PROPOSAL / COMPLETED / ERROR), not via a bare None.
     """
     store = build_store()
-    engine = ExecutionEngine(
-        ReferenceMonitor(store), ToolRegistry(), Budget(3)
-    )
+    monitor = ReferenceMonitor(store)
+    engine = ExecutionEngine(monitor, TrustedExecutionBroker(monitor), Budget(3))
 
     record = engine.run(build_ctx(), UnparseableModel())
 
@@ -367,9 +379,8 @@ def test_ollama_adapter_does_not_swallow_provider_errors():
             raise RuntimeError("connection refused")
 
     store = build_store()
-    engine = ExecutionEngine(
-        ReferenceMonitor(store), ToolRegistry(), Budget(3)
-    )
+    monitor = ReferenceMonitor(store)
+    engine = ExecutionEngine(monitor, TrustedExecutionBroker(monitor), Budget(3))
 
     record = engine.run(build_ctx(), BrokenOllama())
 
@@ -396,20 +407,21 @@ def _broker_with_http(monitor, transport, url="https://example.com/api",
                       secret="LEAKME", single_use=True, verb="read",
                       scope="acme/api"):
     """A broker wired with one credential and one credentialed HttpTool."""
-    broker = CredentialBroker(monitor)
-    broker.issue(Credential("cred-1", "cap-1", verb, scope,
-                            Secret(secret), single_use=single_use))
+    broker = TrustedExecutionBroker(monitor)
+    broker.issue_credential(Credential("cred-1", "cap-1", verb, scope,
+                                       Secret(secret), single_use=single_use))
     broker.register_tool(ToolRegistration(
-        registration_id="http-1", kind=ToolKind.CREDENTIALED,
+        registration_id="http-1", verb=verb, kind=ToolKind.CREDENTIALED,
         adapter=HttpTool(url, transport), version="1", credential_id="cred-1",
     ))
+    broker.grant_tool("http-1", "acme")
     return broker
 
 
 def _mint(broker, monitor, ctx, proposal, tool_reg_id="http-1"):
-    decision = monitor.authorize(ctx, proposal)
-    assert decision.verdict == Verdict.ALLOW, "fixture proposal must be allowed"
-    return broker.register_authorized_execution(ctx, proposal, decision, tool_reg_id)
+    """proposal is an M1 Proposal; wrap for the execution layer."""
+    return broker.register_authorized_execution(
+        ctx, ExecutionProposal(action=proposal, tool_registration_id=tool_reg_id))
 
 
 # --------------------------------------------------------------------------- #
@@ -448,19 +460,20 @@ def test_forged_decision_cannot_obtain_the_secret():
     monitor = ReferenceMonitor(store)
     calls = MockCalls()
     broker = _broker_with_http(monitor, calls.transport)
-    forged = Decision(Verdict.ALLOW, "authorized")
 
-    # A resource the real monitor will NOT authorize, smuggled in on a forged ALLOW.
+    # The broker no longer ACCEPTS a Decision at all, so there is nothing to
+    # forge: it authorizes independently. An unauthorized action is refused at
+    # mint, and there is no parameter through which a caller could assert
+    # otherwise.
+    import inspect
+    sig = inspect.signature(broker.register_authorized_execution)
+    assert "decision" not in sig.parameters
+
     unauth = Proposal("globex/secret", "read")
-    action_id = broker.register_authorized_execution(
-        build_ctx(), unauth, forged, "http-1"
-    )
+    with pytest.raises(AuthorizationError):
+        _mint(broker, monitor, build_ctx(), unauth)
 
-    result = broker.redeem_and_execute(action_id)
-
-    assert result.ok is False
-    assert result.code == "authorization_refused"
-    assert calls.count == 0, "a forged decision must never reach the transport"
+    assert calls.count == 0, "an unauthorized action must never reach the transport"
 
 
 # --------------------------------------------------------------------------- #
@@ -517,7 +530,7 @@ def test_action_cannot_be_redeemed_for_a_different_tool():
     signature admits no tool argument.
     """
     import inspect
-    sig = inspect.signature(CredentialBroker.redeem_and_execute)
+    sig = inspect.signature(TrustedExecutionBroker.redeem_and_execute)
     params = set(sig.parameters) - {"self"}
     assert params <= {"action_id", "now"}, (
         f"redeem_and_execute exposes {params}; a caller must not be able to pass "
@@ -539,11 +552,11 @@ def test_swapped_tool_version_is_refused():
 
     # Swap the tool under the same registration id, new version + new transport.
     calls_new = MockCalls()
-    broker._tools["http-1"] = ToolRegistration(
-        registration_id="http-1", kind=ToolKind.CREDENTIALED,
+    broker.catalog.replace_for_test(ToolRegistration(
+        registration_id="http-1", verb="read", kind=ToolKind.CREDENTIALED,
         adapter=HttpTool("https://example.com/api", calls_new.transport),
         version="2", credential_id="cred-1",
-    )
+    ))
 
     result = broker.redeem_and_execute(action_id)
 
@@ -561,23 +574,24 @@ def test_expired_action_is_denied():
     store = build_store()
     monitor = ReferenceMonitor(store)
     calls = MockCalls()
-    broker = CredentialBroker(monitor, action_ttl_seconds=10.0)
-    broker.issue(Credential("cred-1", "cap-1", "read", "acme/api",
-                            Secret("LEAKME"), single_use=True))
+    broker = TrustedExecutionBroker(monitor, action_ttl_seconds=10.0)
+    broker.issue_credential(Credential("cred-1", "cap-1", "read", "acme/api",
+                                       Secret("LEAKME"), single_use=True))
     broker.register_tool(ToolRegistration(
-        registration_id="http-1", kind=ToolKind.CREDENTIALED,
+        registration_id="http-1", verb="read", kind=ToolKind.CREDENTIALED,
         adapter=HttpTool("https://example.com/api", calls.transport),
         version="1", credential_id="cred-1",
     ))
+    broker.grant_tool("http-1", "acme")
     ctx = build_ctx()
     proposal = Proposal("acme/api/x", "read")
-    decision = monitor.authorize(ctx, proposal)
     # Anchor to a single clock origin. The action TTL is self-consistent, but
     # mixing an absolute `now` with time.monotonic()-based credential state is
     # how a machine-dependent flake gets in.
     t0 = time.monotonic()
     action_id = broker.register_authorized_execution(
-        ctx, proposal, decision, "http-1", now=t0
+        ctx, ExecutionProposal(action=proposal, tool_registration_id="http-1"),
+        now=t0,
     )
 
     result = broker.redeem_and_execute(action_id, now=t0 + 11.0)
@@ -651,11 +665,12 @@ def test_plain_tool_executes_without_a_credential():
     store = build_store()
     monitor = ReferenceMonitor(store)
     ran = []
-    broker = CredentialBroker(monitor)
+    broker = TrustedExecutionBroker(monitor)
     broker.register_tool(ToolRegistration(
-        registration_id="plain-1", kind=ToolKind.PLAIN,
-        adapter=lambda p: ran.append(p.resource) or "plain-ok", version="1",
+        registration_id="plain-1", verb="read", kind=ToolKind.PLAIN,
+        adapter=lambda a: ran.append(a.resource) or "plain-ok", version="1",
     ))
+    broker.grant_tool("plain-1", "acme")
     action_id = _mint(broker, monitor, build_ctx(),
                       Proposal("acme/api/x", "read"), tool_reg_id="plain-1")
 

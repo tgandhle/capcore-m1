@@ -84,27 +84,45 @@ MUTATIONS = [
      "            if cap.run is not None and cap.run != ctx.run:\n                continue",
      "            if False:  # BUG: ignore run binding\n                continue"),
     # --- M2 runtime mutations (target capcore/runtime.py) ---
-    ("revoke_race_reexecute_skipped",
-     "        second = self._authorize(record.ctx, proposal)\n        if second.verdict != Verdict.ALLOW:",
-     "        second = first  # BUG: skip execute-time re-authorization (revoke race)\n        if second.verdict != Verdict.ALLOW:",
-     "capcore/runtime.py"),
+    # The engine's execute-time re-authorization MOVED into the broker in the
+    # M2<->M3 integration: the re-check now happens at redemption, immediately
+    # before the credential is touched. The revoke-race mutation therefore targets
+    # the broker's live re-authorization (see broker_skips_reauthorization_at_
+    # redemption below). What remains engine-side is the BUDGET.
     ("budget_not_enforced",
-     "        if record.steps_taken >= self.budget.max_steps:\n            record.state = RunState.ABORTED\n            res = StepResult(StepOutcome.BUDGET_EXHAUSTED, proposal,",
-     "        if False:  # BUG: never enforce budget\n            record.state = RunState.ABORTED\n            res = StepResult(StepOutcome.BUDGET_EXHAUSTED, proposal,",
+     "        if record.steps_taken >= self.budget.max_steps:\n            record.state = RunState.ABORTED\n            res = StepResult(StepOutcome.BUDGET_EXHAUSTED, action,",
+     "        if False:  # BUG: never enforce budget\n            record.state = RunState.ABORTED\n            res = StepResult(StepOutcome.BUDGET_EXHAUSTED, action,",
+     "capcore/runtime.py"),
+    # The engine's independent loop ceiling: a hostile model must not be able to
+    # produce an unbounded run even if trusted counter state were corrupted.
+    ("engine_loop_ceiling_removed",
+     "        for _ in range(self.budget.max_steps):",
+     "        while True:  # BUG: unbounded loop, no independent ceiling",
      "capcore/runtime.py"),
     # --- M3 broker mutations (target capcore/broker.py) ---
     # Re-authorization at redemption: if the live monitor no longer allows the
     # action, the secret must not leave. Mutating this to always-allow is the
     # stale-decision / revocation-bypass defect.
     ("broker_skips_reauthorization_at_redemption",
-     "            if live.verdict != Verdict.ALLOW:",
+     "            if live.verdict is not Verdict.ALLOW:",
      "            if False:  # BUG: skip live re-authorization at redemption",
      "capcore/broker.py"),
     # Credential scope must cover the resource. Ignoring it lets a credential be
     # used outside its binding.
     ("broker_ignores_credential_scope",
-     "        if not scope_covers(cred.scope, record.proposal.resource):",
+     "        if not scope_covers(cred.scope, rec.action.resource):",
      "        if False:  # BUG: ignore credential scope",
+     "capcore/broker.py"),
+    # Catalog existence is NOT authorization. Bypassing ToolPolicy lets an
+    # untrusted model route an authorized action to ANY registered executor.
+    ("broker_ignores_tool_policy",
+     "        if not self._policy.allows(reg.registration_id, action):",
+     "        if False:  # BUG: any registered tool may serve any action",
+     "capcore/broker.py"),
+    # The tool must serve the proposed action class.
+    ("broker_ignores_tool_verb_match",
+     "        if reg.verb != action.verb:",
+     "        if False:  # BUG: any tool may serve any verb",
      "capcore/broker.py"),
     # Consumed/expired credentials must be refused. Ignoring availability defeats
     # single-use and TTL.
@@ -115,7 +133,7 @@ MUTATIONS = [
     # The single-use consumption itself: if the record is not claimed atomically,
     # an authorization can be replayed. Mutating the claim guard opens replay.
     ("broker_allows_replay_of_claimed_action",
-     "        if record.state is not AuthorizationState.PENDING:",
+     "        if rec.state is not AuthorizationState.PENDING:",
      "        if False:  # BUG: allow redeeming a non-pending authorization",
      "capcore/broker.py"),
 ]

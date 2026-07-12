@@ -32,7 +32,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from capcore import Capability, CapabilityStore, ReferenceMonitor, RunContext, Proposal, Verdict
 from capcore.broker import (
-    Secret, Credential, CredentialBroker, ToolKind, ToolRegistration,
+    Secret, Credential, TrustedExecutionBroker, ToolKind, ToolRegistration,
+    ExecutionProposal,
 )
 from capcore.httptool import HttpTool, real_requests_transport
 
@@ -58,21 +59,23 @@ def main():
     ctx = RunContext("acme", "agent-7", "run-m3")
 
     # --- broker holds the real secret AND executes the tool inside its boundary ---
-    broker = CredentialBroker(mon)
-    broker.issue(Credential("api-token", "cap-run", "read", "acme/api",
-                            Secret(token), single_use=True))
+    broker = TrustedExecutionBroker(mon)
+    broker.issue_credential(Credential("api-token", "cap-run", "read", "acme/api",
+                                       Secret(token), single_use=True))
     broker.register_tool(ToolRegistration(
-        registration_id="http-1", kind=ToolKind.CREDENTIALED,
+        registration_id="http-1", verb="read", kind=ToolKind.CREDENTIALED,
         adapter=HttpTool(ALLOWED_URL, real_requests_transport),
         version="1", credential_id="api-token",
     ))
+    broker.grant_tool("http-1", "acme/api")   # registration is NOT authorization
 
     # === 1. authorized action: engine mints, broker executes, secret never returned ===
     print("1) authorized action  ->  broker mints authorization  ->  broker executes")
     prop = Proposal("acme/api/data", "read")
     decision = mon.authorize(ctx, prop)
     print(f"   monitor verdict: {decision.verdict.value}")
-    action_id = broker.register_authorized_execution(ctx, prop, decision, "http-1")
+    action_id = broker.register_authorized_execution(
+        ctx, ExecutionProposal(action=prop, tool_registration_id="http-1"))
     result = broker.redeem_and_execute(action_id)
     print(f"   execution ok: {result.ok}")
     print(f"   sanitized result: {result.body if result.ok else result.code}")
@@ -92,7 +95,8 @@ def main():
     decision2 = mon.authorize(ctx, prop2)
     print(f"   monitor verdict: {decision2.verdict.value}")
     try:
-        broker.register_authorized_execution(ctx, prop2, decision2, "http-1")
+        broker.register_authorized_execution(
+            ctx, ExecutionProposal(action=prop2, tool_registration_id="http-1"))
         print("   registered: yes (unexpected)")
     except Exception:
         print("   registered: no (correctly refused at mint)")
