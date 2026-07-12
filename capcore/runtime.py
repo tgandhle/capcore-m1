@@ -44,9 +44,27 @@ from capcore.broker import (
 class RunState(Enum):
     CREATED = "created"
     RUNNING = "running"
-    COMPLETED = "completed"
-    ABORTED = "aborted"          # budget exhausted or explicit stop
-    FAILED = "failed"            # a tool raised
+    COMPLETED = "completed"      # the model said it was done
+    ABORTED = "aborted"          # budget exhausted or ceiling reached
+    FAILED = "failed"            # a tool raised, or the model provider died
+
+
+class StopReason(Enum):
+    """WHY a run ended. Distinct from RunState, which says only THAT it ended.
+
+    The engine used to have exactly one channel for "no proposal": the model
+    returning None. A clean finish and a dead provider produced byte-identical
+    terminal state, so a run that crashed on its first call to a broken Ollama
+    server reported COMPLETED. Success and failure were indistinguishable in
+    trusted state, which is a correctness defect and an audit defect: nothing
+    downstream could tell whether the work was actually done.
+    """
+    MODEL_FINISHED = "model_finished"            # the model chose to stop
+    BUDGET_EXHAUSTED = "budget_exhausted"        # ran out of authorized actions
+    CEILING_REACHED = "ceiling_reached"          # loop bound hit (see run())
+    MODEL_ERROR = "model_error"                  # the adapter raised
+    PROVIDER_UNAVAILABLE = "provider_unavailable"  # the model provider failed
+    TOOL_FAILED = "tool_failed"                  # a tool raised during execution
 
 
 class StepOutcome(Enum):
@@ -56,6 +74,8 @@ class StepOutcome(Enum):
     REVOKED_RACE = "revoked_race"  # authorized at propose, revoked before execute
     BUDGET_EXHAUSTED = "budget_exhausted"
     TOOL_ERROR = "tool_error"    # tool raised during execution
+    TOOL_NOT_FOUND = "tool_not_found"    # no such registration: NOTHING RAN
+    TOOL_NOT_AUTHORIZED = "tool_not_authorized"  # registered but not policy-granted
 
 
 @dataclass(frozen=True)
@@ -87,6 +107,8 @@ class RunRecord:
     state: RunState = RunState.CREATED
     steps_taken: int = 0
     history: list[StepResult] = field(default_factory=list)
+    # WHY the run ended. None while running. Set exactly once, at termination.
+    stop_reason: Optional[StopReason] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -197,6 +219,40 @@ class Budget:
 # Model client (proposes actions). Abstracted so the engine is model-agnostic.
 # --------------------------------------------------------------------------- #
 
+class ModelOutcome(Enum):
+    PROPOSAL = "proposal"        # the model proposed an action
+    FINISHED = "finished"        # the model chose to stop. Real completion.
+    ERROR = "error"              # the provider or adapter failed. NOT completion.
+
+
+@dataclass(frozen=True)
+class ModelResult:
+    """What a ModelClient returns.
+
+    A bare `Optional[Proposal]` was the defect: None meant BOTH "I am done" and
+    "my provider is down", and the engine could not tell them apart, so a crashed
+    run reported COMPLETED. The type now forces the adapter to say which.
+
+    Adapters that cannot distinguish the two (a raw HTTP client that swallows its
+    own exceptions, say) must not paper over it by returning FINISHED. Return
+    ERROR: an unknown outcome is a failure, not a success.
+    """
+    outcome: ModelOutcome
+    proposal: Optional["ExecutionProposal"] = None
+
+    @staticmethod
+    def propose(p: "ExecutionProposal") -> "ModelResult":
+        return ModelResult(ModelOutcome.PROPOSAL, p)
+
+    @staticmethod
+    def finished() -> "ModelResult":
+        return ModelResult(ModelOutcome.FINISHED)
+
+    @staticmethod
+    def error() -> "ModelResult":
+        return ModelResult(ModelOutcome.ERROR)
+
+
 class ModelClient(Protocol):
     """Produces the next ExecutionProposal, or None to stop.
 
@@ -211,24 +267,24 @@ class ModelClient(Protocol):
     untrusted provider), so it must not be able to reach trusted execution state.
     See RunRecord's docstring for what happened when it could.
     """
-    def next_proposal(self, view: ModelView) -> Optional[ExecutionProposal]: ...
+    def next_proposal(self, view: ModelView) -> ModelResult: ...
 
 
 class ScriptedModel:
     """Deterministic model that emits a fixed list of proposals in order, then
-    stops. Used by all tests and CI so the engine's security properties are
+    finishes. Used by all tests and CI so the engine's security properties are
     reproducible.
     """
     def __init__(self, proposals: list[ExecutionProposal]):
         self._proposals = list(proposals)
         self._i = 0
 
-    def next_proposal(self, view: ModelView) -> Optional[ExecutionProposal]:
+    def next_proposal(self, view: ModelView) -> ModelResult:
         if self._i >= len(self._proposals):
-            return None
+            return ModelResult.finished()
         p = self._proposals[self._i]
         self._i += 1
-        return p
+        return ModelResult.propose(p)
 
 
 # --------------------------------------------------------------------------- #
@@ -345,10 +401,21 @@ class ExecutionEngine:
         try:
             action_id = self.broker.register_authorized_execution(record.ctx, proposal)
         except AuthorizationError as e:
-            # Authorization was lost between propose and mint (revoke race), or
-            # the model named a tool it may not use.
-            res = StepResult(StepOutcome.REVOKED_RACE, action,
-                             audit_reason=f"broker refused authorization: {e}")
+            # The broker refused. WHY it refused matters for audit, and lumping
+            # every refusal under REVOKED_RACE was false reporting: a model naming
+            # a tool that does not exist is not a revocation race.
+            reason = str(e)
+            if "unknown tool registration" in reason:
+                outcome = StepOutcome.TOOL_NOT_FOUND
+            elif "not authorized" in reason and "tool" in reason:
+                outcome = StepOutcome.TOOL_NOT_AUTHORIZED
+            elif "verb does not match" in reason:
+                outcome = StepOutcome.TOOL_NOT_AUTHORIZED
+            else:
+                # authorization for the ACTION was lost between propose and mint
+                outcome = StepOutcome.REVOKED_RACE
+            res = StepResult(outcome, action,
+                             audit_reason=f"broker refused authorization: {reason}")
             record.history.append(res)
             return res
 
@@ -369,54 +436,83 @@ class ExecutionEngine:
             return res
 
         record.state = RunState.FAILED
+        record.stop_reason = StopReason.TOOL_FAILED
         res = StepResult(StepOutcome.TOOL_ERROR, action,
                          audit_reason=f"tool failed: {result.code}")
         record.history.append(res)
         return res
 
     def run(self, ctx: RunContext, model: ModelClient) -> RunRecord:
-        """Drive a full run: pull proposals from the model until it stops or the
-        budget is exhausted, stepping each through the trusted pipeline.
+        """Drive a full run. Every termination path sets a stop_reason.
 
         TERMINATION IS STRUCTURAL. The loop is bounded by `range(max_steps)`, a
-        local counter that is never derived from, and never written by, anything
-        the model can reach. The old loop guard read `record.steps_taken`, which
-        was the same field the model could write, so a model that drove it
-        negative made the loop unbounded. Now, even if trusted state were somehow
-        corrupted, this loop cannot iterate more than `max_steps` times.
+        local counter never derived from, and never written by, anything the model
+        can reach. The old loop guard read `record.steps_taken`, the same field an
+        untrusted model could write, so a model that drove it negative made the
+        loop unbounded. Even if trusted counter state were corrupted, this loop
+        cannot iterate more than max_steps times.
 
-        `record.steps_taken` is still enforced in step() and still authoritative
-        for the budget verdict. It is no longer the only thing standing between a
-        hostile model and an infinite run.
+        TERMINAL STATE IS HONEST. A run that ends because the model provider died
+        does not report COMPLETED. `stop_reason` says which of MODEL_FINISHED,
+        BUDGET_EXHAUSTED, CEILING_REACHED, MODEL_ERROR, PROVIDER_UNAVAILABLE, or
+        TOOL_FAILED ended it. Nothing downstream has to guess whether the work was
+        actually done.
         """
         record = RunRecord(ctx=ctx, state=RunState.RUNNING)
 
         for _ in range(self.budget.max_steps):
-            # The budget is still checked against trusted state; the loop ceiling
-            # above is an INDEPENDENT second bound, not a replacement for it.
+            # Budget is still checked against trusted state; the ceiling above is
+            # an INDEPENDENT second bound, not a replacement for it.
             if record.steps_taken >= self.budget.max_steps:
                 record.state = RunState.ABORTED
-                break
+                record.stop_reason = StopReason.BUDGET_EXHAUSTED
+                return record
 
             # The model sees a frozen, redacted copy. Never the record itself.
-            proposal = model.next_proposal(to_model_view(record, self.budget))
-            if proposal is None:
-                break
+            try:
+                result = model.next_proposal(to_model_view(record, self.budget))
+            except Exception:
+                # A ModelClient that raises is a failed provider, not a finished
+                # one. Fail closed: no more actions, and say so.
+                record.state = RunState.FAILED
+                record.stop_reason = StopReason.MODEL_ERROR
+                return record
 
-            result = self.step(record, proposal)
-            if result.outcome == StepOutcome.BUDGET_EXHAUSTED:
-                record.state = RunState.ABORTED
-                break
-            if result.outcome == StepOutcome.TOOL_ERROR:
-                # already marked FAILED; stop the run
-                break
-        else:
-            # The loop ran to its full ceiling without the model stopping: the
-            # model had more to say than its budget allowed. That is an abort,
-            # not a completion.
-            if record.state == RunState.RUNNING:
-                record.state = RunState.ABORTED
+            if not isinstance(result, ModelResult):
+                # An adapter that does not speak the typed protocol cannot be
+                # trusted to mean "finished" by returning None. Treat as failure.
+                record.state = RunState.FAILED
+                record.stop_reason = StopReason.MODEL_ERROR
+                return record
 
-        if record.state == RunState.RUNNING:
-            record.state = RunState.COMPLETED
+            if result.outcome is ModelOutcome.ERROR:
+                record.state = RunState.FAILED
+                record.stop_reason = StopReason.PROVIDER_UNAVAILABLE
+                return record
+
+            if result.outcome is ModelOutcome.FINISHED:
+                record.state = RunState.COMPLETED
+                record.stop_reason = StopReason.MODEL_FINISHED
+                return record
+
+            if result.proposal is None:
+                # PROPOSAL with nothing to propose is a malformed adapter.
+                record.state = RunState.FAILED
+                record.stop_reason = StopReason.MODEL_ERROR
+                return record
+
+            step_result = self.step(record, result.proposal)
+
+            if step_result.outcome == StepOutcome.BUDGET_EXHAUSTED:
+                record.state = RunState.ABORTED
+                record.stop_reason = StopReason.BUDGET_EXHAUSTED
+                return record
+            if step_result.outcome == StepOutcome.TOOL_ERROR:
+                # step() already marked FAILED and set TOOL_FAILED
+                return record
+
+        # The loop ran to its full ceiling without the model finishing: it had more
+        # to say than its budget allowed. That is an abort, not a completion.
+        record.state = RunState.ABORTED
+        record.stop_reason = StopReason.CEILING_REACHED
         return record

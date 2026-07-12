@@ -43,6 +43,7 @@ from capcore.broker import (
 )
 from capcore.httptool import HttpTool
 from capcore.runtime import (
+    ModelResult, ModelOutcome, StopReason,
     Budget, ExecutionEngine, RunRecord, RunState, ScriptedModel, StepOutcome,
 )
 
@@ -161,7 +162,7 @@ class MutatingModel:
         # a frozen ModelView and the write must be refused.
         self._probe(view, "steps_taken", -100)
         self._probe(view, "remaining_steps", 10 ** 9)
-        return self.proposal
+        return ModelResult.propose(self.proposal)
 
 
 def test_model_cannot_mutate_trusted_budget_counter():

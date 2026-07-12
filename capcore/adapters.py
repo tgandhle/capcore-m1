@@ -25,7 +25,7 @@ from typing import Optional
 
 from capcore import Proposal
 from capcore.broker import ExecutionProposal
-from capcore.runtime import ModelView
+from capcore.runtime import ModelResult, ModelView
 
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
@@ -97,6 +97,26 @@ def parse_proposal(text: str) -> Optional[ExecutionProposal]:
     )
 
 
+def _signals_done(text: str) -> bool:
+    """Did the model explicitly say it was finished, as opposed to emitting junk?
+
+    parse_proposal returns None for BOTH cases, which is fine for parsing but not
+    for terminal state: a model that said {"done": true} completed its work, while
+    a model that emitted prose completed nothing. The engine must not report those
+    identically.
+    """
+    if not text:
+        return False
+    match = re.search(r"\{.*?\}", text, re.DOTALL)
+    if not match:
+        return False
+    try:
+        obj = json.loads(match.group(0))
+    except (json.JSONDecodeError, ValueError):
+        return False
+    return isinstance(obj, dict) and obj.get("done") is True
+
+
 def render_history(view: ModelView, max_items: int = 6) -> str:
     """A compact textual history to give the model context on prior outcomes.
 
@@ -144,9 +164,21 @@ class OllamaModel:
         resp.raise_for_status()
         return resp.json().get("response", "")
 
-    def next_proposal(self, view: ModelView) -> Optional[Proposal]:
+    def next_proposal(self, view: ModelView) -> ModelResult:
+        """Return a TYPED result. A provider failure is not a completion.
+
+        This used to catch every exception and return None, and the engine read
+        None as "the model is done". So a run against a dead Ollama server
+        terminated as COMPLETED, with zero actions taken and no indication that
+        anything had gone wrong. Silent, total failure reported as success.
+
+        Now a transport failure is ModelResult.error(), which the engine maps to
+        RunState.FAILED / StopReason.PROVIDER_UNAVAILABLE. Still fail-closed (no
+        further actions, no crash), but HONEST about why.
+        """
         if self._asked >= self.max_proposals:
-            return None
+            # A self-imposed cap is a real completion: the adapter chose to stop.
+            return ModelResult.finished()
         self._asked += 1
         prompt = (
             f"History so far:\n{render_history(view)}\n\n"
@@ -155,7 +187,16 @@ class OllamaModel:
         try:
             text = self._call(prompt)
         except Exception:
-            # any network/parse failure => stop the run cleanly (fail closed to
-            # "no more actions" rather than crashing the engine)
-            return None
-        return parse_proposal(text)
+            # Network, HTTP, timeout, malformed-JSON-from-the-server: the provider
+            # failed. NOT a completion.
+            return ModelResult.error()
+
+        proposal = parse_proposal(text)
+        if proposal is None:
+            # The model either signalled {"done": true} or emitted something
+            # unusable. parse_proposal cannot distinguish those, so ask it again:
+            # a clean done is a FINISH, garbage is an ERROR.
+            if _signals_done(text):
+                return ModelResult.finished()
+            return ModelResult.error()
+        return ModelResult.propose(proposal)

@@ -29,6 +29,7 @@ from capcore.broker import (
     ToolKind, ToolPolicy, ToolRegistration, TrustedExecutionBroker,
 )
 from capcore.runtime import (
+    ModelResult, ModelOutcome, StopReason,
     Budget, ExecutionEngine, RunRecord, RunState, ScriptedModel, StepOutcome,
 )
 
@@ -235,7 +236,9 @@ def test_exact_registration_must_be_policy_authorized():
     ]))
 
     assert sensitive.ran == [], "an ungranted executor must never run"
-    assert record.history[0].outcome is StepOutcome.REVOKED_RACE
+    # TOOL_NOT_AUTHORIZED, not REVOKED_RACE: the action was fine, the EXECUTOR was
+    # not. Reporting this as a revocation race would be false audit state.
+    assert record.history[0].outcome is StepOutcome.TOOL_NOT_AUTHORIZED
 
 
 def test_registering_a_tool_does_not_authorize_it():

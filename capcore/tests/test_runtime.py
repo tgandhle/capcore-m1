@@ -16,6 +16,7 @@ from capcore.broker import (
     ExecutionProposal, ToolKind, ToolRegistration, TrustedExecutionBroker,
 )
 from capcore.runtime import (
+    ModelResult, ModelOutcome, StopReason,
     RunState, StepOutcome, StepResult, RunRecord, Budget,
     ScriptedModel, ExecutionEngine,
 )
@@ -287,7 +288,7 @@ def test_loop_ceiling_terminates_even_if_the_counter_is_corrupted():
                     "engine failed to terminate: run() is not bounded by its own "
                     "loop ceiling once steps_taken is corrupted"
                 )
-            return ep("acme/records/x", "read")
+            return ModelResult.propose(ep("acme/records/x", "read"))
 
     model = Endless()
     record = engine.run(ctx, model)   # must terminate
@@ -315,7 +316,7 @@ def test_run_terminates_against_a_model_that_never_stops():
             self.calls += 1
             if self.calls > 100:
                 raise AssertionError("engine failed to terminate")
-            return ep("acme/records/x", "read")
+            return ModelResult.propose(ep("acme/records/x", "read"))
 
     model = Endless()
     record = engine.run(ctx, model)
@@ -323,3 +324,146 @@ def test_run_terminates_against_a_model_that_never_stops():
     assert model.calls <= 3
     assert len(calls) <= 3
     assert record.state in (RunState.COMPLETED, RunState.ABORTED)
+
+
+# --------------------------------------------------------------------------- #
+# Terminal state must be HONEST. A run that failed does not report success.
+#
+# The engine used to have one channel for "no proposal": the model returning None.
+# A clean finish and a dead provider produced byte-identical terminal state, so a
+# run against a broken Ollama server reported COMPLETED with zero actions taken.
+# Silent total failure, reported as success.
+# --------------------------------------------------------------------------- #
+
+from capcore.runtime import ModelOutcome, ModelResult, StopReason
+
+
+def test_model_finishing_is_a_real_completion():
+    engine, store, ctx, _ = build(budget_steps=3)
+
+    class Finishes:
+        def next_proposal(self, view):
+            return ModelResult.finished()
+
+    record = engine.run(ctx, Finishes())
+
+    assert record.state is RunState.COMPLETED
+    assert record.stop_reason is StopReason.MODEL_FINISHED
+
+
+def test_provider_failure_is_not_a_completion():
+    engine, store, ctx, _ = build(budget_steps=3)
+
+    class ProviderDown:
+        def next_proposal(self, view):
+            return ModelResult.error()
+
+    record = engine.run(ctx, ProviderDown())
+
+    assert record.state is RunState.FAILED
+    assert record.stop_reason is StopReason.PROVIDER_UNAVAILABLE
+    assert record.state is not RunState.COMPLETED
+
+
+def test_model_adapter_that_raises_is_not_a_completion():
+    engine, store, ctx, _ = build(budget_steps=3)
+
+    class Raises:
+        def next_proposal(self, view):
+            raise RuntimeError("adapter blew up")
+
+    record = engine.run(ctx, Raises())
+
+    assert record.state is RunState.FAILED
+    assert record.stop_reason is StopReason.MODEL_ERROR
+
+
+def test_untyped_model_return_is_treated_as_failure():
+    """An adapter that returns a bare value cannot be trusted to mean 'finished'.
+
+    Fail closed: an unknown outcome is a failure, not a success. Otherwise a
+    partially-migrated adapter silently reports completion.
+    """
+    engine, store, ctx, _ = build(budget_steps=3)
+
+    class Untyped:
+        def next_proposal(self, view):
+            return None          # the OLD protocol
+
+    record = engine.run(ctx, Untyped())
+
+    assert record.state is RunState.FAILED
+    assert record.stop_reason is StopReason.MODEL_ERROR
+
+
+def test_budget_exhaustion_is_distinguishable_from_completion():
+    calls = []
+    reg = ToolRegistry()
+    reg.register("read", lambda a: calls.append(a.resource) or "ok")
+    engine, store, ctx, _ = build(budget_steps=2, tools=reg)
+
+    class Endless:
+        def next_proposal(self, view):
+            return ModelResult.propose(ep("acme/records/x", "read"))
+
+    record = engine.run(ctx, Endless())
+
+    assert record.state is RunState.ABORTED
+    assert record.stop_reason in (StopReason.BUDGET_EXHAUSTED,
+                                  StopReason.CEILING_REACHED)
+    assert record.state is not RunState.COMPLETED
+
+
+def test_tool_failure_is_distinguishable_from_completion():
+    reg = ToolRegistry()
+
+    def boom(action):
+        raise RuntimeError("tool exploded")
+
+    reg.register("read", boom)
+    engine, store, ctx, _ = build(budget_steps=3, tools=reg)
+
+    record = engine.run(ctx, ScriptedModel([ep("acme/records/x", "read")]))
+
+    assert record.state is RunState.FAILED
+    assert record.stop_reason is StopReason.TOOL_FAILED
+
+
+def test_every_terminated_run_has_a_stop_reason():
+    """No run may end without saying why. A None stop_reason on a terminated run
+    means some path forgot, and that path is exactly where a failure could be
+    silently reported as success."""
+    scenarios = []
+
+    class Finishes:
+        def next_proposal(self, view):
+            return ModelResult.finished()
+
+    class Errors:
+        def next_proposal(self, view):
+            return ModelResult.error()
+
+    class Raises:
+        def next_proposal(self, view):
+            raise RuntimeError("boom")
+
+    for model_cls in (Finishes, Errors, Raises):
+        engine, store, ctx, _ = build(budget_steps=2)
+        scenarios.append(engine.run(ctx, model_cls()))
+
+    reg = ToolRegistry()
+    reg.register("read", lambda a: "ok")
+    engine, store, ctx, _ = build(budget_steps=1, tools=reg)
+
+    class Endless:
+        def next_proposal(self, view):
+            return ModelResult.propose(ep("acme/records/x", "read"))
+
+    scenarios.append(engine.run(ctx, Endless()))
+
+    for record in scenarios:
+        assert record.state is not RunState.RUNNING
+        assert record.stop_reason is not None, (
+            f"a run terminated in {record.state} with no stop_reason: a failure "
+            f"could be indistinguishable from success"
+        )

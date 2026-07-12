@@ -136,6 +136,22 @@ MUTATIONS = [
      "            raise ValueError(f\"invalid tool-grant scope: {self.scope!r}\") from exc",
      "            pass  # BUG: swallow an invalid tool-grant scope",
      "capcore/broker.py"),
+    # A provider failure must not be reported as a completion. This is the
+    # difference between "the work is done" and "nothing happened and we lied".
+    ("provider_error_reported_as_completion",
+     "            if result.outcome is ModelOutcome.ERROR:\n                record.state = RunState.FAILED",
+     "            if result.outcome is ModelOutcome.ERROR:\n                record.state = RunState.COMPLETED  # BUG: failure looks like success",
+     "capcore/runtime.py"),
+    # An adapter that raises is a failed provider, not a finished one.
+    ("model_exception_swallowed_as_completion",
+     "                record.state = RunState.FAILED\n                record.stop_reason = StopReason.MODEL_ERROR\n                return record\n\n            if not isinstance(result, ModelResult):",
+     "                record.state = RunState.COMPLETED  # BUG: crash looks like success\n                record.stop_reason = StopReason.MODEL_ERROR\n                return record\n\n            if not isinstance(result, ModelResult):",
+     "capcore/runtime.py"),
+    # OllamaModel must not turn a transport failure into a clean stop.
+    ("ollama_error_becomes_finished",
+     "            return ModelResult.error()\n\n        proposal = parse_proposal(text)",
+     "            return ModelResult.finished()  # BUG: provider failure as completion\n\n        proposal = parse_proposal(text)",
+     "capcore/adapters.py"),
     # --- M3 destination policy (target capcore/httptool.py) ---
     # The URL is where a real credential is SENT. https-only is what keeps the
     # Authorization header off a cleartext wire.

@@ -100,7 +100,9 @@ def phase1_live():
         return
     for step in record.history:
         print(fmt(step))
-    print(f"  -- phase 1 end: state={record.state.value}, steps={record.steps_taken}")
+    reason = record.stop_reason.value if record.stop_reason else "?"
+    print(f"  -- phase 1 end: state={record.state.value}, why={reason}, "
+          f"steps={record.steps_taken}")
 
 
 def phase2_scripted():

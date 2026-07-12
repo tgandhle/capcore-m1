@@ -80,3 +80,61 @@ def test_hostile_traversal_resource_becomes_proposal_not_crash():
         action=Proposal(resource="acme/../secret", verb="read"),
         tool_registration_id="t1")
     # the monitor is what rejects this at authorize time (tested elsewhere)
+
+
+# --------------------------------------------------------------------------- #
+# OllamaModel must not convert a provider failure into a clean stop.
+# --------------------------------------------------------------------------- #
+
+from capcore.runtime import ModelOutcome
+from capcore.adapters import OllamaModel
+
+
+class _View:
+    run_id = "r1"
+    remaining_steps = 3
+    history = ()
+
+
+def test_ollama_transport_failure_is_an_error_not_a_completion():
+    class Broken(OllamaModel):
+        def _call(self, prompt):
+            raise RuntimeError("connection refused")
+
+    result = Broken().next_proposal(_View())
+
+    assert result.outcome is ModelOutcome.ERROR
+    assert result.outcome is not ModelOutcome.FINISHED
+
+
+def test_ollama_explicit_done_is_a_completion():
+    class Done(OllamaModel):
+        def _call(self, prompt):
+            return '{"done": true}'
+
+    result = Done().next_proposal(_View())
+
+    assert result.outcome is ModelOutcome.FINISHED
+
+
+def test_ollama_garbage_is_an_error_not_a_completion():
+    """A model emitting prose completed nothing. It must not look like a model
+    that said it was done."""
+    class Garbage(OllamaModel):
+        def _call(self, prompt):
+            return "I don't feel like answering in JSON today."
+
+    result = Garbage().next_proposal(_View())
+
+    assert result.outcome is ModelOutcome.ERROR
+
+
+def test_ollama_valid_proposal_is_a_proposal():
+    class Good(OllamaModel):
+        def _call(self, prompt):
+            return '{"verb": "read", "resource": "acme/records/x", "tool": "t1"}'
+
+    result = Good().next_proposal(_View())
+
+    assert result.outcome is ModelOutcome.PROPOSAL
+    assert result.proposal.tool_registration_id == "t1"
