@@ -467,3 +467,23 @@ def test_every_terminated_run_has_a_stop_reason():
             f"a run terminated in {record.state} with no stop_reason: a failure "
             f"could be indistinguishable from success"
         )
+
+
+def test_adapter_limit_is_not_a_completion():
+    """A ModelClient hitting its own cap aborts; it does not report COMPLETED.
+
+    Hitting an adapter ceiling means the adapter stopped asking, not that the
+    model finished the task. Reporting COMPLETED would be the same false-success
+    defect as swallowing a provider error.
+    """
+    engine, store, ctx, _ = build(budget_steps=10)
+
+    class Capped:
+        def next_proposal(self, view):
+            return ModelResult.limit_reached()
+
+    record = engine.run(ctx, Capped())
+
+    assert record.state is RunState.ABORTED
+    assert record.stop_reason is StopReason.ADAPTER_LIMIT_REACHED
+    assert record.state is not RunState.COMPLETED

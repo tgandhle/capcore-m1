@@ -138,3 +138,26 @@ def test_ollama_valid_proposal_is_a_proposal():
 
     assert result.outcome is ModelOutcome.PROPOSAL
     assert result.proposal.tool_registration_id == "t1"
+
+
+def test_ollama_max_proposals_is_a_limit_not_a_completion():
+    """Reaching max_proposals reports LIMIT_REACHED, not FINISHED: the model did
+    not say it was done, the adapter just stopped asking."""
+    from capcore.runtime import ModelOutcome
+    from capcore.adapters import OllamaModel
+
+    class Chatty(OllamaModel):
+        def _call(self, prompt):
+            return '{"verb": "read", "resource": "acme/records/x", "tool": "t1"}'
+
+    m = Chatty(max_proposals=1)
+
+    class _V:
+        run_id = "r"; remaining_steps = 5; history = ()
+
+    first = m.next_proposal(_V())
+    second = m.next_proposal(_V())      # now at the cap
+
+    assert first.outcome is ModelOutcome.PROPOSAL
+    assert second.outcome is ModelOutcome.LIMIT_REACHED
+    assert second.outcome is not ModelOutcome.FINISHED

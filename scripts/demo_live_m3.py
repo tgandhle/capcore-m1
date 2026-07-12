@@ -60,7 +60,7 @@ def main():
 
     # --- broker holds the real secret AND executes the tool inside its boundary ---
     broker = TrustedExecutionBroker(mon)
-    broker.issue_credential(Credential("api-token", "cap-run", "read", "acme/api",
+    broker.issue_credential(Credential("api-token", "read", "acme/api",
                                        Secret(token), single_use=True))
     broker.register_tool(ToolRegistration(
         registration_id="http-1", verb="read", kind=ToolKind.CREDENTIALED,

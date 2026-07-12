@@ -177,8 +177,10 @@ class OllamaModel:
         further actions, no crash), but HONEST about why.
         """
         if self._asked >= self.max_proposals:
-            # A self-imposed cap is a real completion: the adapter chose to stop.
-            return ModelResult.finished()
+            # Hitting our OWN proposal cap is NOT task completion: the model never
+            # said it was done, we just stopped asking. Report it distinctly so a
+            # truncated run is not indistinguishable from a finished one.
+            return ModelResult.limit_reached()
         self._asked += 1
         prompt = (
             f"History so far:\n{render_history(view)}\n\n"
