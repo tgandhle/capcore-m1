@@ -26,7 +26,7 @@ Three layers, each with its own trust boundary:
 | M1 capability core | **Implemented**, within documented scope |
 | M2 execution loop | **Implemented**, single-process trust model |
 | M3 trusted execution broker | **Implemented**, single-process trust model |
-| Approval workflow | **Classification only** |
+| Approval workflow | **Classification implemented**; pause/approve/resume designed, not implemented |
 | Cascade revocation | **Not implemented.** Deliberate deferral |
 | Adapter isolation | **Not implemented** |
 
@@ -217,9 +217,10 @@ taken. `ModelResult` now forces the adapter to say which.
 
 ## What's open
 
-- **Approval is classification, not a workflow.** The engine classifies an action
-  as requiring approval and does not execute it. It does not pause the run,
-  persist the pending action, accept an approval, reauthorize, or resume.
+- **Approval is classification, not yet a workflow.** Approval *classification* is
+  implemented: the engine classifies an action as requiring approval and does not
+  execute it. Persistent pause, authenticated approval, reauthorization, and
+  resume are *designed but not implemented*.
 - **Cascade revocation.** Revoking a parent does not revoke its descendants.
   Deliberate deferral, not an oversight.
 - **Adapter isolation.** See the TCB note above.
