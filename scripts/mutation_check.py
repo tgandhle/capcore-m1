@@ -136,6 +136,27 @@ MUTATIONS = [
      "            raise ValueError(f\"invalid tool-grant scope: {self.scope!r}\") from exc",
      "            pass  # BUG: swallow an invalid tool-grant scope",
      "capcore/broker.py"),
+    # A tool's untrusted return value must be normalized to an inert str before it
+    # enters trusted run state. Accepting it raw lets a mutable object reach the
+    # model through the shallowly-frozen ModelView.
+    # Credential issue-time must be stamped from the trusted clock, not left at
+    # the -1 sentinel or a caller value. Stamping from a fixed 0 would make every
+    # credential appear issued at epoch, breaking TTL.
+    # The tool's catalog-owned generation is the authenticity check at redemption.
+    # Comparing the caller-supplied version string instead lets a same-version
+    # swap inherit the authorization.
+    ("redemption_ignores_tool_generation",
+     "            if reg is None or gen != rec.tool_generation:",
+     "            if reg is None:  # BUG: same-version swap inherits authorization",
+     "capcore/broker.py"),
+    ("credential_issue_time_not_stamped",
+     "        object.__setattr__(cred, \"_issued_at\", self._clock.now())",
+     "        object.__setattr__(cred, \"_issued_at\", 0.0)  # BUG: ignore the clock",
+     "capcore/broker.py"),
+    ("broker_stores_unnormalized_tool_result",
+     "    if not isinstance(out, str):\n        return False, None",
+     "    if False:\n        return False, None  # BUG: store raw adapter output",
+     "capcore/broker.py"),
     # A provider failure must not be reported as a completion. This is the
     # difference between "the work is done" and "nothing happened and we lied".
     ("provider_error_reported_as_completion",
@@ -148,6 +169,11 @@ MUTATIONS = [
      "                record.state = RunState.COMPLETED  # BUG: crash looks like success\n                record.stop_reason = StopReason.MODEL_ERROR\n                return record\n\n            if not isinstance(result, ModelResult):",
      "capcore/runtime.py"),
     # OllamaModel must not turn a transport failure into a clean stop.
+    # An adapter hitting its own cap must not report task completion.
+    ("adapter_limit_becomes_completion",
+     "            if result.outcome is ModelOutcome.LIMIT_REACHED:\n                # The adapter stopped asking; the model did not say it was done.\n                # That is an abort, not a completion: the task may be unfinished.\n                record.state = RunState.ABORTED",
+     "            if result.outcome is ModelOutcome.LIMIT_REACHED:\n                record.state = RunState.COMPLETED  # BUG: truncated run looks finished",
+     "capcore/runtime.py"),
     ("ollama_error_becomes_finished",
      "            return ModelResult.error()\n\n        proposal = parse_proposal(text)",
      "            return ModelResult.finished()  # BUG: provider failure as completion\n\n        proposal = parse_proposal(text)",

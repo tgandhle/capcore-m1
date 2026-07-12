@@ -65,6 +65,10 @@ class StopReason(Enum):
     MODEL_ERROR = "model_error"                  # the adapter raised
     PROVIDER_UNAVAILABLE = "provider_unavailable"  # the model provider failed
     TOOL_FAILED = "tool_failed"                  # a tool raised during execution
+    ADAPTER_LIMIT_REACHED = "adapter_limit_reached"  # a ModelClient hit its own
+    #                        cap (e.g. OllamaModel.max_proposals). NOT a task
+    #                        completion: the adapter stopped asking, the model did
+    #                        not say it was done.
 
 
 class StepOutcome(Enum):
@@ -223,6 +227,7 @@ class ModelOutcome(Enum):
     PROPOSAL = "proposal"        # the model proposed an action
     FINISHED = "finished"        # the model chose to stop. Real completion.
     ERROR = "error"              # the provider or adapter failed. NOT completion.
+    LIMIT_REACHED = "limit_reached"  # the ADAPTER hit its own cap. Not completion.
 
 
 @dataclass(frozen=True)
@@ -251,6 +256,10 @@ class ModelResult:
     @staticmethod
     def error() -> "ModelResult":
         return ModelResult(ModelOutcome.ERROR)
+
+    @staticmethod
+    def limit_reached() -> "ModelResult":
+        return ModelResult(ModelOutcome.LIMIT_REACHED)
 
 
 class ModelClient(Protocol):
@@ -493,6 +502,13 @@ class ExecutionEngine:
             if result.outcome is ModelOutcome.FINISHED:
                 record.state = RunState.COMPLETED
                 record.stop_reason = StopReason.MODEL_FINISHED
+                return record
+
+            if result.outcome is ModelOutcome.LIMIT_REACHED:
+                # The adapter stopped asking; the model did not say it was done.
+                # That is an abort, not a completion: the task may be unfinished.
+                record.state = RunState.ABORTED
+                record.stop_reason = StopReason.ADAPTER_LIMIT_REACHED
                 return record
 
             if result.proposal is None:

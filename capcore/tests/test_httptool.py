@@ -28,7 +28,7 @@ def build():
 
 def wired(mon, transport, url="https://api.example.com/data"):
     broker = TrustedExecutionBroker(mon)
-    broker.issue_credential(Credential("cred-1", "cap-run", "read", "acme/records",
+    broker.issue_credential(Credential("cred-1", "read", "acme/records",
                                        Secret(MOCK_SECRET)))
     broker.register_tool(ToolRegistration(
         registration_id="http-1", verb="read", kind=ToolKind.CREDENTIALED,

@@ -37,6 +37,7 @@ from capcore import (
     RunContext, Verdict,
 )
 from capcore.broker import (
+    FakeClock,
     AuthorizationError, AuthorizationState, Credential, TrustedExecutionBroker,
     CredentialError, ExecutionProposal, PendingAuthorization,
     SanitizedToolResult, Secret, ToolKind, ToolPolicy, ToolRegistration,
@@ -297,7 +298,7 @@ def test_engine_rejects_a_second_store():
 def test_credential_scope_is_validated_at_issuance(bad_scope):
     """An invalid resource scope must be rejected when the credential is made."""
     with pytest.raises((CredentialError, ValueError)):
-        Credential("c-bad", "cap-1", "read", bad_scope, Secret("X"))
+        Credential("c-bad", "read", bad_scope, Secret("X"))
 
 
 # --------------------------------------------------------------------------- #
@@ -409,7 +410,7 @@ def _broker_with_http(monitor, transport, url="https://example.com/api",
                       scope="acme/api"):
     """A broker wired with one credential and one credentialed HttpTool."""
     broker = TrustedExecutionBroker(monitor)
-    broker.issue_credential(Credential("cred-1", "cap-1", verb, scope,
+    broker.issue_credential(Credential("cred-1", verb, scope,
                                        Secret(secret), single_use=single_use))
     broker.register_tool(ToolRegistration(
         registration_id="http-1", verb=verb, kind=ToolKind.CREDENTIALED,
@@ -553,7 +554,7 @@ def test_swapped_tool_version_is_refused():
 
     # Swap the tool under the same registration id, new version + new transport.
     calls_new = MockCalls()
-    broker.catalog.replace_for_test(ToolRegistration(
+    broker.catalog._replace_unsafe(ToolRegistration(
         registration_id="http-1", verb="read", kind=ToolKind.CREDENTIALED,
         adapter=HttpTool("https://example.com/api", calls_new.transport),
         version="2", credential_id="cred-1",
@@ -575,8 +576,9 @@ def test_expired_action_is_denied():
     store = build_store()
     monitor = ReferenceMonitor(store)
     calls = MockCalls()
-    broker = TrustedExecutionBroker(monitor, action_ttl_seconds=10.0)
-    broker.issue_credential(Credential("cred-1", "cap-1", "read", "acme/api",
+    clock = FakeClock(1000.0)
+    broker = TrustedExecutionBroker(monitor, action_ttl_seconds=10.0, clock=clock)
+    broker.issue_credential(Credential("cred-1", "read", "acme/api",
                                        Secret("LEAKME"), single_use=True))
     broker.register_tool(ToolRegistration(
         registration_id="http-1", verb="read", kind=ToolKind.CREDENTIALED,
@@ -586,16 +588,11 @@ def test_expired_action_is_denied():
     broker.grant_tool("http-1", "acme")
     ctx = build_ctx()
     proposal = Proposal("acme/api/x", "read")
-    # Anchor to a single clock origin. The action TTL is self-consistent, but
-    # mixing an absolute `now` with time.monotonic()-based credential state is
-    # how a machine-dependent flake gets in.
-    t0 = time.monotonic()
     action_id = broker.register_authorized_execution(
-        ctx, ExecutionProposal(action=proposal, tool_registration_id="http-1"),
-        now=t0,
-    )
+        ctx, ExecutionProposal(action=proposal, tool_registration_id="http-1"))
 
-    result = broker.redeem_and_execute(action_id, now=t0 + 11.0)
+    clock.advance(11.0)       # past the 10s action TTL
+    result = broker.redeem_and_execute(action_id)
 
     assert result.ok is False
     assert result.code == "authorization_refused"
