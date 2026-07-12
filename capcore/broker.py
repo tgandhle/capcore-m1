@@ -79,6 +79,7 @@ restricted IPC.
 from __future__ import annotations
 
 import hashlib
+import threading
 import secrets
 import time
 from dataclasses import dataclass, field, replace
@@ -297,6 +298,10 @@ class CredentialVault:
     def __init__(self, clock: Clock):
         self._creds: dict[str, Credential] = {}
         self._clock = clock
+        # Serializes availability-check + consume for single-use credentials, so
+        # two concurrent redemptions cannot both see an unconsumed credential and
+        # both deliver the secret. Same reasoning as the pending-store lock.
+        self._lock = threading.Lock()
 
     def issue(self, cred: Credential) -> str:
         if cred.id in self._creds:
@@ -309,6 +314,28 @@ class CredentialVault:
 
     def resolve(self, credential_id: str) -> Optional[Credential]:
         return self._creds.get(credential_id)
+
+    def claim_credential(self, credential_id: str, now: float) -> tuple[bool, str]:
+        """Atomically check availability and consume a single-use credential.
+
+        Returns (ok, reason). On ok=True the credential is available and, if
+        single-use, has been marked consumed IN THE SAME critical section as the
+        availability check, so two concurrent redemptions cannot both pass. On
+        ok=False the reason is one of: "no such credential", "expired",
+        "already consumed". A non-single-use credential is not mutated.
+
+        This does NOT reveal the secret; the caller resolves and uses it. It only
+        owns the consume decision, which is the part that must be atomic.
+        """
+        with self._lock:
+            cred = self._creds.get(credential_id)
+            if cred is None:
+                return False, "no such credential"
+            if not cred.is_available(now):
+                return False, "expired" if cred.is_expired(now) else "already consumed"
+            if cred.single_use:
+                cred._consumed = True
+            return True, "ok"
 
 
 # --------------------------------------------------------------------------- #
@@ -522,6 +549,15 @@ class PendingAuthorizationStore:
 
     def __init__(self):
         self._records: dict[str, PendingAuthorization] = {}
+        # Serializes the PENDING -> EXECUTING transition. Without it, the
+        # read-check-write in claim() is a compound operation that the language
+        # does not guarantee to be atomic: CPython can switch threads between
+        # bytecode ops, so two redemptions of one action_id could both observe
+        # PENDING and both proceed. The GIL happens to mask this on stock CPython
+        # today, but that is an interpreter side effect, not a control, and it
+        # disappears under free-threaded builds. The lock makes atomicity a
+        # property of the code, not of the runtime.
+        self._lock = threading.Lock()
 
     def put(self, record: PendingAuthorization) -> None:
         self._records[record.action_id] = record
@@ -534,34 +570,37 @@ class PendingAuthorizationStore:
         return rec.state if rec else None
 
     def settle(self, action_id: str, state: AuthorizationState) -> None:
-        rec = self._records.get(action_id)
-        if rec is not None:
-            self._records[action_id] = replace(rec, state=state)
+        with self._lock:
+            rec = self._records.get(action_id)
+            if rec is not None:
+                self._records[action_id] = replace(rec, state=state)
 
     def claim(self, action_id: str, now: float) -> PendingAuthorization:
         """Atomically move PENDING -> EXECUTING, or refuse.
 
-        The transition happens BEFORE the credential is resolved and before any
-        external side effect. If execution later crashes, the record stays
-        non-PENDING and cannot be redeemed again. That deliberately favours
-        preventing a duplicate side effect over automatic retry: an ambiguous
-        remote failure must NOT silently return the authorization to PENDING. A
-        retry needs a fresh authorization.
+        The whole read-check-write runs under the store lock, so exactly one
+        caller can move a given action_id out of PENDING. The transition happens
+        BEFORE the credential is resolved and before any external side effect. If
+        execution later crashes, the record stays non-PENDING and cannot be
+        redeemed again. That deliberately favours preventing a duplicate side
+        effect over automatic retry: an ambiguous remote failure must NOT silently
+        return the authorization to PENDING. A retry needs a fresh authorization.
         """
-        rec = self._records.get(action_id)
-        if rec is None:
-            # Forged or unknown id: no record, therefore no authorization,
-            # whatever object the caller may have constructed.
-            raise AuthorizationError("unknown authorization")
-        if rec.state is not AuthorizationState.PENDING:
-            raise AuthorizationError("authorization is not redeemable")
-        if now >= rec.expires_at:
-            self._records[action_id] = replace(rec, state=AuthorizationState.FAILED)
-            raise AuthorizationError("authorization expired")
+        with self._lock:
+            rec = self._records.get(action_id)
+            if rec is None:
+                # Forged or unknown id: no record, therefore no authorization,
+                # whatever object the caller may have constructed.
+                raise AuthorizationError("unknown authorization")
+            if rec.state is not AuthorizationState.PENDING:
+                raise AuthorizationError("authorization is not redeemable")
+            if now >= rec.expires_at:
+                self._records[action_id] = replace(rec, state=AuthorizationState.FAILED)
+                raise AuthorizationError("authorization expired")
 
-        claimed = replace(rec, state=AuthorizationState.EXECUTING)
-        self._records[action_id] = claimed
-        return claimed
+            claimed = replace(rec, state=AuthorizationState.EXECUTING)
+            self._records[action_id] = claimed
+            return claimed
 
 
 # --------------------------------------------------------------------------- #
@@ -883,14 +922,15 @@ class TrustedExecutionBroker:
                          "credential scope does not cover resource")
             return SanitizedToolResult.failed("authorization_refused")
 
-        if not cred.is_available(now):
-            why = "expired" if cred.is_expired(now) else "already consumed"
+        # Availability check AND consume, atomically. Two concurrent redemptions
+        # of a single-use credential cannot both pass here: the vault lock
+        # serializes the check-and-consume, so exactly one wins and the other
+        # sees "already consumed".
+        ok, why = self._vault.claim_credential(cred.id, now)
+        if not ok:
             self._pending.settle(action_id, AuthorizationState.FAILED)
             self._record(action_id, cred.id, rec.action, False, f"credential {why}")
             return SanitizedToolResult.failed("authorization_refused")
-
-        if cred.single_use:
-            cred._consumed = True
 
         # THE CREDENTIAL BOUNDARY.
         # The secret is revealed only inside this try, only to the trusted

@@ -243,19 +243,29 @@ def _replace_tool(broker, reg):
 # --------------------------------------------------------------------------- #
 
 def test_single_use_credential_delivered_at_most_once_under_concurrency():
+    """A single-use credential is delivered at most once under concurrent redeem.
+
+    A plain concurrent test passes on stock CPython whether or not the lock is
+    present, because the GIL serializes the short critical section. To make this a
+    REAL regression guard, the adapter below sleeps briefly, widening the window
+    so that if the check-and-consume were not atomic, a second thread would pass
+    the availability check before the first marked the credential consumed. With
+    the vault lock, exactly one delivery happens regardless.
+    """
     store, mon, ctx = build()
     b = TrustedExecutionBroker(mon)
     deliveries = []
 
-    class Rec:
+    class SlowRec:
         def execute_with_credential(self, a, s):
-            deliveries.append(s.reveal())  # unlocked: a race would show as >1
+            deliveries.append(s.reveal())
+            time.sleep(0.005)              # widen the window
             return "ok"
 
     b.issue_credential(Credential("cred-1", "read", "acme/api",
                                   Secret("SEK"), single_use=True))
     b.register_tool(ToolRegistration("t", "read", ToolKind.CREDENTIALED,
-                                     Rec(), "1", "cred-1"))
+                                     SlowRec(), "1", "cred-1"))
     b.grant_tool("t", "acme/api")
 
     aids = [b.register_authorized_execution(ctx, ep(f"acme/api/x{i}"))
