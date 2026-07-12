@@ -24,7 +24,8 @@ import re
 from typing import Optional
 
 from capcore import Proposal
-from capcore.runtime import RunRecord
+from capcore.broker import ExecutionProposal
+from capcore.runtime import ModelResult, ModelView
 
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
@@ -35,12 +36,13 @@ DEFAULT_MODEL = "llama3.2"
 # comes back as untrusted regardless.
 SYSTEM_PROMPT = """You are an agent proposing ONE action at a time inside a \
 capability-enforced runtime. Respond with a single JSON object and nothing else:
-{"verb": "<read|send>", "resource": "acme/records/customers/<id>"}
+{"verb": "<read|send>", "resource": "acme/records/customers/<id>", "tool": "<tool-id>"}
 
 You may only READ or SEND on resources under acme/records/customers.
 Resources are slash-separated paths with NO leading slash. Use real ids like
-c-1001, c-1002. Example of a VALID action:
-{"verb": "read", "resource": "acme/records/customers/c-1001"}
+c-1001, c-1002. The "tool" field names the concrete executor, e.g. "read-records"
+or "send-records". Example of a VALID action:
+{"verb": "read", "resource": "acme/records/customers/c-1001", "tool": "read-records"}
 
 Do not use a leading slash. Do not invent other top-level paths. Do not use
 placeholders like <id> literally, pick a concrete id. Do not explain, do not
@@ -48,9 +50,14 @@ use markdown, output only the JSON object. If done, output exactly:
 {"done": true}"""
 
 
-def parse_proposal(text: str) -> Optional[Proposal]:
-    """Extract a Proposal from raw model text. Returns None if the model
-    signals done or the text has no usable JSON object.
+def parse_proposal(text: str) -> Optional[ExecutionProposal]:
+    """Extract an ExecutionProposal from raw model text. None if the model signals
+    done or the text has no usable JSON object.
+
+    The model names BOTH the action (verb + resource) and the executor ("tool").
+    All three are UNTRUSTED. Naming a tool does not authorize it: the broker's
+    deny-by-default ToolPolicy decides whether this registration may serve this
+    action, and an unauthorized executor is refused at mint.
 
     This is deliberately forgiving on FORMAT (small models wrap things in prose
     or markdown) but strict on CONTENT: it only accepts a non-empty string verb
@@ -77,20 +84,50 @@ def parse_proposal(text: str) -> Optional[Proposal]:
         return None
     verb = obj.get("verb")
     resource = obj.get("resource")
+    tool = obj.get("tool")
     if not isinstance(verb, str) or not verb:
         return None
     if not isinstance(resource, str) or not resource:
         return None
-    return Proposal(resource=resource, verb=verb)
+    if not isinstance(tool, str) or not tool:
+        return None
+    return ExecutionProposal(
+        action=Proposal(resource=resource, verb=verb),
+        tool_registration_id=tool,
+    )
 
 
-def render_history(record: RunRecord, max_items: int = 6) -> str:
-    """A compact textual history to give the model context on prior outcomes."""
+def _signals_done(text: str) -> bool:
+    """Did the model explicitly say it was finished, as opposed to emitting junk?
+
+    parse_proposal returns None for BOTH cases, which is fine for parsing but not
+    for terminal state: a model that said {"done": true} completed its work, while
+    a model that emitted prose completed nothing. The engine must not report those
+    identically.
+    """
+    if not text:
+        return False
+    match = re.search(r"\{.*?\}", text, re.DOTALL)
+    if not match:
+        return False
+    try:
+        obj = json.loads(match.group(0))
+    except (json.JSONDecodeError, ValueError):
+        return False
+    return isinstance(obj, dict) and obj.get("done") is True
+
+
+def render_history(view: ModelView, max_items: int = 6) -> str:
+    """A compact textual history to give the model context on prior outcomes.
+
+    Takes a ModelView, not a RunRecord. The view is already redacted: it carries
+    no audit_reason, so there is no way for this function to accidentally render
+    trusted diagnostic detail into a prompt. That redaction happens once, at the
+    boundary, rather than being re-litigated by every adapter.
+    """
     lines = []
-    for s in record.history[-max_items:]:
-        r = s.proposal.resource if hasattr(s.proposal, "resource") else "?"
-        v = s.proposal.verb if hasattr(s.proposal, "verb") else "?"
-        lines.append(f"- {v} {r} -> {s.outcome.value}")
+    for s in view.history[-max_items:]:
+        lines.append(f"- {s.verb} {s.resource} -> {s.outcome.value}")
     return "\n".join(lines) if lines else "(no actions yet)"
 
 
@@ -127,18 +164,39 @@ class OllamaModel:
         resp.raise_for_status()
         return resp.json().get("response", "")
 
-    def next_proposal(self, record: RunRecord) -> Optional[Proposal]:
+    def next_proposal(self, view: ModelView) -> ModelResult:
+        """Return a TYPED result. A provider failure is not a completion.
+
+        This used to catch every exception and return None, and the engine read
+        None as "the model is done". So a run against a dead Ollama server
+        terminated as COMPLETED, with zero actions taken and no indication that
+        anything had gone wrong. Silent, total failure reported as success.
+
+        Now a transport failure is ModelResult.error(), which the engine maps to
+        RunState.FAILED / StopReason.PROVIDER_UNAVAILABLE. Still fail-closed (no
+        further actions, no crash), but HONEST about why.
+        """
         if self._asked >= self.max_proposals:
-            return None
+            # A self-imposed cap is a real completion: the adapter chose to stop.
+            return ModelResult.finished()
         self._asked += 1
         prompt = (
-            f"History so far:\n{render_history(record)}\n\n"
+            f"History so far:\n{render_history(view)}\n\n"
             f"Propose your next action as JSON, or {{\"done\": true}} to stop."
         )
         try:
             text = self._call(prompt)
         except Exception:
-            # any network/parse failure => stop the run cleanly (fail closed to
-            # "no more actions" rather than crashing the engine)
-            return None
-        return parse_proposal(text)
+            # Network, HTTP, timeout, malformed-JSON-from-the-server: the provider
+            # failed. NOT a completion.
+            return ModelResult.error()
+
+        proposal = parse_proposal(text)
+        if proposal is None:
+            # The model either signalled {"done": true} or emitted something
+            # unusable. parse_proposal cannot distinguish those, so ask it again:
+            # a clean done is a FINISH, garbage is an ERROR.
+            if _signals_done(text):
+                return ModelResult.finished()
+            return ModelResult.error()
+        return ModelResult.propose(proposal)

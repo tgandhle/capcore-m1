@@ -31,7 +31,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from capcore import Capability, CapabilityStore, ReferenceMonitor, RunContext, Proposal, Verdict
-from capcore.broker import Secret, Credential, CredentialBroker
+from capcore.broker import (
+    Secret, Credential, TrustedExecutionBroker, ToolKind, ToolRegistration,
+    ExecutionProposal,
+)
 from capcore.httptool import HttpTool, real_requests_transport
 
 
@@ -55,26 +58,27 @@ def main():
     mon = ReferenceMonitor(store)
     ctx = RunContext("acme", "agent-7", "run-m3")
 
-    # --- broker holds the real secret, bound to the capability+action+scope ---
-    broker = CredentialBroker()
-    broker.issue(Credential("api-token", "cap-run", "read", "acme/api",
-                            Secret(token), single_use=True))
+    # --- broker holds the real secret AND executes the tool inside its boundary ---
+    broker = TrustedExecutionBroker(mon)
+    broker.issue_credential(Credential("api-token", "cap-run", "read", "acme/api",
+                                       Secret(token), single_use=True))
+    broker.register_tool(ToolRegistration(
+        registration_id="http-1", verb="read", kind=ToolKind.CREDENTIALED,
+        adapter=HttpTool(ALLOWED_URL, real_requests_transport),
+        version="1", credential_id="api-token",
+    ))
+    broker.grant_tool("http-1", "acme/api")   # registration is NOT authorization
 
-    # --- the tool: fixed allowed URL, real transport ---
-    tool = HttpTool(ALLOWED_URL, real_requests_transport)
-
-    # === 1. authorized action: secret released, real call made ===
-    print("1) authorized action  ->  broker releases secret  ->  real HTTPS call")
+    # === 1. authorized action: engine mints, broker executes, secret never returned ===
+    print("1) authorized action  ->  broker mints authorization  ->  broker executes")
     prop = Proposal("acme/api/data", "read")
     decision = mon.authorize(ctx, prop)
     print(f"   monitor verdict: {decision.verdict.value}")
-    secret = broker.release("api-token", "cap-run", prop, decision)
-    print(f"   secret released to tool: {'yes' if secret else 'no'}")
-    try:
-        result = tool(prop, secret)
-        print(f"   tool result: {result}")
-    except Exception as e:
-        print(f"   (network error: {e})")
+    action_id = broker.register_authorized_execution(
+        ctx, ExecutionProposal(action=prop, tool_registration_id="http-1"))
+    result = broker.redeem_and_execute(action_id)
+    print(f"   execution ok: {result.ok}")
+    print(f"   sanitized result: {result.body if result.ok else result.code}")
 
     # prove the secret is absent from everything the model or logs can see
     model_view = decision.for_model()
@@ -90,13 +94,17 @@ def main():
     prop2 = Proposal("acme/api/data", "write")  # write not granted
     decision2 = mon.authorize(ctx, prop2)
     print(f"   monitor verdict: {decision2.verdict.value}")
-    secret2 = broker.release("api-token", "cap-run", prop2, decision2)
-    print(f"   secret released: {'yes' if secret2 else 'no (correctly refused)'}")
+    try:
+        broker.register_authorized_execution(
+            ctx, ExecutionProposal(action=prop2, tool_registration_id="http-1"))
+        print("   registered: yes (unexpected)")
+    except Exception:
+        print("   registered: no (correctly refused at mint)")
 
     # === 3. single-use exhausted: even an authorized repeat gets nothing ===
-    print("\n3) authorized repeat  ->  single-use credential already consumed")
-    secret3 = broker.release("api-token", "cap-run", prop, decision)
-    print(f"   secret released: {'yes' if secret3 else 'no (consumed)'}")
+    print("\n3) authorized repeat  ->  authorization already redeemed")
+    repeat = broker.redeem_and_execute(action_id)
+    print(f"   execution ok: {repeat.ok}  (should be False: single-use redeemed)")
 
     print("\nThe broker released the real secret exactly once, only for the")
     print("authorized in-scope action, sent it only to the allowed URL, and it")

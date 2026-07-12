@@ -84,26 +84,97 @@ MUTATIONS = [
      "            if cap.run is not None and cap.run != ctx.run:\n                continue",
      "            if False:  # BUG: ignore run binding\n                continue"),
     # --- M2 runtime mutations (target capcore/runtime.py) ---
-    ("revoke_race_reexecute_skipped",
-     "        second = self._authorize(record.ctx, proposal)\n        if second.verdict != Verdict.ALLOW:",
-     "        second = first  # BUG: skip execute-time re-authorization (revoke race)\n        if second.verdict != Verdict.ALLOW:",
-     "capcore/runtime.py"),
+    # The engine's execute-time re-authorization MOVED into the broker in the
+    # M2<->M3 integration: the re-check now happens at redemption, immediately
+    # before the credential is touched. The revoke-race mutation therefore targets
+    # the broker's live re-authorization (see broker_skips_reauthorization_at_
+    # redemption below). What remains engine-side is the BUDGET.
     ("budget_not_enforced",
-     "        if record.steps_taken >= self.budget.max_steps:\n            record.state = RunState.ABORTED\n            res = StepResult(StepOutcome.BUDGET_EXHAUSTED, proposal,",
-     "        if False:  # BUG: never enforce budget\n            record.state = RunState.ABORTED\n            res = StepResult(StepOutcome.BUDGET_EXHAUSTED, proposal,",
+     "        if record.steps_taken >= self.budget.max_steps:\n            record.state = RunState.ABORTED\n            res = StepResult(StepOutcome.BUDGET_EXHAUSTED, action,",
+     "        if False:  # BUG: never enforce budget\n            record.state = RunState.ABORTED\n            res = StepResult(StepOutcome.BUDGET_EXHAUSTED, action,",
+     "capcore/runtime.py"),
+    # The engine's independent loop ceiling: a hostile model must not be able to
+    # produce an unbounded run even if trusted counter state were corrupted.
+    ("engine_loop_ceiling_removed",
+     "        for _ in range(self.budget.max_steps):",
+     "        while True:  # BUG: unbounded loop, no independent ceiling",
      "capcore/runtime.py"),
     # --- M3 broker mutations (target capcore/broker.py) ---
-    ("broker_releases_on_denied_action",
-     "        if decision.verdict != Verdict.ALLOW:",
-     "        if False:  # BUG: release secret even when not authorized",
+    # Re-authorization at redemption: if the live monitor no longer allows the
+    # action, the secret must not leave. Mutating this to always-allow is the
+    # stale-decision / revocation-bypass defect.
+    ("broker_skips_reauthorization_at_redemption",
+     "            if live.verdict is not Verdict.ALLOW:",
+     "            if False:  # BUG: skip live re-authorization at redemption",
      "capcore/broker.py"),
+    # Credential scope must cover the resource. Ignoring it lets a credential be
+    # used outside its binding.
     ("broker_ignores_credential_scope",
-     "        if not scope_covers(cred.scope, proposal.resource):",
+     "        if not scope_covers(cred.scope, rec.action.resource):",
      "        if False:  # BUG: ignore credential scope",
      "capcore/broker.py"),
+    # Catalog existence is NOT authorization. Bypassing ToolPolicy lets an
+    # untrusted model route an authorized action to ANY registered executor.
+    ("broker_ignores_tool_policy",
+     "        if not self._policy.allows(reg.registration_id, action):",
+     "        if False:  # BUG: any registered tool may serve any action",
+     "capcore/broker.py"),
+    # The tool must serve the proposed action class.
+    ("broker_ignores_tool_verb_match",
+     "        if reg.verb != action.verb:",
+     "        if False:  # BUG: any tool may serve any verb",
+     "capcore/broker.py"),
+    # A malformed credential scope must fail closed AT ISSUANCE, not blow up
+    # mid-action with a secret already in play.
+    ("credential_scope_not_validated_at_issue",
+     "            raise CredentialError(f\"invalid credential scope: {self.scope!r}\") from exc",
+     "            pass  # BUG: swallow an invalid credential scope (fail open)",
+     "capcore/broker.py"),
+    # A malformed TOOL GRANT scope must also fail closed at construction: a grant
+    # that vanished at check time would be an allow-by-omission.
+    ("tool_grant_scope_not_validated",
+     "            raise ValueError(f\"invalid tool-grant scope: {self.scope!r}\") from exc",
+     "            pass  # BUG: swallow an invalid tool-grant scope",
+     "capcore/broker.py"),
+    # A provider failure must not be reported as a completion. This is the
+    # difference between "the work is done" and "nothing happened and we lied".
+    ("provider_error_reported_as_completion",
+     "            if result.outcome is ModelOutcome.ERROR:\n                record.state = RunState.FAILED",
+     "            if result.outcome is ModelOutcome.ERROR:\n                record.state = RunState.COMPLETED  # BUG: failure looks like success",
+     "capcore/runtime.py"),
+    # An adapter that raises is a failed provider, not a finished one.
+    ("model_exception_swallowed_as_completion",
+     "                record.state = RunState.FAILED\n                record.stop_reason = StopReason.MODEL_ERROR\n                return record\n\n            if not isinstance(result, ModelResult):",
+     "                record.state = RunState.COMPLETED  # BUG: crash looks like success\n                record.stop_reason = StopReason.MODEL_ERROR\n                return record\n\n            if not isinstance(result, ModelResult):",
+     "capcore/runtime.py"),
+    # OllamaModel must not turn a transport failure into a clean stop.
+    ("ollama_error_becomes_finished",
+     "            return ModelResult.error()\n\n        proposal = parse_proposal(text)",
+     "            return ModelResult.finished()  # BUG: provider failure as completion\n\n        proposal = parse_proposal(text)",
+     "capcore/adapters.py"),
+    # --- M3 destination policy (target capcore/httptool.py) ---
+    # The URL is where a real credential is SENT. https-only is what keeps the
+    # Authorization header off a cleartext wire.
+    ("httptool_allows_any_scheme",
+     "    if scheme not in ALLOWED_SCHEMES:",
+     "    if False:  # BUG: send credentials over any scheme",
+     "capcore/httptool.py"),
+    # Embedded userinfo leaks credentials into logs, proxies, and exceptions.
+    ("httptool_allows_embedded_userinfo",
+     "    if parts.username is not None or parts.password is not None:",
+     "    if False:  # BUG: permit https://user:pw@host",
+     "capcore/httptool.py"),
+    # Consumed/expired credentials must be refused. Ignoring availability defeats
+    # single-use and TTL.
     ("broker_ignores_single_use_and_ttl",
      "        if not cred.is_available(now):",
      "        if False:  # BUG: ignore consumed/expired credential",
+     "capcore/broker.py"),
+    # The single-use consumption itself: if the record is not claimed atomically,
+    # an authorization can be replayed. Mutating the claim guard opens replay.
+    ("broker_allows_replay_of_claimed_action",
+     "        if rec.state is not AuthorizationState.PENDING:",
+     "        if False:  # BUG: allow redeeming a non-pending authorization",
      "capcore/broker.py"),
 ]
 
