@@ -141,7 +141,7 @@ to completion in about two minutes.
 
 ## Status and open decisions
 
-Status: **Partial.** Implemented: tenant isolation, union-of-grants, segment
+Status: **M1 implemented within documented scope.** Implemented: tenant isolation, union-of-grants, segment
 scope, issue-time attenuation, deny precedence, fail-closed, generic model-facing
 denials, no-derivation-from-revoked-parent, and principal/run binding. Not yet
 implemented, honestly marked:
@@ -178,77 +178,192 @@ implemented, honestly marked:
 
 ## M2: the trusted execution loop (`capcore/runtime.py`)
 
-M1 is the decision function; M2 is the loop that uses it. `ExecutionEngine`
-drives a run through a trusted state machine (`RunRecord`, `RunState`), enforces
-a per-run `Budget`, and dispatches authorized actions to a `ToolRegistry`. The
-model is abstracted behind `ModelClient`, so the same engine runs against a
-deterministic `ScriptedModel` (all tests, CI) or a real local LLM (`OllamaModel`
-in `capcore/adapters.py`). New security properties, all tested against a scripted
-model so they are reproducible:
+M1 is the decision function; M2 is the loop that uses it. `ExecutionEngine` drives
+a run through a trusted state machine (`RunRecord`, `RunState`), enforces a per-run
+`Budget`, and hands authorized actions to the broker. It **owns no tool catalog and
+holds no adapter**, so it cannot dispatch around the credential boundary.
 
-- **Trusted state.** Run state lives in `RunRecord`, not in anything the model
-  controls.
-- **Double authorization (revoke race).** Each action is authorized at propose
-  time AND re-authorized immediately before execution. If a capability is revoked
-  in between, the execute-time check denies and the action does not run on a
-  stale authorization. Mutation-tested (`revoke_race_reexecute_skipped`).
-- **Budget.** A run cannot exceed `max_steps`; an exhausted budget aborts the run
-  and denies further actions, and denied attempts count against the budget so a
-  hostile model cannot burn unlimited probes. Enforced at both the run-loop and
-  step level (defense in depth). Mutation-tested (`budget_not_enforced`).
-- **Tool boundary.** Only ALLOWed actions reach a tool; denied and
-  approval-gated actions never touch one. A tool that raises fails the run
-  cleanly (state FAILED) rather than crashing the engine.
+The model is abstracted behind `ModelClient`, so the same engine runs against a
+deterministic `ScriptedModel` (all tests, CI) or a real local LLM (`OllamaModel`).
 
-The real-LLM path (`OllamaModel`, `scripts/demo_live.py`) is deliberately NOT in
-CI: it needs a local Ollama server and produces nondeterministic output. Its
-PARSING logic (`parse_proposal`) is unit-tested with fixed strings; the live
-network call is verified by running the demo locally. This keeps the security
-properties deterministic and CI-safe while still wiring in a genuine model: the
-LLM's outputs are untrusted and pass through the identical trusted pipeline as a
-scripted proposal.
+### Trusted state is not model-reachable
 
-## M3: the credential broker (`capcore/broker.py`, `capcore/httptool.py`)
+`ModelClient.next_proposal` receives an immutable, redacted `ModelView`, **not** the
+live `RunRecord`.
 
-When an authorized action needs a real secret (API key, token) to execute, the
-`CredentialBroker` releases it, but only for the authorized action, and never to
-the model. Security properties, all tested with a known mock secret so
-containment is provable:
+This was a critical defect. The adapter used to receive the real `RunRecord`, and an
+untrusted adapter could write `record.steps_taken = -100`. Both the run-loop guard
+and the step-level budget check read that same field, so the model could bypass its
+budget *and* produce a **nonterminating run**: a liveness failure of the enforcement
+loop itself, reachable from the least trusted surface in the system.
 
-- **Secret non-exposure.** `Secret` never renders its value in repr/str/format/
-  logging/exceptions; the raw value is reachable only via an explicit `.reveal()`
-  chokepoint. Tested that a mock secret appears in NONE of those.
-- **Authorized-release only.** `release()` hands over the secret only when the
-  monitor's decision is ALLOW, the credential is bound to the authorizing
-  capability, the verb matches, and the credential scope covers the resource.
-  Any mismatch, or a denied action, yields no secret. Mutation-tested
-  (`broker_releases_on_denied_action`, `broker_ignores_credential_scope`).
-- **Scoped lifetime.** Credentials can be single-use (consumed after one release)
-  and/or TTL-expiring (denied after a deadline). Mutation-tested
-  (`broker_ignores_single_use_and_ttl`).
-- **Audit without secrets.** Every release attempt, granted or refused, is
-  recorded without the secret value. Tested.
-- **Delivery boundary (`HttpTool`).** The tool sends the released secret only in
-  the Authorization header of its fixed allowed URL, never a URL implied by the
-  untrusted proposal, and its returned summary never echoes the secret. The
-  transport is injectable: a `MockTransport` in tests records exactly what was
-  sent (proving the secret went only to the allowed URL); real HTTP is used only
-  in the live demo.
+`ModelView` also drops `audit_reason`. That field carries the boundary-mapping
+detail M1 already withholds from the model via the `public_reason`/`audit_reason`
+split; passing the raw history to the model would have reopened that hole by
+another route.
 
-The real-secret/real-network path (`scripts/demo_live_m3.py`) is deliberately
-NOT in CI. It reads a token from the `CAPCORE_DEMO_TOKEN` environment variable
-(never committed) and makes a real HTTPS call to httpbin.org/bearer, which echoes
-the token back so you can see it arrived at the allowed endpoint, and confirm the
-runtime, not the model, put it there. This keeps a real credential out of the
-repo and out of CI logs while still demonstrating real containment: the secret is
-provably absent from every model-facing reason and audit line.
+### Termination is structural
+
+`run()` is bounded by `for _ in range(budget.max_steps)`, a **local** counter never
+derived from, and never written by, anything the model can reach. The trusted
+`steps_taken` check remains authoritative for the budget verdict; the ceiling is an
+independent second bound. Even if trusted counter state were corrupted by any means,
+the loop cannot iterate more than `max_steps` times. Mutation-tested
+(`budget_not_enforced`, `engine_loop_ceiling_removed`).
+
+### Terminal state is honest
+
+`RunRecord.stop_reason` says **why** a run ended: `MODEL_FINISHED`,
+`BUDGET_EXHAUSTED`, `CEILING_REACHED`, `MODEL_ERROR`, `PROVIDER_UNAVAILABLE`, or
+`TOOL_FAILED`.
+
+Previously a `ModelClient` returned `Optional[Proposal]`, and `None` meant **both**
+"I am done" and "my provider is down". A run against a dead Ollama server therefore
+reported `COMPLETED` with zero actions taken: silent total failure, reported as
+success. `ModelResult` (PROPOSAL / FINISHED / ERROR) forces the adapter to say which,
+and an adapter that raises, or returns an untyped value, is treated as a failure
+rather than a completion. Mutation-tested (`provider_error_reported_as_completion`,
+`model_exception_swallowed_as_completion`, `ollama_error_becomes_finished`).
+
+### One capability store
+
+`ExecutionEngine` derives its store from the monitor rather than taking a second one.
+An earlier version accepted both, which permitted a divergent state where the monitor
+authorized against store A while `engine.store` pointed at store B. Both
+authorization checks read `monitor.store`, so revoking through `engine.store` was a
+silent no-op and the action executed anyway. The store was a parallel reference with
+no authority that looked like it had some.
+
+### The revoke race
+
+Double authorization has not been weakened; it **moved into the broker**, where the
+re-check now happens at redemption, immediately before the credential is touched. A
+capability revoked between propose and execute stops the action there, and the tool
+never runs. Mutation-tested (`broker_skips_reauthorization_at_redemption`).
+
+### Live LLM
+
+The real-LLM path (`OllamaModel`, `scripts/demo_live.py`) is deliberately NOT in CI:
+it needs a local Ollama server and produces nondeterministic output. Its parsing
+logic (`parse_proposal`) is unit-tested with fixed strings; the live network call is
+verified by running the demo locally. This keeps the security properties
+deterministic and CI-safe while still wiring in a genuine model: the LLM's outputs
+are untrusted and pass through the identical trusted pipeline as a scripted proposal.
+
+## M3: the trusted execution broker (`capcore/broker.py`, `capcore/httptool.py`)
+
+The broker does not hand out secrets. It **executes tools inside its own boundary**
+and returns sanitized results. It is the only path from an authorized proposal to a
+running adapter.
+
+### Redemption, not inspection
+
+An earlier version took a caller-supplied `Decision` and checked
+`decision.verdict == ALLOW`. That is authorization by *inspection*, and inspection
+cannot establish authenticity in Python: `Decision(Verdict.ALLOW, "authorized")` is
+one constructor call away. Enriching the object does not help. A frozen dataclass
+carrying a digest, a version, and an expiry is integrity-preserving after
+construction but still not *authentic*, because an attacker who can call the
+constructor sets whatever fields the checker wants to see.
+
+So the broker **redeems**:
+
+1. `register_authorized_execution(context, execution_proposal) -> action_id`.
+   The broker authorizes **independently** through its own monitor (it accepts no
+   caller `Decision` at all), resolves the tool from its own catalog, checks the
+   tool policy, and stores a `PendingAuthorization` in its own state. It returns an
+   opaque random id.
+2. `redeem_and_execute(action_id) -> SanitizedToolResult`. The caller presents
+   **only** the id. The action, the tool, the version, and the credential are all
+   read from stored state.
+
+The `action_id` is not the authority. It is a lookup key. The authority is the
+broker-held record.
+
+This closes four attacks structurally:
+
+- **Forgery.** A fabricated authorization has no record; lookup fails. Mutation-
+  tested (`broker_skips_reauthorization_at_redemption`).
+- **Replay.** Redemption atomically claims PENDING -> EXECUTING. Single-use is a
+  state machine, not a deletion, so a crash after the transition leaves the
+  authorization non-redeemable rather than silently retryable. Mutation-tested
+  (`broker_allows_replay_of_claimed_action`).
+- **Staleness.** The live monitor re-authorizes immediately before the credential
+  is touched, so a capability revoked after mint stops the action.
+- **Substitution.** The caller supplies neither tool nor credential at redemption.
+  Both are bound at mint, and the record pins registration id **and version**, so a
+  tool swapped out after authorization is refused.
+
+### Catalog existence is not authorization
+
+`read_customer_record` and `read_payroll_database` may both serve `verb=read`. If
+catalog lookup were the only check, an untrusted model naming its own executor
+would choose which one runs. `ToolPolicy` is therefore **deny-by-default**: an
+empty policy authorizes nothing, and a tool must be explicitly granted for a scope.
+Mutation-tested (`broker_ignores_tool_policy`, `broker_ignores_tool_verb_match`).
+
+### Secret containment, and the limit of it
+
+`Secret` never renders its value in repr/str/format/logging. But that protects the
+**wrapper**. Once `.reveal()` is called and the value is interpolated into an
+`Authorization` header, the result is an ordinary Python string, and any exception
+carrying it carries the credential. A transport raising
+`RuntimeError(headers["Authorization"])` leaked `Bearer <token>` in an earlier
+version, which is why the old claim ("secrets never appear in exceptions") was
+false as written.
+
+The mechanism now: `.reveal()` is called **only inside the broker's execution
+boundary**, where every exception from the adapter is caught and **discarded**,
+never inspected, formatted, re-raised, chained, or logged. The returned failure
+code is a constant, not derived from the exception. The claim is exactly as strong
+as that mechanism: *secrets are contained by the broker boundary.*
+
+**The limit, stated rather than buried:** the broker cannot protect the credential
+from a *malicious credentialed adapter in the same process*. The adapter receives
+the secret in order to use it, and could log it, retain it, or send it elsewhere.
+Every `CredentialedTool` is therefore inside the TCB. Real isolation means a
+separate process behind restricted IPC, which is not done.
+
+### Delivery boundary (`HttpTool`)
+
+Destinations are validated at **construction**, so a tool that exists is a tool
+whose destination is safe: https only (a cleartext scheme would put the
+`Authorization` header on the wire), no embedded userinfo (which leaks into logs,
+proxies, and parser-confusion attacks), an explicit host allowlist, an explicit
+port policy, and URL normalization before comparison. Redirects are disabled: a 3xx
+from the pinned host would otherwise re-send the header to an attacker-chosen
+`Location`, which defeats destination pinning entirely. Mutation-tested
+(`httptool_allows_any_scheme`, `httptool_allows_embedded_userinfo`).
+
+Credential and tool-grant scopes are validated at issuance via the same
+`validate_resource` M1 uses, so a malformed scope fails closed at configuration
+time rather than mid-action with a secret already in play. Mutation-tested
+(`credential_scope_not_validated_at_issue`, `tool_grant_scope_not_validated`).
+
+### Re-authorization semantics (a deliberate choice)
+
+Redemption asks the monitor: *is this action authorized right now, through any
+valid capability path?* That is **current-authority** semantics. If the capability
+that originally authorized the action is revoked but a different valid capability
+would independently authorize the same action, redemption **succeeds**. It is not
+original-capability-continuity; binding to the exact granting capability would
+require the monitor to return granting capability ids, which it does not.
+
+### Live demo
+
+The real-secret/real-network path (`scripts/demo_live_m3.py`) is deliberately NOT
+in CI. It reads a token from `CAPCORE_DEMO_TOKEN` (never committed) and makes a
+real HTTPS call to httpbin.org/bearer, which echoes the token back so you can see
+it arrived at the allowed endpoint and confirm the runtime, not the model, put it
+there. This keeps a real credential out of the repo and out of CI logs while still
+demonstrating real containment.
 
 ## Run
 
 ```
 pip install -e ".[test]"
 python -m pytest
-python scripts/mutation_check.py      # all 20 mutations must be caught
+python scripts/mutation_check.py      # all 30 mutations must be caught
 
 # live demos (local, not part of CI):
 pip install -e ".[live]"
