@@ -53,31 +53,54 @@ python scripts/mutation_check.py
 
 This is the part worth reading. Everything else follows from it.
 
-**Untrusted**, assumed hostile:
+CapCore's current implementation uses a **single-process Python trust model**.
 
-- the model provider and its output
-- the `ModelClient` implementation (it wraps an untrusted provider)
-- every proposal, including the **executor the model names**
-- tool results and remote services
+All Python code executed inside the runtime process is part of the trusted
+computing base, including `ModelClient` implementations, plain and credentialed
+tool adapters, hooks, clocks, policies, catalogs, vaults, and other injected
+callbacks. Python objects and immutability controls can prevent accidental misuse
+through documented interfaces, but they do not isolate malicious code running in
+the same interpreter.
 
-**Trusted** (the TCB):
+The untrusted boundary applies to **data** crossing into trusted runtime code,
+including remote model responses, model-generated proposals, tool results, user
+content, and responses from remote services. These values are validated and
+authorized before they can influence trusted execution or create external effects.
 
-- the reference monitor and the capability store
-- run state (`RunRecord`), which the model never receives
-- the trusted execution broker: catalog, policy, authorization state, credentials
-- **credentialed adapters**
+Running model adapters or tool plugins as genuinely untrusted code requires a
+process or stronger isolation boundary with restricted IPC. That isolation is not
+implemented in the current release and is a future design objective.
 
-### Credentialed adapters are inside the TCB
+### Why the boundary is drawn at data, not code
 
-The broker keeps the credential away from the engine, the model, and general
-application code. It **cannot** protect the credential from a malicious
-credentialed adapter in the same process: the adapter receives the secret in order
-to use it, and could log it, retain it, or send it somewhere else.
+There is no in-process Python mechanism that makes arbitrary same-interpreter code
+untrusted. A hostile callback can walk the call stack
+(`inspect.currentframe().f_back`), traverse the object graph
+(`gc.get_referrers`), or monkeypatch, and from there reach the engine, the broker,
+the vault, and the live `RunRecord`, regardless of any frozen dataclass or
+"immutable" view. So the honest line is: the *code* on the runtime's side of the
+boundary is trusted, and the *data* that crosses it is not.
 
-So every `CredentialedTool` you write is trusted code. That is acceptable for a
-single-process runtime, and it is stated here rather than buried. Real isolation
-means running credentialed adapters in a separate process behind restricted IPC,
-which is not done.
+That is a narrower claim than an earlier version of this document made (it
+classified `ModelClient` implementations as untrusted, which a single-process
+architecture cannot enforce). The narrowing is deliberate: the earlier statement
+was technically false, and a defensible boundary is worth more than an impressive
+one.
+
+What the architecture *does* enforce, against untrusted data, is the whole point
+of the rest of this document: a proposal cannot forge an authorization, name an
+executor it may not use, replay a credential, or outrun its budget, because those
+are decided by trusted code checking untrusted values, never by trusting the
+values themselves.
+
+### Credentialed adapters
+
+A credentialed adapter receives a real secret in order to use it, and could log
+it, retain it, or send it elsewhere. Under the single-process model above it is
+trusted code, like every other in-process component. The broker keeps the secret
+away from the *engine* and the *model*, and contains it against accidental leakage
+(exceptions, logs), but it cannot contain a hostile adapter. Real containment is
+the same process-isolation objective named above.
 
 ## How authorization actually works
 

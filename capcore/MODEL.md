@@ -188,14 +188,22 @@ deterministic `ScriptedModel` (all tests, CI) or a real local LLM (`OllamaModel`
 
 ### Trusted state is not model-reachable
 
+Under CapCore's single-process trust model, every in-process component is TCB,
+including the `ModelClient` implementation. What is untrusted is the DATA it
+produces (proposals), which is authorized before it can act. The mechanism below
+prevents ACCIDENTAL trusted-state mutation through the documented interface; it
+does not isolate hostile same-interpreter code (see README "Trust model").
+
 `ModelClient.next_proposal` receives an immutable, redacted `ModelView`, **not** the
 live `RunRecord`.
 
-This was a critical defect. The adapter used to receive the real `RunRecord`, and an
-untrusted adapter could write `record.steps_taken = -100`. Both the run-loop guard
-and the step-level budget check read that same field, so the model could bypass its
-budget *and* produce a **nonterminating run**: a liveness failure of the enforcement
-loop itself, reachable from the least trusted surface in the system.
+This was a defect in the documented interface. The adapter used to receive the real
+`RunRecord`, and a careless adapter could write `record.steps_taken = -100`. Both
+the run-loop guard and the step-level budget check read that same field, so the
+adapter could bypass its budget *and* produce a **nonterminating run**: a liveness
+failure of the enforcement loop. `ModelView` closes that accidental path. It does
+not isolate hostile in-process code (nothing in-process can); the independent loop
+ceiling in `run()` is the structural bound against runaway iteration.
 
 `ModelView` also drops `audit_reason`. That field carries the boundary-mapping
 detail M1 already withholds from the model via the `public_reason`/`audit_reason`

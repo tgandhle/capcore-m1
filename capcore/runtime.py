@@ -101,10 +101,18 @@ class RunRecord:
     it is model-reachable. Model adapters get a ModelView built by
     `to_model_view()` below: an immutable, redacted copy.
 
-    Handing this object to a ModelClient was a critical defect. An untrusted
-    adapter could write `record.steps_taken = -100`, and because both the
-    `run()` loop guard and the `step()` budget check read that same field, the
-    model could bypass its budget AND produce a nonterminating run. See
+    Handing this object to a ModelClient through the documented API was a defect:
+    an adapter could write `record.steps_taken = -100`, and because both the
+    `run()` loop guard and the `step()` budget check read that same field, a
+    careless (not necessarily hostile) adapter could bypass its budget and produce
+    a nonterminating run. `to_model_view()` closes that ACCIDENTAL path.
+
+    It does NOT isolate hostile in-process code. A malicious ModelClient can reach
+    this object anyway, via stack inspection or the object graph; under CapCore's
+    single-process trust model every in-process component, ModelClient included, is
+    TCB (see README "Trust model"). The independent loop ceiling in run() is the
+    structural defense against runaway iteration; ModelView is the defense against
+    accidental mutation through the interface. See
     tests/test_m2_m3_trust_boundaries.py::test_model_cannot_mutate_trusted_budget_counter.
     """
     ctx: RunContext
@@ -271,10 +279,12 @@ class ModelClient(Protocol):
     to run it (which the broker's deny-by-default ToolPolicy authorizes
     separately). Naming a tool does not entitle the model to it.
 
-    A ModelClient receives a ModelView, NOT a RunRecord. This is a trust boundary,
-    not a convenience: a ModelClient implementation is untrusted code (it wraps an
-    untrusted provider), so it must not be able to reach trusted execution state.
-    See RunRecord's docstring for what happened when it could.
+    A ModelClient receives a ModelView, NOT a RunRecord. The DATA a ModelClient
+    produces (its proposals) is untrusted and is authorized before it can act; the
+    ModelClient CODE, running in-process, is trusted (see README "Trust model").
+    ModelView keeps the documented interface from handing trusted state to the
+    adapter by accident. It does not, and cannot, isolate hostile same-interpreter
+    code. See RunRecord's docstring.
     """
     def next_proposal(self, view: ModelView) -> ModelResult: ...
 
