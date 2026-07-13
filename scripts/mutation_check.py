@@ -364,8 +364,8 @@ MUTATIONS = [
      "            elif outcome is ModelOutcome.LIMIT_REACHED:\n                record.state = RunState.COMPLETED  # BUG: truncated run looks finished",
      "capcore/runtime.py"),
     ("ollama_error_becomes_finished",
-     "            return ModelResult.error()\n\n        proposal = parse_proposal(text)",
-     "            return ModelResult.finished()  # BUG: provider failure as completion\n\n        proposal = parse_proposal(text)",
+     "        except Exception:\n            # Network, HTTP, timeout, malformed-JSON-from-the-server: the provider\n            # failed. NOT a completion.\n            return ModelResult.error()",
+     "        except Exception:\n            # Network, HTTP, timeout, malformed-JSON-from-the-server: the provider\n            # failed. NOT a completion.\n            return ModelResult.finished()  # BUG: provider failure as completion",
      "capcore/adapters.py"),
     # --- M3 destination policy (target capcore/httptool.py) ---
     # The URL is where a real credential is SENT. https-only is what keeps the
