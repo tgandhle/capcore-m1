@@ -91,12 +91,31 @@ MUTATIONS = [
     # that lies via split()/__str__(), diverging authorization from execution.
     # Raw model text must be bounded before parsing. Removing the cap lets a huge
     # provider blob through as long as the eventual proposal is small.
-    ("parse_proposal_unbounded",
-     "    n = utf8_length(text)\n    if n is None or n > MAX_GENERATED_MODEL_TEXT_BYTES:\n        return None",
-     "    n = 0  # BUG: skip the raw-text size bound",
+    # The unified parse gate must reject oversized text for ALL outcomes,
+    # including completion. Removing the size check lets an oversized {"done"}
+    # through as FINISHED.
+    ("parse_model_output_size_unbounded",
+     "    if n > MAX_GENERATED_MODEL_TEXT_BYTES:\n        return ParsedModelOutput(ParsedOutputKind.TOO_LARGE)",
+     "    if False:\n        return ParsedModelOutput(ParsedOutputKind.TOO_LARGE)",
+     "capcore/adapters.py"),
+    # The unified gate must reject malformed utf-8 for ALL outcomes.
+    ("parse_model_output_utf8_unchecked",
+     "    if n is None:\n        return ParsedModelOutput(ParsedOutputKind.INVALID_UTF8)",
+     "    if False:\n        return ParsedModelOutput(ParsedOutputKind.INVALID_UTF8)",
      "capcore/adapters.py"),
     # The transport must bound by bytes actually read. Removing the check lets an
     # unbounded body be buffered.
+    # The provider transport must decode strictly. Reverting to errors="replace"
+    # silently repairs malformed bytes, defeating the fail-closed unicode rule.
+    ("provider_decode_repairs_malformed",
+     "            decoded = raw.decode(\"utf-8\")",
+     "            decoded = raw.decode(\"utf-8\", errors=\"replace\")  # BUG: repair",
+     "capcore/adapters.py"),
+    # The provider response field must be an exact str.
+    ("provider_response_field_untyped",
+     "        if type(text) is not str:\n            raise ProviderProtocolError(\"provider response field must be a string\")",
+     "        if False:\n            raise ProviderProtocolError(\"provider response field must be a string\")",
+     "capcore/adapters.py"),
     ("bounded_read_unbounded",
      "        if len(buf) > max_bytes:\n            raise ProviderResponseTooLarge(\n                f\"provider response exceeded {max_bytes} bytes\")",
      "        if False:\n            raise ProviderResponseTooLarge(\n                f\"provider response exceeded {max_bytes} bytes\")",
@@ -186,6 +205,13 @@ MUTATIONS = [
     # An invalid/oversized action must fail closed at the run boundary before it
     # can enter trusted history. Removing the valid_proposal check lets a raw
     # malformed action be retained and reach ModelView.
+    # step() must validate the action before the budget check. Removing the
+    # step-level check lets a raw malformed action into trusted history via the
+    # public step() entry point.
+    ("step_retains_invalid_proposal_in_history",
+     "        if not valid_proposal(action):\n            record.state = RunState.FAILED\n            record.stop_reason = StopReason.MODEL_ERROR\n            res = StepResult(StepOutcome.MALFORMED_PROPOSAL,\n                             _redacted_action(action),\n                             audit_reason=\"model proposal was malformed or exceeded size limits\")\n            record.history.append(res)\n            return res\n\n        # 1. Budget.",
+     "        # 1. Budget.",
+     "capcore/runtime.py"),
     ("run_retains_invalid_proposal_in_history",
      "                if not valid_proposal(result.proposal.action):",
      "                if False:  # BUG: let a malformed action into history",

@@ -27,6 +27,13 @@ class ProviderResponseTooLarge(Exception):
     pass
 
 
+class ProviderProtocolError(Exception):
+    """A provider response violated the expected protocol: not valid utf-8, not a
+    JSON object, or missing/mistyped the response field. Fail closed rather than
+    silently repair (e.g. errors='replace') malformed provider bytes."""
+    pass
+
+
 def bounded_read(response, max_bytes: int) -> bytes:
     """Read at most `max_bytes` from a streaming HTTP response, then stop.
 

@@ -374,7 +374,7 @@ demonstrating real containment.
 ```
 pip install -e ".[test]"
 python -m pytest
-python scripts/mutation_check.py      # all 58 mutations must be caught
+python scripts/mutation_check.py      # all 61 mutations must be caught
 
 # live demos (local, not part of CI):
 pip install -e ".[live]"

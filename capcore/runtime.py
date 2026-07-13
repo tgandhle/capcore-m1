@@ -545,7 +545,32 @@ class ExecutionEngine:
         touched. A capability revoked between propose and execute stops the
         action at redemption, and the tool never runs.
         """
+        # 0. VALIDATE FIRST. step() is the public, history-writing boundary, so
+        #    it must enforce the malformed-input invariant BY CONSTRUCTION, not
+        #    rely on run() having done so. This runs before the budget check,
+        #    because a malformed action must never be stored, not even in a
+        #    BUDGET_EXHAUSTED result, and never with its raw (possibly oversized
+        #    or malformed-unicode) fields retained.
+        from capcore import valid_proposal
+        if type(proposal) is not ExecutionProposal:
+            record.state = RunState.FAILED
+            record.stop_reason = StopReason.MODEL_ERROR
+            res = StepResult(StepOutcome.MALFORMED_PROPOSAL,
+                             _redacted_action(None),
+                             audit_reason="step called with a non-ExecutionProposal")
+            record.history.append(res)
+            return res
+
         action = proposal.action
+
+        if not valid_proposal(action):
+            record.state = RunState.FAILED
+            record.stop_reason = StopReason.MODEL_ERROR
+            res = StepResult(StepOutcome.MALFORMED_PROPOSAL,
+                             _redacted_action(action),
+                             audit_reason="model proposal was malformed or exceeded size limits")
+            record.history.append(res)
+            return res
 
         # 1. Budget.
         if record.steps_taken >= self.budget.max_actions:

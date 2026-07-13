@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
+from enum import Enum
 from typing import Optional
 
 from capcore import Proposal
@@ -50,79 +52,75 @@ use markdown, output only the JSON object. If done, output exactly:
 {"done": true}"""
 
 
-def parse_proposal(text: str) -> Optional[ExecutionProposal]:
-    """Extract an ExecutionProposal from raw model text. None if the model signals
-    done or the text has no usable JSON object.
+class ParsedOutputKind(Enum):
+    PROPOSAL = "proposal"
+    FINISHED = "finished"
+    INVALID = "invalid"            # unusable text (no JSON, wrong shape)
+    TOO_LARGE = "too_large"        # exceeded the generated-text limit
+    INVALID_UTF8 = "invalid_utf8"  # not utf-8 encodable
 
-    The model names BOTH the action (verb + resource) and the executor ("tool").
-    All three are UNTRUSTED. Naming a tool does not authorize it: the broker's
-    deny-by-default ToolPolicy decides whether this registration may serve this
-    action, and an unauthorized executor is refused at mint.
 
-    This is deliberately forgiving on FORMAT (small models wrap things in prose
-    or markdown) but strict on CONTENT: it only accepts a non-empty string verb
-    and resource. Anything malformed returns None, and a None from the model is
-    treated by the engine as "stop", while a malformed-but-present action would
-    be turned into a Proposal that the monitor then judges (and likely denies).
+@dataclass(frozen=True)
+class ParsedModelOutput:
+    kind: ParsedOutputKind
+    proposal: Optional[ExecutionProposal] = None
 
-    Note: this does NOT validate the resource against capcore's rules; that is
-    the monitor's job. Parsing only shapes text into a Proposal or None.
+
+def parse_model_output(text: str) -> ParsedModelOutput:
+    """The SINGLE parse path for untrusted model text.
+
+    Every outcome, proposal AND completion, passes the same size and utf-8 gate
+    FIRST, so there is no second parser (the old `_signals_done`) that could
+    accept an oversized or malformed-unicode completion the proposal path
+    rejected. Order: encodability -> size -> JSON shape -> done vs proposal.
     """
-    if not text:
-        return None
-    # Bound the raw text BEFORE parsing. A provider (or a replayed/fixture
-    # response) can send a large blob whose eventual proposal fields are small;
-    # parsing it still costs memory and CPU. Reject oversized input outright. This
-    # is a second line of defense; the live transport also bounds the HTTP body.
     from capcore import utf8_length, MAX_GENERATED_MODEL_TEXT_BYTES
+    if not text:
+        return ParsedModelOutput(ParsedOutputKind.INVALID)
     n = utf8_length(text)
-    if n is None or n > MAX_GENERATED_MODEL_TEXT_BYTES:
-        return None
-    # find the first {...} JSON object in the text
+    if n is None:
+        return ParsedModelOutput(ParsedOutputKind.INVALID_UTF8)
+    if n > MAX_GENERATED_MODEL_TEXT_BYTES:
+        return ParsedModelOutput(ParsedOutputKind.TOO_LARGE)
+
     match = re.search(r"\{.*?\}", text, re.DOTALL)
     if not match:
-        return None
+        return ParsedModelOutput(ParsedOutputKind.INVALID)
     try:
         obj = json.loads(match.group(0))
     except (json.JSONDecodeError, ValueError):
-        return None
+        return ParsedModelOutput(ParsedOutputKind.INVALID)
     if not isinstance(obj, dict):
-        return None
+        return ParsedModelOutput(ParsedOutputKind.INVALID)
+
     if obj.get("done") is True:
-        return None
+        return ParsedModelOutput(ParsedOutputKind.FINISHED)
+
     verb = obj.get("verb")
     resource = obj.get("resource")
     tool = obj.get("tool")
     if not isinstance(verb, str) or not verb:
-        return None
+        return ParsedModelOutput(ParsedOutputKind.INVALID)
     if not isinstance(resource, str) or not resource:
-        return None
+        return ParsedModelOutput(ParsedOutputKind.INVALID)
     if not isinstance(tool, str) or not tool:
-        return None
-    return ExecutionProposal(
-        action=Proposal(resource=resource, verb=verb),
-        tool_registration_id=tool,
+        return ParsedModelOutput(ParsedOutputKind.INVALID)
+    return ParsedModelOutput(
+        ParsedOutputKind.PROPOSAL,
+        ExecutionProposal(action=Proposal(resource=resource, verb=verb),
+                          tool_registration_id=tool),
     )
 
 
-def _signals_done(text: str) -> bool:
-    """Did the model explicitly say it was finished, as opposed to emitting junk?
+def parse_proposal(text: str) -> Optional[ExecutionProposal]:
+    """Backward-compatible thin wrapper over parse_model_output.
 
-    parse_proposal returns None for BOTH cases, which is fine for parsing but not
-    for terminal state: a model that said {"done": true} completed its work, while
-    a model that emitted prose completed nothing. The engine must not report those
-    identically.
+    Returns the ExecutionProposal for a PROPOSAL outcome, else None. Retained so
+    existing parsing unit tests keep working; new code should use
+    parse_model_output, which distinguishes finished/too-large/invalid-utf8.
     """
-    if not text:
-        return False
-    match = re.search(r"\{.*?\}", text, re.DOTALL)
-    if not match:
-        return False
-    try:
-        obj = json.loads(match.group(0))
-    except (json.JSONDecodeError, ValueError):
-        return False
-    return isinstance(obj, dict) and obj.get("done") is True
+    parsed = parse_model_output(text)
+    return parsed.proposal if parsed.kind is ParsedOutputKind.PROPOSAL else None
 
 
 def render_history(view: ModelView, max_items: int = 6) -> str:
@@ -160,8 +158,11 @@ class OllamaModel:
         import json as _json
         import requests
         from capcore import MAX_PROVIDER_HTTP_BODY_BYTES
-        from capcore.httptool import bounded_read
-        resp = requests.post(
+        from capcore.httptool import bounded_read, ProviderProtocolError
+        # The response is used as a CONTEXT MANAGER so the connection is closed on
+        # every exit path (success, size rejection, protocol error, HTTP error),
+        # not left awaiting garbage collection.
+        with requests.post(
             self.url,
             json={
                 "model": self.model,
@@ -172,12 +173,30 @@ class OllamaModel:
             },
             timeout=self.timeout,
             stream=True,   # do NOT let requests buffer an unbounded body
-        )
-        resp.raise_for_status()
-        # Bound the HTTP body by bytes ACTUALLY READ (a hostile provider can lie
-        # about Content-Length). Parse JSON only after the bounded read.
-        raw = bounded_read(resp, MAX_PROVIDER_HTTP_BODY_BYTES)
-        return _json.loads(raw.decode("utf-8", errors="replace")).get("response", "")
+        ) as resp:
+            resp.raise_for_status()
+            # Bound the HTTP body by bytes ACTUALLY READ (a hostile provider can
+            # lie about Content-Length).
+            raw = bounded_read(resp, MAX_PROVIDER_HTTP_BODY_BYTES)
+
+        # STRICT decode: do NOT silently repair malformed bytes with
+        # errors="replace". Malformed provider unicode fails closed, consistent
+        # with every other untrusted-text boundary.
+        try:
+            decoded = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ProviderProtocolError("provider response is not valid utf-8") from exc
+
+        try:
+            obj = _json.loads(decoded)
+        except (ValueError, _json.JSONDecodeError) as exc:
+            raise ProviderProtocolError("provider response is not valid JSON") from exc
+        if type(obj) is not dict:
+            raise ProviderProtocolError("provider response must be a JSON object")
+        text = obj.get("response")
+        if type(text) is not str:
+            raise ProviderProtocolError("provider response field must be a string")
+        return text
 
     def next_proposal(self, view: ModelView) -> ModelResult:
         """Return a TYPED result. A provider failure is not a completion.
@@ -208,12 +227,14 @@ class OllamaModel:
             # failed. NOT a completion.
             return ModelResult.error()
 
-        proposal = parse_proposal(text)
-        if proposal is None:
-            # The model either signalled {"done": true} or emitted something
-            # unusable. parse_proposal cannot distinguish those, so ask it again:
-            # a clean done is a FINISH, garbage is an ERROR.
-            if _signals_done(text):
-                return ModelResult.finished()
-            return ModelResult.error()
-        return ModelResult.propose(proposal)
+        # SINGLE parse path: proposal and completion pass the same size/utf-8
+        # gate. There is no separate _signals_done parser that could accept an
+        # oversized or malformed-unicode completion the proposal path rejected.
+        parsed = parse_model_output(text)
+        if parsed.kind is ParsedOutputKind.PROPOSAL:
+            return ModelResult.propose(parsed.proposal)
+        if parsed.kind is ParsedOutputKind.FINISHED:
+            return ModelResult.finished()
+        # INVALID / TOO_LARGE / INVALID_UTF8: the model produced unusable or
+        # out-of-bounds output. Not a completion. Fail closed to error.
+        return ModelResult.error()

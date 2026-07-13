@@ -33,7 +33,7 @@ Three layers, each with its own trust boundary:
 "Single-process trust model" is load-bearing, not a hedge. See
 [Trust model](#trust-model).
 
-244 tests pass. `python scripts/mutation_check.py` reintroduces 58 known defects
+258 tests pass. `python scripts/mutation_check.py` reintroduces 61 known defects
 one at a time and asserts the suite catches every one (it mutates a temporary
 copy, never your working tree). CI runs Python 3.11-3.13 on Ubuntu and Windows.
 
@@ -326,6 +326,27 @@ The last three (catalog, mint refusals, TTLs) are correctness controls that
 require in-process TCB behaviour or malformed trusted configuration to trigger;
 the first three are reachable from ordinary untrusted provider data.
 
+## Boundary completeness
+
+Round-7 hardening closes three cases where a Round-6 fix was applied at one entry
+point but a second path to the same trusted operation was left open:
+
+- **`step()` validates by construction.** `run()` validated the action, but
+  `step()` is the public, history-writing boundary. It now validates the proposal
+  type and the action (size, unicode, canonical form) BEFORE the budget check, so
+  a malformed action never enters trusted history, not even via a
+  `BUDGET_EXHAUSTED` result, and only a redacted stand-in is retained.
+- **One parse path for model output.** Proposals and the completion signal both
+  pass a single `parse_model_output` gate (size + utf-8 first). The separate
+  `_signals_done` parser is gone, so an oversized or malformed-unicode
+  `{"done": true}` can no longer be accepted as completion after the proposal
+  path rejected it.
+- **Strict provider decoding and cleanup.** The live transport decodes with
+  strict utf-8 (no `errors="replace"` silently repairing malformed bytes), rejects
+  a response that is not a JSON object or whose `response` field is not an exact
+  string (`ProviderProtocolError`), and reads the response inside a context
+  manager so the connection closes on every exit path.
+
 ## Terminal state is honest
 
 A run that fails does not report success. `RunRecord.stop_reason` says why a run
@@ -368,7 +389,7 @@ attacks.
 - `capcore/adapters.py` - `OllamaModel` (a real local LLM as an untrusted
   `ModelClient`), `ScriptedModel`, proposal parsing.
 - `capcore/MODEL.md` - semantics, test regime, mutation results, open decisions.
-- `scripts/mutation_check.py` - reintroduces 58 known defects; asserts the suite
+- `scripts/mutation_check.py` - reintroduces 61 known defects; asserts the suite
   catches each.
 - `scripts/demo_live.py` - a real local LLM driven through the full trusted loop.
 - `scripts/demo_live_m3.py` - a real secret over real HTTPS, through the broker.
