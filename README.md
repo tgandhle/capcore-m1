@@ -33,7 +33,7 @@ Three layers, each with its own trust boundary:
 "Single-process trust model" is load-bearing, not a hedge. See
 [Trust model](#trust-model).
 
-258 tests pass. `python scripts/mutation_check.py` reintroduces 61 known defects
+268 tests pass. `python scripts/mutation_check.py` reintroduces 68 known defects
 one at a time and asserts the suite catches every one (it mutates a temporary
 copy, never your working tree). CI runs Python 3.11-3.13 on Ubuntu and Windows.
 
@@ -347,6 +347,31 @@ point but a second path to the same trusted operation was left open:
   string (`ProviderProtocolError`), and reads the response inside a context
   manager so the connection closes on every exit path.
 
+## Untrusted-transport and configuration-integrity hardening
+
+Round-8 hardening closes five issues, only the first reachable from an untrusted
+remote service:
+
+- **The credentialed HTTP transport is bounded.** The live transport streams,
+  never reads the response body (the tool uses only the status), and closes the
+  response via a context manager. A hostile allowed endpoint can no longer force
+  unbounded memory allocation in the credentialed path. (High, remote-reachable.)
+- **Model-output parsing is total.** `parse_model_output` never raises: a
+  non-string, oversized, or otherwise malformed input becomes a typed INVALID
+  result instead of an escaping exception.
+- **M1 classification survives budget exhaustion.** The action-budget gate runs
+  AFTER authorization, so an out-of-scope proposal is DENIED, not
+  BUDGET_EXHAUSTED, even when the budget is spent.
+- **Sealing seals the whole configuration.** `seal_configuration()` freezes the
+  catalog, the tool policy, AND credential issuance. `grant_tool` and
+  `issue_credential` are refused after sealing (`seal_catalog()` remains as a
+  deprecated alias). "Sealed" means sealed, not "catalog frozen, policy still
+  mutable."
+- **An injected vault must share the broker clock.** The broker no longer
+  rewrites an injected vault's clock (which created a clock-domain split where a
+  credential could outlive its TTL); it requires clock identity and refuses a
+  mismatch.
+
 ## Terminal state is honest
 
 A run that fails does not report success. `RunRecord.stop_reason` says why a run
@@ -389,7 +414,7 @@ attacks.
 - `capcore/adapters.py` - `OllamaModel` (a real local LLM as an untrusted
   `ModelClient`), `ScriptedModel`, proposal parsing.
 - `capcore/MODEL.md` - semantics, test regime, mutation results, open decisions.
-- `scripts/mutation_check.py` - reintroduces 61 known defects; asserts the suite
+- `scripts/mutation_check.py` - reintroduces 68 known defects; asserts the suite
   catches each.
 - `scripts/demo_live.py` - a real local LLM driven through the full trusted loop.
 - `scripts/demo_live_m3.py` - a real secret over real HTTPS, through the broker.

@@ -94,6 +94,17 @@ MUTATIONS = [
     # The unified parse gate must reject oversized text for ALL outcomes,
     # including completion. Removing the size check lets an oversized {"done"}
     # through as FINISHED.
+    # The parser must be total: a non-str input must return INVALID, not raise.
+    ("parse_model_output_non_string_raises",
+     "    if type(text) is not str:\n        return ParsedModelOutput(ParsedOutputKind.INVALID)",
+     "    if False:\n        return ParsedModelOutput(ParsedOutputKind.INVALID)",
+     "capcore/adapters.py"),
+    # A proposal-construction failure (e.g. oversized tool id) must become INVALID,
+    # not escape as an exception.
+    ("parse_model_output_construction_raises",
+     "    except Exception:\n        return ParsedModelOutput(ParsedOutputKind.INVALID)\n    return ParsedModelOutput(ParsedOutputKind.PROPOSAL, proposal)",
+     "    except Exception:\n        raise  # BUG: let construction errors escape\n    return ParsedModelOutput(ParsedOutputKind.PROPOSAL, proposal)",
+     "capcore/adapters.py"),
     ("parse_model_output_size_unbounded",
      "    if n > MAX_GENERATED_MODEL_TEXT_BYTES:\n        return ParsedModelOutput(ParsedOutputKind.TOO_LARGE)",
      "    if False:\n        return ParsedModelOutput(ParsedOutputKind.TOO_LARGE)",
@@ -209,8 +220,14 @@ MUTATIONS = [
     # step-level check lets a raw malformed action into trusted history via the
     # public step() entry point.
     ("step_retains_invalid_proposal_in_history",
-     "        if not valid_proposal(action):\n            record.state = RunState.FAILED\n            record.stop_reason = StopReason.MODEL_ERROR\n            res = StepResult(StepOutcome.MALFORMED_PROPOSAL,\n                             _redacted_action(action),\n                             audit_reason=\"model proposal was malformed or exceeded size limits\")\n            record.history.append(res)\n            return res\n\n        # 1. Budget.",
-     "        # 1. Budget.",
+     "        if not valid_proposal(action):\n            record.state = RunState.FAILED\n            record.stop_reason = StopReason.MODEL_ERROR",
+     "        if False:  # BUG: let a malformed action into history\n            record.state = RunState.FAILED\n            record.stop_reason = StopReason.MODEL_ERROR",
+     "capcore/runtime.py"),
+    # M1 classification must survive budget exhaustion. Moving the budget gate
+    # BEFORE the DENY/APPROVAL returns re-hides denials as BUDGET_EXHAUSTED.
+    ("budget_gate_disabled",
+     "        # 2. Budget gate, AFTER M1 classification. Only an ALLOWed action that\n        #    would actually execute is subject to the action budget; a denial or\n        #    approval has already returned above with its honest classification.\n        if record.steps_taken >= self.budget.max_actions:",
+     "        # 2. Budget gate.\n        if False:  # BUG: budget gate disabled  # was: steps_taken >= max_actions",
      "capcore/runtime.py"),
     ("run_retains_invalid_proposal_in_history",
      "                if not valid_proposal(result.proposal.action):",
@@ -318,9 +335,20 @@ MUTATIONS = [
     # swap inherit the authorization.
     # Mint must require a sealed catalog. Removing the check lets execution
     # proceed against a mutable catalog.
+    # grant_tool must be refused after seal_configuration(). Removing the guard
+    # lets policy be mutated after sealing.
+    ("grant_after_seal_allowed",
+     "        if self._config_sealed:\n            raise CatalogError(\"configuration is sealed; no grants after seal\")",
+     "        if False:\n            raise CatalogError(\"configuration is sealed; no grants after seal\")",
+     "capcore/broker.py"),
+    # issue_credential must be refused after seal.
+    ("issue_after_seal_allowed",
+     "        if self._config_sealed:\n            raise CatalogError(\"configuration is sealed; no credential issuance after seal\")",
+     "        if False:\n            raise CatalogError(\"configuration is sealed; no credential issuance after seal\")",
+     "capcore/broker.py"),
     ("mint_allows_unsealed_catalog",
-     "        if not self._catalog.is_sealed:\n            self._record(\"-\", None, action, False, \"catalog not sealed\")\n            raise MintRefused(MintRefusal.CATALOG_NOT_SEALED, \"catalog is not sealed\")",
-     "        if False:\n            self._record(\"-\", None, action, False, \"catalog not sealed\")\n            raise MintRefused(MintRefusal.CATALOG_NOT_SEALED, \"catalog is not sealed\")",
+     "        if not self._config_sealed:\n            self._record(\"-\", None, action, False, \"configuration not sealed\")\n            raise MintRefused(MintRefusal.CATALOG_NOT_SEALED, \"configuration is not sealed\")",
+     "        if False:\n            self._record(\"-\", None, action, False, \"configuration not sealed\")\n            raise MintRefused(MintRefusal.CATALOG_NOT_SEALED, \"configuration is not sealed\")",
      "capcore/broker.py"),
     # Sealing must actually block registration. If seal() is a no-op, the
     # lifecycle guarantee is void.
@@ -331,6 +359,12 @@ MUTATIONS = [
     ("redemption_ignores_tool_generation",
      "            if reg is None or gen != rec.tool_generation:",
      "            if reg is None:  # BUG: same-version swap inherits authorization",
+     "capcore/broker.py"),
+    # An injected vault must share the broker clock. Removing the identity check
+    # reintroduces the clock-domain split (rewriting or ignoring the mismatch).
+    ("injected_vault_clock_not_checked",
+     "            if vault.clock is not self._clock:\n                raise ValueError(",
+     "            if False:\n                raise ValueError(",
      "capcore/broker.py"),
     ("credential_issue_time_not_stamped",
      "            issued_at=self._clock.now(),",
@@ -370,6 +404,12 @@ MUTATIONS = [
     # --- M3 destination policy (target capcore/httptool.py) ---
     # The URL is where a real credential is SENT. https-only is what keeps the
     # Authorization header off a cleartext wire.
+    # The credentialed transport must stream and not buffer the body. Reverting to
+    # a buffered read reintroduces the unbounded-memory defect.
+    ("real_transport_buffers_body",
+     "    with requests.request(method, url, headers=headers, timeout=30,\n                          allow_redirects=False, stream=True) as response:\n        return {\"status\": response.status_code}",
+     "    response = requests.request(method, url, headers=headers, timeout=30,\n                          allow_redirects=False)\n    return {\"status\": response.status_code, \"body\": response.text}",
+     "capcore/httptool.py"),
     ("httptool_allows_any_scheme",
      "    if scheme not in ALLOWED_SCHEMES:",
      "    if False:  # BUG: send credentials over any scheme",

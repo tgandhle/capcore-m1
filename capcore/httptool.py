@@ -152,15 +152,25 @@ class MockTransport:
 def real_requests_transport(method: str, url: str, headers: dict) -> dict:
     """Live transport using requests. Imported lazily; only used by the demo.
 
-    allow_redirects=False is load-bearing, not a default worth inheriting: a 3xx
-    from the pinned host would otherwise re-send the Authorization header to an
-    attacker-chosen Location, defeating destination pinning entirely. A redirect
-    is a new destination and needs its own authorization.
+    Two load-bearing properties:
+
+    1. allow_redirects=False: a 3xx from the pinned host would otherwise re-send
+       the Authorization header to an attacker-chosen Location, defeating
+       destination pinning. A redirect is a new destination and needs its own
+       authorization.
+
+    2. stream=True + context manager + status-only return: the credentialed tool
+       (HttpTool.execute_with_credential) uses ONLY the status code and discards
+       the body. Buffering the body (resp.text / resp.content) would let a hostile
+       or compromised allowed endpoint force unbounded memory allocation in the
+       credentialed path for no benefit. So the body is never read, the response
+       is closed via a context manager on every exit path, and only the status is
+       returned.
     """
     import requests
-    resp = requests.request(method, url, headers=headers, timeout=30,
-                            allow_redirects=False)
-    return {"status": resp.status_code, "body": resp.text}
+    with requests.request(method, url, headers=headers, timeout=30,
+                          allow_redirects=False, stream=True) as response:
+        return {"status": response.status_code}
 
 
 class HttpTool:

@@ -81,7 +81,6 @@ def build_broker(monitor, plain=None, cred=None, grant_plain=True,
         adapter=cred or CredRecorder(), version="1", credential_id="cred-1"))
     if grant_plain:
         broker.grant_tool("plain-read", "acme/records")
-        broker.seal_catalog()
     if grant_cred:
         broker.grant_tool("cred-read", "acme/records")
     broker.seal_catalog()

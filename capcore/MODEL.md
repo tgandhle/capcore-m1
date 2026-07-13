@@ -130,14 +130,13 @@ Six defects were found in later review and are now fixed and mutation-tested in
     so a malformed policy fails monitor construction rather than silently
     disabling a mandatory deny.
 
-Note on the mutation runner: the 13 defects above, plus two mutations covering
-the principal-binding and run-binding enforcement added with the identity-binding
-feature, are all individually caught by the suite (15 mutations total). The runner
-suite. The runner (`scripts/mutation_check.py`) uses a fresh isolated temp copy
-per mutation, disables bytecode writing, isolates Hypothesis storage, and applies
-a per-mutation timeout (a timeout counts as a harness error, not a caught
-mutation). An earlier runner reused one temp dir and could stall; this one runs
-to completion in about two minutes.
+Note on the mutation runner (`scripts/mutation_check.py`): it reintroduces the
+full current set of documented defects (68 as of review round 8), each into a
+fresh isolated temp copy, and asserts the suite catches every one. It disables
+bytecode writing, isolates Hypothesis storage, and applies a per-mutation timeout
+(a timeout is a harness error, not a caught mutation). `scripts/check_stale.py`
+is a fast companion that verifies every mutation anchor still matches its source
+exactly once, without running any tests; CI runs it as a pre-gate.
 
 ## Status and open decisions
 
@@ -374,7 +373,7 @@ demonstrating real containment.
 ```
 pip install -e ".[test]"
 python -m pytest
-python scripts/mutation_check.py      # all 61 mutations must be caught
+python scripts/mutation_check.py      # all 68 mutations must be caught
 
 # live demos (local, not part of CI):
 pip install -e ".[live]"

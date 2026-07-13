@@ -75,6 +75,11 @@ def parse_model_output(text: str) -> ParsedModelOutput:
     rejected. Order: encodability -> size -> JSON shape -> done vs proposal.
     """
     from capcore import utf8_length, MAX_GENERATED_MODEL_TEXT_BYTES
+    # TOTAL function: never raise, always a typed outcome. A non-str input (a
+    # provider adapter bug, a fixture, a hostile caller) is INVALID, not an
+    # AttributeError escaping the parser.
+    if type(text) is not str:
+        return ParsedModelOutput(ParsedOutputKind.INVALID)
     if not text:
         return ParsedModelOutput(ParsedOutputKind.INVALID)
     n = utf8_length(text)
@@ -105,11 +110,17 @@ def parse_model_output(text: str) -> ParsedModelOutput:
         return ParsedModelOutput(ParsedOutputKind.INVALID)
     if not isinstance(tool, str) or not tool:
         return ParsedModelOutput(ParsedOutputKind.INVALID)
-    return ParsedModelOutput(
-        ParsedOutputKind.PROPOSAL,
-        ExecutionProposal(action=Proposal(resource=resource, verb=verb),
-                          tool_registration_id=tool),
-    )
+    # ExecutionProposal.__post_init__ enforces exact types and size limits and
+    # RAISES on violation (e.g. an oversized tool id). In a TOTAL parser that must
+    # become a typed INVALID, not an escaping exception.
+    try:
+        proposal = ExecutionProposal(
+            action=Proposal(resource=resource, verb=verb),
+            tool_registration_id=tool,
+        )
+    except Exception:
+        return ParsedModelOutput(ParsedOutputKind.INVALID)
+    return ParsedModelOutput(ParsedOutputKind.PROPOSAL, proposal)
 
 
 def parse_proposal(text: str) -> Optional[ExecutionProposal]:

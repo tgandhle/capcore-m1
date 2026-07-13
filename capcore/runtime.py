@@ -572,15 +572,11 @@ class ExecutionEngine:
             record.history.append(res)
             return res
 
-        # 1. Budget.
-        if record.steps_taken >= self.budget.max_actions:
-            record.state = RunState.ABORTED
-            res = StepResult(StepOutcome.BUDGET_EXHAUSTED, action,
-                             audit_reason="run budget exhausted")
-            record.history.append(res)
-            return res
-
-        # 2. Propose-time authorization (control flow + audit).
+        # 1. Propose-time authorization (control flow + audit) FIRST. M1's
+        #    classification (DENY / REQUIRE_APPROVAL) must survive budget
+        #    exhaustion: an out-of-scope proposal is DENIED, not BUDGET_EXHAUSTED,
+        #    even when the action budget is spent. So the budget gate comes AFTER
+        #    the DENY/APPROVAL returns below, not before authorization.
         first = self._authorize(record.ctx, action)
 
         # Budget accounting for DENIED / APPROVAL happens here ONLY when the run
@@ -599,6 +595,16 @@ class ExecutionEngine:
         if first.verdict == Verdict.REQUIRE_APPROVAL:
             res = StepResult(StepOutcome.APPROVAL, action,
                              audit_reason=first.audit_reason)
+            record.history.append(res)
+            return res
+
+        # 2. Budget gate, AFTER M1 classification. Only an ALLOWed action that
+        #    would actually execute is subject to the action budget; a denial or
+        #    approval has already returned above with its honest classification.
+        if record.steps_taken >= self.budget.max_actions:
+            record.state = RunState.ABORTED
+            res = StepResult(StepOutcome.BUDGET_EXHAUSTED, action,
+                             audit_reason="run budget exhausted")
             record.history.append(res)
             return res
 

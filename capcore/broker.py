@@ -362,6 +362,13 @@ class CredentialVault:
         # both deliver the secret. Same reasoning as the pending-store lock.
         self._lock = threading.Lock()
 
+    @property
+    def clock(self) -> Clock:
+        """The vault's trusted clock. The broker requires an injected vault to
+        already use the broker's clock object (identity), so issue-time and TTL
+        are measured against one clock domain."""
+        return self._clock
+
     def issue(self, cred: Credential) -> str:
         if cred.id in self._creds:
             raise CredentialError(f"duplicate credential id: {cred.id}")
@@ -900,15 +907,30 @@ class TrustedExecutionBroker:
         self._monitor = monitor
         self._catalog = catalog or ToolCatalog()
         self._policy = policy or ToolPolicy()      # deny-by-default when empty
-        # The vault stamps credential issue-time from the same trusted clock, so a
-        # supplied vault must share it. A caller-supplied vault with a different
-        # clock would reintroduce clock divergence, so we hand it ours.
-        self._vault = vault or CredentialVault(self._clock)
+        # The vault stamps credential issue-time from the trusted clock. A
+        # supplied vault MUST already use the broker's clock object. Rewriting its
+        # clock (the old behaviour) silently created a clock-domain split:
+        # credentials issued under the vault's ORIGINAL clock kept their old
+        # issued_at, so a TTL measured against the broker's clock could be wrong
+        # (a credential outliving its TTL, or expiring early). Require identity and
+        # refuse divergence rather than paper over it.
         if vault is not None:
-            self._vault._clock = self._clock
+            if vault.clock is not self._clock:
+                raise ValueError(
+                    "injected credential vault must use the broker's clock object; "
+                    "construct the vault with the same clock, or let the broker own it"
+                )
+            self._vault = vault
+        else:
+            self._vault = CredentialVault(self._clock)
         self._pending = PendingAuthorizationStore()
         self._action_ttl = action_ttl_seconds
         self.audit: list[ReleaseAudit] = []
+        # Broker-level configuration seal. seal_configuration() freezes the
+        # catalog AND the tool policy AND credential issuance, so "sealed" means
+        # the whole execution configuration is immutable, not just the executor
+        # registry. Minting requires a sealed configuration.
+        self._config_sealed = False
 
     @property
     def monitor(self) -> ReferenceMonitor:
@@ -920,6 +942,8 @@ class TrustedExecutionBroker:
     # -- wiring (trusted setup) --------------------------------------------- #
 
     def issue_credential(self, cred: Credential) -> str:
+        if self._config_sealed:
+            raise CatalogError("configuration is sealed; no credential issuance after seal")
         return self._vault.issue(cred)
 
     def register_tool(self, reg: ToolRegistration) -> str:
@@ -931,17 +955,41 @@ class TrustedExecutionBroker:
         """Authorize a registration to serve actions under `scope`.
 
         Required: registering a tool does NOT authorize it. Deny-by-default.
+        Refused after seal_configuration(): a policy grant is execution
+        configuration and must be frozen along with the catalog.
         """
+        if self._config_sealed:
+            raise CatalogError("configuration is sealed; no grants after seal")
         if self._catalog.resolve(registration_id) is None:
             raise CatalogError("cannot grant an unregistered tool")
         self._policy.grant(registration_id, scope)
 
-    def seal_catalog(self) -> None:
-        """Seal the tool catalog. Required before any execution: the broker
-        refuses to mint against an unsealed catalog, so the production lifecycle
-        (register -> grant -> seal -> execute) is explicit and configuration state
-        is visible, not silently defaulted."""
+    def seal_configuration(self) -> None:
+        """Freeze the entire execution configuration: catalog, tool policy, and
+        credential issuance. After this, register_tool, grant_tool, tool
+        replacement, and issue_credential are all refused.
+
+        This is the honest seal: "sealed" means the whole configuration is
+        immutable, not just the executor registry. The broker refuses to mint
+        against an unsealed configuration, so the lifecycle
+        (register -> grant -> issue -> seal -> execute) is explicit and the
+        configuration state is visible, never silently mutable trusted state.
+        """
         self._catalog.seal()
+        self._config_sealed = True
+
+    def seal_catalog(self) -> None:
+        """Deprecated alias for seal_configuration().
+
+        Kept so existing setup code keeps working. New code should call
+        seal_configuration(), which makes explicit that policy and credential
+        issuance are frozen too, not only the catalog.
+        """
+        self.seal_configuration()
+
+    @property
+    def is_configuration_sealed(self) -> bool:
+        return self._config_sealed
 
     @property
     def catalog(self) -> ToolCatalog:
@@ -995,11 +1043,12 @@ class TrustedExecutionBroker:
             self._record("-", None, action, False, "action is not authorized")
             raise MintRefused(MintRefusal.ACTION_NOT_AUTHORIZED, "action is not authorized")
 
-        # 1b. The catalog must be sealed before any execution. An unsealed
-        #     catalog is a configuration error, not a silent default.
-        if not self._catalog.is_sealed:
-            self._record("-", None, action, False, "catalog not sealed")
-            raise MintRefused(MintRefusal.CATALOG_NOT_SEALED, "catalog is not sealed")
+        # 1b. The full configuration must be sealed before any execution. An
+        #     unsealed configuration is a configuration error, not a silent
+        #     default. seal_configuration() freezes catalog, policy, and issuance.
+        if not self._config_sealed:
+            self._record("-", None, action, False, "configuration not sealed")
+            raise MintRefused(MintRefusal.CATALOG_NOT_SEALED, "configuration is not sealed")
 
         # 2. The executor must exist, read ATOMICALLY (registration + generation
         #    from one locked catalog state; never two split reads on a security

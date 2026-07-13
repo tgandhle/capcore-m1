@@ -12,9 +12,9 @@ collection-error/timeout-as-harness-error); and self-tests for the harness in
 `capcore/tests/test_mutation_harness.py`.
 
 ONGOING CONVENTION (not a separate task, just a habit): selectors are declared on
-only 3 of 61 mutations so far. A mutation without selectors falls back to the full
+only 3 of 68 mutations so far. A mutation without selectors falls back to the full
 suite in focused mode (safe, just slower). When adding a NEW mutation, give it a
-selector while the relevant test is fresh; back-filling the existing 46 is
+selector while the relevant test is fresh; back-filling the existing 65 is
 low-value grunt work and a wrong selector is worse than none, so let them accrue
 rather than bulk-adding.
 
