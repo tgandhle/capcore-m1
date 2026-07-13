@@ -44,6 +44,35 @@ MAX_RESOURCE_BYTES = 4 * 1024      # whole resource path
 MAX_SEGMENT_BYTES = 255           # one path segment
 MAX_VERB_BYTES = 64               # verb
 
+# Limits on UNTRUSTED provider output, distinct from the per-field limits above.
+# A remote provider can impose memory/parsing cost with a large response even
+# when the eventual proposal FIELDS are small, so the raw text is bounded before
+# parsing. Two separate limits: the whole HTTP body (JSON metadata + generated
+# text) and the generated-text field within it.
+MAX_PROVIDER_HTTP_BODY_BYTES = 1 * 1024 * 1024   # 1 MiB raw HTTP body
+MAX_GENERATED_MODEL_TEXT_BYTES = 256 * 1024      # 256 KiB of generated text
+
+
+def utf8_length(value: str) -> "int | None":
+    """The utf-8 byte length of `value`, or None if it cannot be encoded.
+
+    FAIL-CLOSED helper for every untrusted-text boundary. A lone surrogate
+    (e.g. "\\ud800") is a valid Python str and JSON decoders accept it, but
+    `.encode("utf-8")` RAISES UnicodeEncodeError on it. Calling `.encode` directly
+    at a validation boundary therefore turns malformed input into an EXCEPTION,
+    which violates M1's contract that a malformed proposal deterministically
+    denies (valid | invalid, never a third 'raised' outcome).
+
+    Returning None lets the caller treat un-encodable text as invalid, so the
+    boundary stays two-valued. Use this instead of a bare `.encode("utf-8")`
+    anywhere the text can originate from model output, tool output, provider
+    responses, resources, verbs, registration ids, or audit fields.
+    """
+    try:
+        return len(value.encode("utf-8"))
+    except UnicodeEncodeError:
+        return None
+
 
 class ResourceError(ValueError):
     """Raised when a resource path or scope is not canonical/valid."""
@@ -78,7 +107,10 @@ def validate_resource(path: str) -> tuple[str, ...]:
     # amplifies across validation, hashing, audit, trusted history, and every
     # subsequent ModelView and prompt. Bound by BYTES, not characters, since a
     # multibyte character can be several bytes.
-    if len(path.encode("utf-8")) > MAX_RESOURCE_BYTES:
+    _rlen = utf8_length(path)
+    if _rlen is None:
+        raise ResourceError("resource is not valid utf-8")
+    if _rlen > MAX_RESOURCE_BYTES:
         raise ResourceError("resource exceeds maximum length")
     if "\\" in path:
         raise ResourceError("backslash not allowed in resource path")
@@ -94,7 +126,10 @@ def validate_resource(path: str) -> tuple[str, ...]:
     for s in raw:
         if s == "":
             raise ResourceError("empty path segment not allowed")
-        if len(s.encode("utf-8")) > MAX_SEGMENT_BYTES:
+        _slen = utf8_length(s)
+        if _slen is None:
+            raise ResourceError("path segment is not valid utf-8")
+        if _slen > MAX_SEGMENT_BYTES:
             raise ResourceError("path segment exceeds maximum length")
         if s in (".", ".."):
             raise ResourceError("'.' and '..' segments not allowed (path traversal)")
@@ -244,6 +279,11 @@ class Proposal:
     verb: str
 
 
+def _verb_ok(verb: str) -> bool:
+    n = utf8_length(verb)
+    return n is not None and 0 < n <= MAX_VERB_BYTES
+
+
 def valid_proposal(obj) -> bool:
     """A well-formed proposal has a non-empty string verb and a resource that is
     a valid canonical path (no traversal, no encoded separators, no empties).
@@ -260,7 +300,7 @@ def valid_proposal(obj) -> bool:
     # boundary already enforces; applied here for consistency.
     return (
         type(obj) is Proposal
-        and type(obj.verb) is str and 0 < len(obj.verb.encode("utf-8")) <= MAX_VERB_BYTES
+        and type(obj.verb) is str and _verb_ok(obj.verb)
         and type(obj.resource) is str
         and is_valid_resource(obj.resource)
     )

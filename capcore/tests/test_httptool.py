@@ -35,6 +35,7 @@ def wired(mon, transport, url="https://api.example.com/data"):
         adapter=HttpTool(url, transport), version="1", credential_id="cred-1",
     ))
     broker.grant_tool("http-1", "acme/records")
+    broker.seal_catalog()
     return broker
 
 

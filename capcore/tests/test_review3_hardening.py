@@ -72,6 +72,7 @@ def _broker_with_plain(tool_fn, grant=True):
     b.register_tool(ToolRegistration("t", "read", ToolKind.PLAIN, tool_fn, "1"))
     if grant:
         b.grant_tool("t", "acme/api")
+        b.seal_catalog()
     return b, ctx
 
 
@@ -105,6 +106,7 @@ def test_model_cannot_mutate_trusted_history_through_tool_result():
     b.register_tool(ToolRegistration("t", "read", ToolKind.PLAIN,
                                      lambda a: "result-string", "1"))
     b.grant_tool("t", "acme/api")
+    b.seal_catalog()
     engine = ExecutionEngine(mon, b, Budget(3))
 
     record = engine.run(ctx, ScriptedModel([ep()]))
@@ -199,6 +201,7 @@ def test_same_version_tool_replacement_is_refused():
     b.register_tool(ToolRegistration("t", "read", ToolKind.PLAIN,
                                      lambda a: legit.append(1) or "legit", "1"))
     b.grant_tool("t", "acme/api")
+    b.seal_catalog()
     action_id = b.register_authorized_execution(ctx, ep())
 
     # Re-register the SAME id and SAME version with a different adapter. However
@@ -267,6 +270,7 @@ def test_single_use_credential_delivered_at_most_once_under_concurrency():
     b.register_tool(ToolRegistration("t", "read", ToolKind.CREDENTIALED,
                                      SlowRec(), "1", "cred-1"))
     b.grant_tool("t", "acme/api")
+    b.seal_catalog()
 
     aids = [b.register_authorized_execution(ctx, ep(f"acme/api/x{i}"))
             for i in range(8)]
@@ -295,6 +299,7 @@ def test_one_action_id_executes_at_most_once_under_concurrency():
     b.register_tool(ToolRegistration("t", "read", ToolKind.PLAIN,
                                      lambda a: runs.append(1) or "ok", "1"))
     b.grant_tool("t", "acme/api")
+    b.seal_catalog()
     action_id = b.register_authorized_execution(ctx, ep())
     barrier = threading.Barrier(8)
 
@@ -357,6 +362,7 @@ def test_credential_without_capability_id_still_delivers():
     b.register_tool(ToolRegistration("t", "read", ToolKind.CREDENTIALED,
                                      Rec(), "1", "cred-1"))
     b.grant_tool("t", "acme/api")
+    b.seal_catalog()
     action_id = b.register_authorized_execution(ctx, ep())
     result = b.redeem_and_execute(action_id)
 

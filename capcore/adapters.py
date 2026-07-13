@@ -70,6 +70,14 @@ def parse_proposal(text: str) -> Optional[ExecutionProposal]:
     """
     if not text:
         return None
+    # Bound the raw text BEFORE parsing. A provider (or a replayed/fixture
+    # response) can send a large blob whose eventual proposal fields are small;
+    # parsing it still costs memory and CPU. Reject oversized input outright. This
+    # is a second line of defense; the live transport also bounds the HTTP body.
+    from capcore import utf8_length, MAX_GENERATED_MODEL_TEXT_BYTES
+    n = utf8_length(text)
+    if n is None or n > MAX_GENERATED_MODEL_TEXT_BYTES:
+        return None
     # find the first {...} JSON object in the text
     match = re.search(r"\{.*?\}", text, re.DOTALL)
     if not match:
@@ -149,7 +157,10 @@ class OllamaModel:
 
     def _call(self, prompt: str) -> str:
         # imported lazily so the parsing logic has no hard dependency on requests
+        import json as _json
         import requests
+        from capcore import MAX_PROVIDER_HTTP_BODY_BYTES
+        from capcore.httptool import bounded_read
         resp = requests.post(
             self.url,
             json={
@@ -160,9 +171,13 @@ class OllamaModel:
                 "options": {"temperature": 0},  # pin for reproducibility
             },
             timeout=self.timeout,
+            stream=True,   # do NOT let requests buffer an unbounded body
         )
         resp.raise_for_status()
-        return resp.json().get("response", "")
+        # Bound the HTTP body by bytes ACTUALLY READ (a hostile provider can lie
+        # about Content-Length). Parse JSON only after the bounded read.
+        raw = bounded_read(resp, MAX_PROVIDER_HTTP_BODY_BYTES)
+        return _json.loads(raw.decode("utf-8", errors="replace")).get("response", "")
 
     def next_proposal(self, view: ModelView) -> ModelResult:
         """Return a TYPED result. A provider failure is not a completion.

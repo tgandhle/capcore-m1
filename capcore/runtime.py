@@ -32,8 +32,8 @@ from capcore import (
     Verdict, Decision,
 )
 from capcore.broker import (
-    AuthorizationError, ExecutionProposal, SanitizedToolResult,
-    TrustedExecutionBroker,
+    AuthorizationError, ExecutionProposal, MintRefusal, MintRefused,
+    SanitizedToolResult, TrustedExecutionBroker,
 )
 
 
@@ -85,6 +85,51 @@ class StepOutcome(Enum):
     INTEGRITY_REFUSED = "integrity_refused"      # digest/tool-generation mismatch
     AUTHORIZATION_REFUSED = "authorization_refused"  # unredeemable pending auth
     #                     (unknown id, expired, already redeemed): NOT a revoke race
+    MALFORMED_PROPOSAL = "malformed_proposal"    # the model produced an invalid
+    #                     action (bad types, oversized, invalid resource): a model
+    #                     error, NOT a policy denial. Raw fields are NOT retained.
+
+
+def _redacted_action(action) -> "Proposal":
+    """A safe, bounded stand-in for a malformed action, for trusted history.
+
+    NEVER retain the raw untrusted fields of an invalid proposal: they may be
+    megabytes, malformed unicode, or otherwise hostile, and they would flow into
+    ModelView and subsequent prompts. This returns a small fixed Proposal so
+    history records THAT a malformed action occurred without storing WHAT it was.
+    The detail belongs in a bounded audit_reason string, not in the retained
+    action.
+    """
+    from capcore import Proposal
+    return Proposal("<redacted>", "<redacted>")
+
+
+def _map_mint_refusal(code: "MintRefusal") -> "StepOutcome":
+    """Map a typed MintRefusal code to a StepOutcome. Never REVOKED_RACE.
+
+    A mint refusal means the broker declined to authorize an execution: the tool
+    is unknown/unauthorized, the verb mismatched, the action was malformed, the
+    catalog was unsealed, or the id space was exhausted. None of these is a revoke
+    race (an authorization that was valid earlier and lost at live re-auth); each
+    is its own honest outcome.
+    """
+    return {
+        MintRefusal.UNKNOWN_TOOL: StepOutcome.TOOL_NOT_FOUND,
+        MintRefusal.TOOL_NOT_AUTHORIZED: StepOutcome.TOOL_NOT_AUTHORIZED,
+        MintRefusal.TOOL_VERB_MISMATCH: StepOutcome.TOOL_NOT_AUTHORIZED,
+        # The action was authorized at propose-time but the broker's INDEPENDENT
+        # re-authorization at mint denied it: authority was valid at an earlier
+        # trusted check and lost before execution. That is exactly the revoke
+        # race REVOKED_RACE names.
+        MintRefusal.ACTION_NOT_AUTHORIZED: StepOutcome.REVOKED_RACE,
+        MintRefusal.MALFORMED_ACTION: StepOutcome.MALFORMED_PROPOSAL,
+        MintRefusal.NOT_AN_EXECUTION_PROPOSAL: StepOutcome.MALFORMED_PROPOSAL,
+        MintRefusal.ACTION_NOT_UTF8: StepOutcome.MALFORMED_PROPOSAL,
+        # An exhausted id space or an unsealed catalog is an internal/config error,
+        # not a policy or revoke outcome. Neutral authorization refusal.
+        MintRefusal.ACTION_ID_EXHAUSTED: StepOutcome.AUTHORIZATION_REFUSED,
+        MintRefusal.CATALOG_NOT_SEALED: StepOutcome.AUTHORIZATION_REFUSED,
+    }.get(code, StepOutcome.AUTHORIZATION_REFUSED)
 
 
 def _map_refusal(audit_code: str) -> tuple["StepOutcome", str]:
@@ -540,26 +585,24 @@ class ExecutionEngine:
         #    A tool the model named but is not policy-authorized dies here.
         try:
             action_id = self.broker.register_authorized_execution(record.ctx, proposal)
-        except AuthorizationError as e:
-            # The broker refused. A refusal here means NOTHING executed and no
-            # executor was even resolved (unknown/unauthorized tool, verb
-            # mismatch). With count_denied_attempts=False this must NOT consume the
-            # action budget: max_actions is the EXECUTION budget, and nothing ran.
-            # With count_denied_attempts=True, every attempt counts.
+        except MintRefused as e:
+            # The broker refused, with a TYPED code. Classify by code, never by
+            # parsing the message. A refusal here means nothing executed; with
+            # count_denied_attempts=False it does not consume the action budget.
             if self.budget.count_denied_attempts:
                 record.steps_taken += 1
-            reason = str(e)
-            if "unknown tool registration" in reason:
-                outcome = StepOutcome.TOOL_NOT_FOUND
-            elif "not authorized" in reason and "tool" in reason:
-                outcome = StepOutcome.TOOL_NOT_AUTHORIZED
-            elif "verb does not match" in reason:
-                outcome = StepOutcome.TOOL_NOT_AUTHORIZED
-            else:
-                # authorization for the ACTION was lost between propose and mint
-                outcome = StepOutcome.REVOKED_RACE
+            outcome = _map_mint_refusal(e.code)
             res = StepResult(outcome, action,
-                             audit_reason=f"broker refused authorization: {reason}")
+                             audit_reason=f"broker refused mint: {e.code.value}")
+            record.history.append(res)
+            return res
+        except AuthorizationError as e:
+            # A non-typed authorization error (older path or a subclass without a
+            # code). Fail closed to a neutral refusal, NOT a revoke race.
+            if self.budget.count_denied_attempts:
+                record.steps_taken += 1
+            res = StepResult(StepOutcome.AUTHORIZATION_REFUSED, action,
+                             audit_reason=f"broker refused authorization: {e}")
             record.history.append(res)
             return res
 
@@ -668,6 +711,23 @@ class ExecutionEngine:
                 if type(result.proposal) is not ExecutionProposal:
                     record.state = RunState.FAILED
                     record.stop_reason = StopReason.MODEL_ERROR
+                    return record
+                # The ACTION itself must be well-formed (valid types, in-bounds
+                # sizes, valid resource) BEFORE it can enter step() and thus
+                # trusted history / ModelView. An oversized or malformed action is
+                # a MODEL_ERROR (the model produced a bad action), NOT a policy
+                # DENY (which implies a valid action was evaluated). Crucially,
+                # the raw action must not be retained anywhere: we record safe
+                # metadata only and drop the field.
+                from capcore import valid_proposal
+                if not valid_proposal(result.proposal.action):
+                    record.state = RunState.FAILED
+                    record.stop_reason = StopReason.MODEL_ERROR
+                    record.history.append(StepResult(
+                        StepOutcome.MALFORMED_PROPOSAL,
+                        _redacted_action(result.proposal.action),
+                        audit_reason="model proposal was malformed or exceeded size limits",
+                    ))
                     return record
                 # fall through to dispatch below
 

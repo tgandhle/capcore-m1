@@ -81,8 +81,10 @@ def build_broker(monitor, plain=None, cred=None, grant_plain=True,
         adapter=cred or CredRecorder(), version="1", credential_id="cred-1"))
     if grant_plain:
         broker.grant_tool("plain-read", "acme/records")
+        broker.seal_catalog()
     if grant_cred:
         broker.grant_tool("cred-read", "acme/records")
+    broker.seal_catalog()
     return broker
 
 
@@ -200,6 +202,7 @@ def test_registration_verb_must_match_the_proposed_action():
         registration_id="send-only", verb="send", kind=ToolKind.PLAIN,
         adapter=PlainRecorder(), version="1"))
     broker.grant_tool("send-only", "acme/records")
+    broker.seal_catalog()
 
     with pytest.raises(AuthorizationError):
         broker.register_authorized_execution(
@@ -228,6 +231,7 @@ def test_exact_registration_must_be_policy_authorized():
         adapter=sensitive, version="1"))
     # ONLY the benign executor is granted. Both are registered; both serve `read`.
     broker.grant_tool("read-customer-record", "acme/records")
+    broker.seal_catalog()
 
     engine = ExecutionEngine(monitor, broker, Budget(3))
 
@@ -268,6 +272,7 @@ def test_grant_scope_is_enforced():
         registration_id="plain-read", verb="read", kind=ToolKind.PLAIN,
         adapter=tool, version="1"))
     broker.grant_tool("plain-read", "acme/records")     # granted only here
+    broker.seal_catalog()
 
     # inside the grant: fine
     aid = broker.register_authorized_execution(ctx(), ep("acme/records/x"))
@@ -285,6 +290,7 @@ def test_cannot_grant_an_unregistered_tool():
     broker = TrustedExecutionBroker(monitor)
     with pytest.raises(CatalogError):
         broker.grant_tool("never-registered", "acme/records")
+        broker.seal_catalog()
 
 
 # --------------------------------------------------------------------------- #
@@ -404,6 +410,7 @@ def test_expired_action_is_denied():
         registration_id="cred-read", verb="read", kind=ToolKind.CREDENTIALED,
         adapter=cred, version="1", credential_id="cred-1"))
     broker.grant_tool("cred-read", "acme/records")
+    broker.seal_catalog()
 
     action_id = broker.register_authorized_execution(ctx(), ep(tool="cred-read"))
 

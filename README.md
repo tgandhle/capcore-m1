@@ -33,7 +33,7 @@ Three layers, each with its own trust boundary:
 "Single-process trust model" is load-bearing, not a hedge. See
 [Trust model](#trust-model).
 
-207 tests pass. `python scripts/mutation_check.py` reintroduces 49 known defects
+244 tests pass. `python scripts/mutation_check.py` reintroduces 58 known defects
 one at a time and asserts the suite catches every one (it mutates a temporary
 copy, never your working tree). CI runs Python 3.11-3.13 on Ubuntu and Windows.
 
@@ -291,6 +291,41 @@ require in-process (TCB) code to trigger, but the runtime documents proposal dat
 as untrusted and enforces the invariant uniformly. The size limits are the one
 directly reachable from untrusted remote output.
 
+## Malformed-input and lifecycle hardening
+
+Round-6 hardening closes boundary and correctness gaps:
+
+- **Malformed unicode fails closed.** A lone surrogate is a valid Python str that
+  JSON accepts but cannot be utf-8 encoded. Every untrusted-text boundary uses a
+  fail-closed `utf8_length` (returns None instead of raising), so a malformed
+  resource/verb/tool-id/tool-result DENIES deterministically rather than raising,
+  preserving M1's valid|invalid contract. Reachable from remote model output.
+- **Invalid proposals never enter trusted history.** An oversized or malformed
+  action is rejected at the runtime boundary before it can reach `StepResult`,
+  `ModelView`, or the next prompt. It fails as `MODEL_ERROR` (a model error, not a
+  policy DENY) and retains no raw field. Reachable from remote model output.
+- **Raw provider responses are bounded.** `parse_proposal` caps raw text before
+  parsing, and the live transport streams with a `bounded_read` that limits by
+  bytes ACTUALLY READ (not a Content-Length header a hostile provider can lie
+  about). Two limits: HTTP body and generated text. Reachable from remote output.
+- **The tool catalog is read atomically and sealed explicitly.** Mint and redeem
+  read the registration and its generation as one locked `snapshot()`, closing a
+  split-read race. The catalog must be `seal()`-ed before execution
+  (register -> grant -> seal -> execute); the broker refuses to mint against an
+  unsealed catalog, so configuration state is visible, not silently defaulted.
+- **Mint refusals are typed.** The broker raises a `MintRefused` carrying a
+  `MintRefusal` code; the engine maps by code, never by parsing exception text.
+  `REVOKED_RACE` is reserved for a genuine authorization loss between propose and
+  mint; an unknown tool, unsealed catalog, or id exhaustion each map to their own
+  honest outcome.
+- **TTLs reject non-finite and non-numeric values.** `nan`/`inf` (which the old
+  `<= 0` guard let through as "never expires") and `bool` are rejected; only a
+  strictly-positive finite number is a valid TTL.
+
+The last three (catalog, mint refusals, TTLs) are correctness controls that
+require in-process TCB behaviour or malformed trusted configuration to trigger;
+the first three are reachable from ordinary untrusted provider data.
+
 ## Terminal state is honest
 
 A run that fails does not report success. `RunRecord.stop_reason` says why a run
@@ -333,7 +368,7 @@ attacks.
 - `capcore/adapters.py` - `OllamaModel` (a real local LLM as an untrusted
   `ModelClient`), `ScriptedModel`, proposal parsing.
 - `capcore/MODEL.md` - semantics, test regime, mutation results, open decisions.
-- `scripts/mutation_check.py` - reintroduces 49 known defects; asserts the suite
+- `scripts/mutation_check.py` - reintroduces 58 known defects; asserts the suite
   catches each.
 - `scripts/demo_live.py` - a real local LLM driven through the full trusted loop.
 - `scripts/demo_live_m3.py` - a real secret over real HTTPS, through the broker.

@@ -22,6 +22,32 @@ class DestinationError(ValueError):
     pass
 
 
+class ProviderResponseTooLarge(Exception):
+    """A provider response exceeded the maximum permitted body size."""
+    pass
+
+
+def bounded_read(response, max_bytes: int) -> bytes:
+    """Read at most `max_bytes` from a streaming HTTP response, then stop.
+
+    The authoritative limit is the bytes ACTUALLY READ, not a Content-Length
+    header (which a hostile provider can lie about). We stream chunks and stop as
+    soon as the accumulated size would exceed the cap, raising rather than
+    buffering an unbounded body. `response` must expose `iter_content(chunk_size)`
+    (the requests streaming API); a fake with the same shape is enough to test
+    this without a live provider.
+    """
+    buf = bytearray()
+    for chunk in response.iter_content(chunk_size=8192):
+        if not chunk:
+            continue
+        buf.extend(chunk)
+        if len(buf) > max_bytes:
+            raise ProviderResponseTooLarge(
+                f"provider response exceeded {max_bytes} bytes")
+    return bytes(buf)
+
+
 # A credential may only be sent over TLS, to an explicitly named host.
 ALLOWED_SCHEMES = frozenset({"https"})
 DEFAULT_ALLOWED_PORTS = frozenset({443})

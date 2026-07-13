@@ -85,6 +85,7 @@ def recording_broker(monitor, grant=True):
         adapter=lambda a: calls.append(a.resource) or "ok", version="1"))
     if grant:
         broker.grant_tool("tool-read", "acme")
+    broker.seal_catalog()
     return broker, calls
 
 
@@ -417,6 +418,7 @@ def _broker_with_http(monitor, transport, url="https://example.com/api",
         adapter=HttpTool(url, transport), version="1", credential_id="cred-1",
     ))
     broker.grant_tool("http-1", "acme")
+    broker.seal_catalog()
     return broker
 
 
@@ -586,6 +588,7 @@ def test_expired_action_is_denied():
         version="1", credential_id="cred-1",
     ))
     broker.grant_tool("http-1", "acme")
+    broker.seal_catalog()
     ctx = build_ctx()
     proposal = Proposal("acme/api/x", "read")
     action_id = broker.register_authorized_execution(
@@ -669,6 +672,7 @@ def test_plain_tool_executes_without_a_credential():
         adapter=lambda a: ran.append(a.resource) or "plain-ok", version="1",
     ))
     broker.grant_tool("plain-1", "acme")
+    broker.seal_catalog()
     action_id = _mint(broker, monitor, build_ctx(),
                       Proposal("acme/api/x", "read"), tool_reg_id="plain-1")
 

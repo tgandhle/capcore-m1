@@ -61,6 +61,7 @@ def wired_broker(monitor, adapter=None, scope="acme/api", kind=ToolKind.PLAIN,
         b.register_tool(ToolRegistration("t", "read", kind,
                                          adapter or (lambda a: "ok"), "1"))
     b.grant_tool("t", scope)
+    b.seal_catalog()
     return b
 
 
@@ -124,6 +125,7 @@ def test_issued_credential_scope_cannot_be_widened_by_caller():
     b.register_tool(ToolRegistration("t", "read", ToolKind.CREDENTIALED,
                                      Rec(), "1", "c1"))
     b.grant_tool("t", "acme/data")
+    b.seal_catalog()
 
     action_id = b.register_authorized_execution(ctx, ep("acme/data/secret/x"))
     result = b.redeem_and_execute(action_id)
@@ -149,6 +151,7 @@ def test_issued_credential_single_use_cannot_be_reset_by_caller():
     b.register_tool(ToolRegistration("t", "read", ToolKind.CREDENTIALED,
                                      Rec(), "1", "c1"))
     b.grant_tool("t", "acme/data")
+    b.seal_catalog()
 
     a1 = b.register_authorized_execution(ctx, ep("acme/data/x"))
     b.redeem_and_execute(a1)                  # consumes it
@@ -185,6 +188,7 @@ def test_issued_credential_secret_value_cannot_be_swapped_by_caller():
     b.register_tool(ToolRegistration("t", "read", ToolKind.CREDENTIALED,
                                      Rec(), "1", "c1"))
     b.grant_tool("t", "acme/data")
+    b.seal_catalog()
 
     action_id = b.register_authorized_execution(ctx, ep("acme/data/x"))
     b.redeem_and_execute(action_id)
@@ -362,6 +366,7 @@ def test_expired_credential_is_not_reported_as_revocation_race():
     b._catalog._replace_unsafe(ToolRegistration("t", "read", ToolKind.CREDENTIALED,
                                                 Rec(), "1", "c1"))
     b.grant_tool("t", "acme/api")
+    b.seal_catalog()
 
     engine = ExecutionEngine(mon, b, Budget(max_actions=3, max_iterations=3),
                              pre_execute_hook=lambda e, p, r: clock.advance(50.0))

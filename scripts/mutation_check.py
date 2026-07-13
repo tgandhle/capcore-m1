@@ -89,19 +89,38 @@ MUTATIONS = [
     # limit lets a remote model amplify memory/CPU across the whole pipeline.
     # Exact-type at the proposal boundary. isinstance would accept a str subclass
     # that lies via split()/__str__(), diverging authorization from execution.
+    # Raw model text must be bounded before parsing. Removing the cap lets a huge
+    # provider blob through as long as the eventual proposal is small.
+    ("parse_proposal_unbounded",
+     "    n = utf8_length(text)\n    if n is None or n > MAX_GENERATED_MODEL_TEXT_BYTES:\n        return None",
+     "    n = 0  # BUG: skip the raw-text size bound",
+     "capcore/adapters.py"),
+    # The transport must bound by bytes actually read. Removing the check lets an
+    # unbounded body be buffered.
+    ("bounded_read_unbounded",
+     "        if len(buf) > max_bytes:\n            raise ProviderResponseTooLarge(\n                f\"provider response exceeded {max_bytes} bytes\")",
+     "        if False:\n            raise ProviderResponseTooLarge(\n                f\"provider response exceeded {max_bytes} bytes\")",
+     "capcore/httptool.py"),
     ("proposal_accepts_str_subclass_resource",
      "    if type(path) is not str:\n        raise ResourceError(\"resource must be an exact built-in str\")",
      "    if False:\n        raise ResourceError(\"resource must be an exact built-in str\")",
      "capcore/__init__.py",
      ("capcore/tests/test_review5_hardening.py::test_resource_str_subclass_is_rejected",
       "capcore/tests/test_review5_hardening.py::test_validate_resource_directly_rejects_str_subclass")),
+    # utf8_length must fail closed on un-encodable text (lone surrogate). Making
+    # it re-raise instead of returning None turns a malformed proposal into an
+    # exception, violating M1's valid|invalid contract.
+    ("utf8_length_not_fail_closed",
+     "    try:\n        return len(value.encode(\"utf-8\"))\n    except UnicodeEncodeError:\n        return None",
+     "    return len(value.encode(\"utf-8\"))  # BUG: crash on un-encodable text",
+     "capcore/__init__.py"),
     ("proposal_resource_size_unbounded",
-     "    if len(path.encode(\"utf-8\")) > MAX_RESOURCE_BYTES:\n        raise ResourceError(\"resource exceeds maximum length\")",
+     "    if _rlen > MAX_RESOURCE_BYTES:\n        raise ResourceError(\"resource exceeds maximum length\")",
      "    if False:\n        raise ResourceError(\"resource exceeds maximum length\")",
      "capcore/__init__.py",
      ("capcore/tests/test_review5_hardening.py::test_proposal_resource_length_is_bounded",)),
     ("proposal_segment_size_unbounded",
-     "        if len(s.encode(\"utf-8\")) > MAX_SEGMENT_BYTES:\n            raise ResourceError(\"path segment exceeds maximum length\")",
+     "        if _slen > MAX_SEGMENT_BYTES:\n            raise ResourceError(\"path segment exceeds maximum length\")",
      "        if False:\n            raise ResourceError(\"path segment exceeds maximum length\")",
      "capcore/__init__.py",
      ("capcore/tests/test_review5_hardening.py::test_proposal_resource_segment_length_is_bounded",)),
@@ -164,6 +183,13 @@ MUTATIONS = [
      "            else:\n                # ANY outcome outside the explicit algebra fails closed. This is\n                # the whole point: unknown outcomes must not fall through and be\n                # treated as a proposal. Covers a bypassed __post_init__, a future\n                # enum member the loop does not handle, or a corrupted value.\n                record.state = RunState.FAILED\n                record.stop_reason = StopReason.MODEL_ERROR\n                return record",
      "            else:\n                pass  # BUG: unknown outcome falls through to proposal dispatch",
      "capcore/runtime.py"),
+    # An invalid/oversized action must fail closed at the run boundary before it
+    # can enter trusted history. Removing the valid_proposal check lets a raw
+    # malformed action be retained and reach ModelView.
+    ("run_retains_invalid_proposal_in_history",
+     "                if not valid_proposal(result.proposal.action):",
+     "                if False:  # BUG: let a malformed action into history",
+     "capcore/runtime.py"),
     ("run_skips_proposal_type_check",
      "                if type(result.proposal) is not ExecutionProposal:\n                    record.state = RunState.FAILED\n                    record.stop_reason = StopReason.MODEL_ERROR\n                    return record",
      "                if False:\n                    record.state = RunState.FAILED\n                    record.stop_reason = StopReason.MODEL_ERROR\n                    return record",
@@ -183,6 +209,13 @@ MUTATIONS = [
      "                raise ClaimRefused(BrokerRefusal.ACTION_EXPIRED,\n                                   \"authorization expired\")",
      "                raise ClaimRefused(BrokerRefusal.CLAIM_REFUSED,\n                                   \"authorization expired\")  # BUG: generic",
      "capcore/broker.py"),
+    # Mint refusals must be classified by typed code. If the engine string-parses
+    # again (or maps a non-authorization mint refusal to REVOKED_RACE), audit
+    # integrity is lost.
+    ("mint_refusal_not_typed",
+     "        MintRefusal.UNKNOWN_TOOL: StepOutcome.TOOL_NOT_FOUND,",
+     "        MintRefusal.UNKNOWN_TOOL: StepOutcome.REVOKED_RACE,  # BUG: mislabel",
+     "capcore/runtime.py"),
     ("refusal_mislabeled_as_revoke_race",
      "    if audit_code == BrokerRefusal.REAUTHORIZATION_FAILED:\n        return StepOutcome.REVOKED_RACE, \"authorization lost before execution\"",
      "    if True:\n        return StepOutcome.REVOKED_RACE, \"authorization lost before execution\"  # BUG: every refusal a revoke race",
@@ -232,6 +265,12 @@ MUTATIONS = [
      "capcore/broker.py"),
     # A malformed credential scope must fail closed AT ISSUANCE, not blow up
     # mid-action with a secret already in play.
+    # TTLs must reject non-finite values. Removing isfinite lets nan/inf through
+    # as "never expires", silently defeating expiry.
+    ("ttl_accepts_non_finite",
+     "    if not math.isfinite(value):\n        return False",
+     "    if False:\n        return False  # BUG: accept nan/inf TTL",
+     "capcore/broker.py"),
     ("credential_scope_not_validated_at_issue",
      "            raise CredentialError(f\"invalid credential scope: {self.scope!r}\") from exc",
      "            pass  # BUG: swallow an invalid credential scope (fail open)",
@@ -251,6 +290,18 @@ MUTATIONS = [
     # The tool's catalog-owned generation is the authenticity check at redemption.
     # Comparing the caller-supplied version string instead lets a same-version
     # swap inherit the authorization.
+    # Mint must require a sealed catalog. Removing the check lets execution
+    # proceed against a mutable catalog.
+    ("mint_allows_unsealed_catalog",
+     "        if not self._catalog.is_sealed:\n            self._record(\"-\", None, action, False, \"catalog not sealed\")\n            raise MintRefused(MintRefusal.CATALOG_NOT_SEALED, \"catalog is not sealed\")",
+     "        if False:\n            self._record(\"-\", None, action, False, \"catalog not sealed\")\n            raise MintRefused(MintRefusal.CATALOG_NOT_SEALED, \"catalog is not sealed\")",
+     "capcore/broker.py"),
+    # Sealing must actually block registration. If seal() is a no-op, the
+    # lifecycle guarantee is void.
+    ("catalog_seal_is_noop",
+     "        with self._lock:\n            self._sealed = True",
+     "        with self._lock:\n            self._sealed = self._sealed  # BUG: seal does nothing",
+     "capcore/broker.py"),
     ("redemption_ignores_tool_generation",
      "            if reg is None or gen != rec.tool_generation:",
      "            if reg is None:  # BUG: same-version swap inherits authorization",

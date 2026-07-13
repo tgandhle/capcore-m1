@@ -61,6 +61,7 @@ def build_engine(pre_execute_hook=None, budget=8):
             registration_id=f"{verb}-records", verb=verb, kind=ToolKind.PLAIN,
             adapter=fn, version="1"))
         broker.grant_tool(f"{verb}-records", "acme/records")
+    broker.seal_catalog()
     engine = ExecutionEngine(mon, broker, Budget(budget),
                              pre_execute_hook=pre_execute_hook)
     ctx = RunContext(TENANT, PRINCIPAL, RUN)

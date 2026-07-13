@@ -79,6 +79,7 @@ restricted IPC.
 from __future__ import annotations
 
 import hashlib
+import math
 import threading
 import secrets
 import time
@@ -88,11 +89,30 @@ from typing import Optional, Protocol
 
 from capcore import (
     Proposal, ReferenceMonitor, ResourceError, RunContext, Verdict,
-    _covers_safe, scope_covers, valid_proposal, validate_resource,
+    _covers_safe, scope_covers, utf8_length, valid_proposal, validate_resource,
 )
 
 # Bound on the untrusted tool-registration id the model names.
 MAX_TOOL_ID_BYTES = 128
+
+
+def _is_positive_finite_ttl(value) -> bool:
+    """True iff `value` is a strictly-positive finite real TTL.
+
+    Security TTLs must reject:
+      - non-numeric types (str, None-where-a-number-is-required),
+      - bool (a subtle int subclass: True == 1 would silently mean a 1s TTL),
+      - nan (every comparison with nan is False, so `nan <= 0` is False and the
+        old guard let it through as "never expires"),
+      - +/-inf (inf <= 0 is False -> "never expires"; -inf is nonsensical),
+      - zero and negatives.
+    Exact-type check (not isinstance) excludes bool, which IS an int subclass.
+    """
+    if type(value) not in (int, float):
+        return False
+    if not math.isfinite(value):
+        return False
+    return value > 0
 
 
 # --------------------------------------------------------------------------- #
@@ -224,7 +244,10 @@ class ExecutionProposal:
             raise AuthorizationError("execution proposal requires an exact Proposal action")
         if type(self.tool_registration_id) is not str or not self.tool_registration_id:
             raise AuthorizationError("execution proposal requires an exact str tool_registration_id")
-        if len(self.tool_registration_id.encode("utf-8")) > MAX_TOOL_ID_BYTES:
+        _tlen = utf8_length(self.tool_registration_id)
+        if _tlen is None:
+            raise AuthorizationError("tool_registration_id is not valid utf-8")
+        if _tlen > MAX_TOOL_ID_BYTES:
             raise AuthorizationError("tool_registration_id exceeds maximum length")
 
 
@@ -264,8 +287,8 @@ class Credential:
             raise CredentialError("credential id/verb/scope must be non-empty")
         if not isinstance(self.secret, Secret):
             raise CredentialError("credential secret must be a Secret")
-        if self.ttl_seconds is not None and self.ttl_seconds <= 0:
-            raise CredentialError("ttl_seconds must be positive if set")
+        if self.ttl_seconds is not None and not _is_positive_finite_ttl(self.ttl_seconds):
+            raise CredentialError("ttl_seconds must be a positive finite number if set")
         # FAIL CLOSED AT ISSUANCE, not at use.
         #
         # A credential scope of "../bad" used to be accepted here and only blow up
@@ -431,6 +454,20 @@ class ToolRegistration:
             raise CatalogError("a plain tool must not name a credential")
 
 
+@dataclass(frozen=True)
+class CatalogEntry:
+    """An atomic, immutable snapshot of a catalog registration: the registration
+    AND its catalog-owned generation, read from ONE locked catalog state.
+
+    Reading the registration and its generation as two separate calls is a split
+    read: a replacement between the two yields a mismatched snapshot (original
+    fields, new generation) that then passes the redemption generation check.
+    snapshot() returns both together under the lock so that cannot happen.
+    """
+    registration: "ToolRegistration"
+    generation: int
+
+
 class ToolCatalog:
     """The SOLE tool registry.
 
@@ -438,23 +475,47 @@ class ToolCatalog:
     registration id to an adapter, and it lives here. Two registries that must be
     kept in sync is the same split-authority defect as a monitor and an engine
     holding different capability stores; it is not repeated.
+
+    LIFECYCLE: register... -> seal() -> execute. After seal(), no additions,
+    replacements, or removals are permitted; the generation set is frozen. The
+    application seals explicitly (the broker refuses to mint against an unsealed
+    catalog), so configuration state is visible rather than silently defaulted.
     """
 
     def __init__(self):
-        # registration_id -> (registration, generation). The generation is a
-        # monotonic counter the CATALOG owns and the caller cannot set. It is the
-        # authenticity marker for "is this the same tool the authorization was
-        # minted against", replacing the caller-supplied `version` string, which a
-        # caller can repeat or forget to bump and therefore cannot be trusted.
         self._tools: dict[str, tuple[ToolRegistration, int]] = {}
         self._next_gen = 0
+        self._sealed = False
+        self._lock = threading.Lock()
+
+    @property
+    def is_sealed(self) -> bool:
+        return self._sealed
+
+    def seal(self) -> None:
+        with self._lock:
+            self._sealed = True
 
     def register(self, reg: ToolRegistration) -> str:
-        if reg.registration_id in self._tools:
-            raise CatalogError(f"duplicate tool registration: {reg.registration_id}")
-        self._tools[reg.registration_id] = (reg, self._next_gen)
-        self._next_gen += 1
-        return reg.registration_id
+        with self._lock:
+            if self._sealed:
+                raise CatalogError("catalog is sealed; no registrations after seal")
+            if reg.registration_id in self._tools:
+                raise CatalogError(f"duplicate tool registration: {reg.registration_id}")
+            self._tools[reg.registration_id] = (reg, self._next_gen)
+            self._next_gen += 1
+            return reg.registration_id
+
+    def snapshot(self, registration_id: str) -> Optional[CatalogEntry]:
+        """Atomic read of a registration AND its generation from one locked state.
+
+        This is the ONLY read used on the security-sensitive mint and redemption
+        paths. resolve()/generation() remain for non-security callers, but must
+        NOT be combined on a security path.
+        """
+        with self._lock:
+            entry = self._tools.get(registration_id)
+            return CatalogEntry(entry[0], entry[1]) if entry else None
 
     def resolve(self, registration_id: str) -> Optional[ToolRegistration]:
         entry = self._tools.get(registration_id)
@@ -583,7 +644,13 @@ def action_digest(action: Proposal) -> str:
     forge its digest. This is an internal integrity check, never an authorization
     input.
     """
-    canonical = f"{action.verb}\x00{action.resource}".encode("utf-8")
+    raw = f"{action.verb}\x00{action.resource}"
+    if utf8_length(raw) is None:
+        # Un-encodable text (e.g. a lone surrogate) cannot be hashed. This is a
+        # malformed action; return a sentinel digest that cannot match any real
+        # one, so redemption fails its integrity check rather than crashing.
+        raise MintRefused(MintRefusal.ACTION_NOT_UTF8, "action is not valid utf-8")
+    canonical = raw.encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
 
 
@@ -720,6 +787,34 @@ class ClaimRefused(AuthorizationError):
         self.code = code
 
 
+class MintRefusal(Enum):
+    """Typed reasons a mint (register_authorized_execution) can refuse.
+
+    The engine maps by CODE, never by parsing exception text. Only a genuine
+    authorization loss (valid at an earlier trusted check, lost at live
+    re-authorization) is a revoke race; none of these is."""
+    MALFORMED_ACTION = "malformed_action"
+    ACTION_NOT_AUTHORIZED = "action_not_authorized"
+    CATALOG_NOT_SEALED = "catalog_not_sealed"
+    UNKNOWN_TOOL = "unknown_tool"
+    TOOL_VERB_MISMATCH = "tool_verb_mismatch"
+    TOOL_NOT_AUTHORIZED = "tool_not_authorized"
+    ACTION_ID_EXHAUSTED = "action_id_exhausted"
+    NOT_AN_EXECUTION_PROPOSAL = "not_an_execution_proposal"
+    ACTION_NOT_UTF8 = "action_not_utf8"
+
+
+class MintRefused(AuthorizationError):
+    """Raised by register_authorized_execution with a TYPED MintRefusal code.
+
+    Subclasses AuthorizationError for backward compatibility (callers that catch
+    AuthorizationError still work), but carries `code` so the engine classifies
+    the refusal from a value, not a substring."""
+    def __init__(self, code: "MintRefusal", message: str):
+        super().__init__(message)
+        self.code = code
+
+
 @dataclass(frozen=True)
 class ReleaseAudit:
     action_id: str
@@ -769,7 +864,8 @@ def _normalize_tool_result(out) -> tuple[bool, Optional[str]]:
         return True, None
     if type(out) is not str:
         return False, None
-    if len(out.encode("utf-8")) > MAX_TOOL_RESULT_BYTES:
+    _olen = utf8_length(out)
+    if _olen is None or _olen > MAX_TOOL_RESULT_BYTES:
         return False, None
     return True, out
 
@@ -796,8 +892,8 @@ class TrustedExecutionBroker:
     ):
         if not isinstance(monitor, ReferenceMonitor):
             raise TypeError("broker requires a ReferenceMonitor for authorization")
-        if action_ttl_seconds <= 0:
-            raise ValueError("action_ttl_seconds must be positive")
+        if not _is_positive_finite_ttl(action_ttl_seconds):
+            raise ValueError("action_ttl_seconds must be a positive finite number")
         # ONE clock, owned here. All TTL and expiry decisions read it. Production
         # methods do not accept a caller `now`; tests inject a FakeClock instead.
         self._clock = clock or SystemClock()
@@ -840,6 +936,13 @@ class TrustedExecutionBroker:
             raise CatalogError("cannot grant an unregistered tool")
         self._policy.grant(registration_id, scope)
 
+    def seal_catalog(self) -> None:
+        """Seal the tool catalog. Required before any execution: the broker
+        refuses to mint against an unsealed catalog, so the production lifecycle
+        (register -> grant -> seal -> execute) is explicit and configuration state
+        is visible, not silently defaulted."""
+        self._catalog.seal()
+
     @property
     def catalog(self) -> ToolCatalog:
         return self._catalog
@@ -879,35 +982,45 @@ class TrustedExecutionBroker:
              existence is not authorization.
         """
         if not isinstance(proposal, ExecutionProposal):
-            raise AuthorizationError("register requires an ExecutionProposal")
+            raise MintRefused(MintRefusal.NOT_AN_EXECUTION_PROPOSAL,
+                              "register requires an ExecutionProposal")
         action = proposal.action
         if not valid_proposal(action):
-            raise AuthorizationError("cannot register a malformed action")
+            raise MintRefused(MintRefusal.MALFORMED_ACTION,
+                              "cannot register a malformed action")
 
         # 1. Independent authorization of the ACTION.
         decision = self._monitor.authorize(context, action)
         if decision.verdict is not Verdict.ALLOW:
             self._record("-", None, action, False, "action is not authorized")
-            raise AuthorizationError("action is not authorized")
+            raise MintRefused(MintRefusal.ACTION_NOT_AUTHORIZED, "action is not authorized")
 
-        # 2. The executor must exist...
-        reg = self._catalog.resolve(proposal.tool_registration_id)
-        if reg is None:
+        # 1b. The catalog must be sealed before any execution. An unsealed
+        #     catalog is a configuration error, not a silent default.
+        if not self._catalog.is_sealed:
+            self._record("-", None, action, False, "catalog not sealed")
+            raise MintRefused(MintRefusal.CATALOG_NOT_SEALED, "catalog is not sealed")
+
+        # 2. The executor must exist, read ATOMICALLY (registration + generation
+        #    from one locked catalog state; never two split reads on a security
+        #    path).
+        entry = self._catalog.snapshot(proposal.tool_registration_id)
+        if entry is None:
             self._record("-", None, action, False, "unknown tool registration")
-            raise AuthorizationError("unknown tool registration")
-        gen = self._catalog.generation(proposal.tool_registration_id)
+            raise MintRefused(MintRefusal.UNKNOWN_TOOL, "unknown tool registration")
+        reg, gen = entry.registration, entry.generation
 
         # ...and serve this action class.
         if reg.verb != action.verb:
             self._record("-", None, action, False, "tool verb does not match action")
-            raise AuthorizationError("tool verb does not match proposed action")
+            raise MintRefused(MintRefusal.TOOL_VERB_MISMATCH, "tool verb does not match proposed action")
 
         # 3. ...and be POLICY-AUTHORIZED for this exact action. This is the check
         #    that stops a model routing `read` at read_payroll_database when it
         #    was only ever meant to reach read_customer_record.
         if not self._policy.allows(reg.registration_id, action):
             self._record("-", None, action, False, "tool registration is not authorized")
-            raise AuthorizationError("tool registration is not authorized")
+            raise MintRefused(MintRefusal.TOOL_NOT_AUTHORIZED, "tool registration is not authorized")
 
         now = self._clock.now()
         # A colliding action_id must not overwrite an existing authorization. put()
@@ -934,7 +1047,7 @@ class TrustedExecutionBroker:
             except AuthorizationError:
                 continue   # collision: mint a new id and retry
             return aid
-        raise AuthorizationError("could not mint a unique action_id")
+        raise MintRefused(MintRefusal.ACTION_ID_EXHAUSTED, "could not mint a unique action_id")
 
     # -- redeem ------------------------------------------------------------- #
 
@@ -977,10 +1090,13 @@ class TrustedExecutionBroker:
                 return SanitizedToolResult.failed(
                     "authorization_refused", BrokerRefusal.ACTION_DIGEST_MISMATCH)
 
-            # 3. Resolve the tool from the CATALOG, pinned to the exact version
-            #    bound at mint. A tool swapped out in between is refused.
-            reg = self._catalog.resolve(rec.tool_registration_id)
-            gen = self._catalog.generation(rec.tool_registration_id)
+            # 3. Resolve the tool from the CATALOG atomically (registration +
+            #    generation from one locked read), pinned to the generation bound
+            #    at mint. A tool swapped between resolve and generation, or after
+            #    mint, is refused.
+            entry = self._catalog.snapshot(rec.tool_registration_id)
+            reg = entry.registration if entry else None
+            gen = entry.generation if entry else None
             if reg is None or gen != rec.tool_generation:
                 # The tool was replaced (or removed) after this authorization was
                 # minted. The catalog-owned generation moved; the caller cannot

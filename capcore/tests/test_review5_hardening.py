@@ -60,6 +60,7 @@ def wired(monitor):
     b.register_tool(ToolRegistration("t", "read", ToolKind.PLAIN,
                                      lambda a: "ok", "1"))
     b.grant_tool("t", "acme/api")
+    b.seal_catalog()
     return b
 
 
@@ -176,6 +177,7 @@ def test_unknown_model_outcome_fails_closed():
     b.register_tool(ToolRegistration("t", "read", ToolKind.PLAIN,
                                      lambda a: calls.append(1) or "ok", "1"))
     b.grant_tool("t", "acme/api")
+    b.seal_catalog()
     engine = ExecutionEngine(b, Budget(3))
 
     class Bogus:
@@ -204,6 +206,7 @@ def test_broker_denial_does_not_consume_execution_budget():
     b.register_tool(ToolRegistration("t", "read", ToolKind.PLAIN,
                                      lambda a: calls.append(1) or "ok", "1"))
     b.grant_tool("t", "acme/api")
+    b.seal_catalog()
     engine = ExecutionEngine(b, Budget(max_actions=1, max_iterations=5,
                                        count_denied_attempts=False))
 
@@ -241,6 +244,7 @@ def test_pending_authorization_expiry_is_not_revoked_race():
     b.register_tool(ToolRegistration("t", "read", ToolKind.PLAIN,
                                      lambda a: "ok", "1"))
     b.grant_tool("t", "acme/api")
+    b.seal_catalog()
 
     action_id = b.register_authorized_execution(ctx, ep())
     clock.advance(50.0)    # the PENDING authorization expires before redemption

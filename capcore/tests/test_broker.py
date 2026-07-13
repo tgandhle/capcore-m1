@@ -68,6 +68,7 @@ def wired(monitor, recorder=None, cred=None, tool_version="1", verb="read"):
         credential_id="cred-1",
     ))
     broker.grant_tool("tool-1", "acme/records")
+    broker.seal_catalog()
     return broker
 
 
@@ -194,6 +195,7 @@ def test_action_ttl_expiry_denies_after_deadline():
         adapter=rec, version="1", credential_id="cred-1",
     ))
     broker.grant_tool("tool-1", "acme/records")
+    broker.seal_catalog()
     prop = Proposal("acme/records/x", "read")
     action_id = broker.register_authorized_execution(
         ctx, ExecutionProposal(action=prop, tool_registration_id="tool-1"))
@@ -308,6 +310,7 @@ def test_expired_credential_refuses_execution():
         adapter=rec, version="1", credential_id="cred-1",
     ))
     broker.grant_tool("tool-1", "acme/records")
+    broker.seal_catalog()
 
     prop = Proposal("acme/records/x", "read")
     action_id = broker.register_authorized_execution(
@@ -337,6 +340,7 @@ def test_credential_within_ttl_still_delivers():
         adapter=rec, version="1", credential_id="cred-1",
     ))
     broker.grant_tool("tool-1", "acme/records")
+    broker.seal_catalog()
 
     prop = Proposal("acme/records/x", "read")
     action_id = broker.register_authorized_execution(

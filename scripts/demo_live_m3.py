@@ -68,6 +68,7 @@ def main():
         version="1", credential_id="api-token",
     ))
     broker.grant_tool("http-1", "acme/api")   # registration is NOT authorization
+    broker.seal_catalog()
 
     # === 1. authorized action: engine mints, broker executes, secret never returned ===
     print("1) authorized action  ->  broker mints authorization  ->  broker executes")
