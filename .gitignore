@@ -16,3 +16,7 @@ build/
 *.key
 secrets.*
 *_token.txt
+
+# local test/mutation scratch output
+*result.txt
+mutfull.txt
