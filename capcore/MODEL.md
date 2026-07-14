@@ -131,7 +131,7 @@ Six defects were found in later review and are now fixed and mutation-tested in
     disabling a mandatory deny.
 
 Note on the mutation runner (`scripts/mutation_check.py`): it reintroduces the
-full current set of documented defects (85 as of review round 9), each into a
+full current set of documented defects (103 as of review round 10), each into a
 fresh isolated temp copy, and asserts the suite catches every one. It disables
 bytecode writing, isolates Hypothesis storage, and applies a per-mutation timeout
 (a timeout is a harness error, not a caught mutation). `scripts/check_stale.py`
@@ -373,7 +373,7 @@ demonstrating real containment.
 ```
 pip install -e ".[test]"
 python -m pytest
-python scripts/mutation_check.py      # all 68 mutations must be caught
+python scripts/mutation_check.py      # all 103 mutations must be caught
 
 # live demos (local, not part of CI):
 pip install -e ".[live]"

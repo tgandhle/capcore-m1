@@ -12,18 +12,26 @@ collection-error/timeout-as-harness-error); and self-tests for the harness in
 `capcore/tests/test_mutation_harness.py`.
 
 ONGOING CONVENTION (not a separate task, just a habit): selectors are declared on
-23 of 85 mutations. A mutation without selectors falls back to the full suite in
+43 of 103 mutations. A mutation without selectors falls back to the full suite in
 focused mode (safe, just slower). When adding a NEW mutation, give it a selector
 while the relevant test is fresh; back-filling the remaining 62 is low-value grunt
 work and a wrong selector is worse than none, so let them accrue rather than
-bulk-adding. (Round 9 added 17 selectors this way, from 3 to 23, at no extra cost.)
+bulk-adding. (Rounds 9-10 added 40 selectors this way, from 3 to 43, at no extra cost.)
 
-CAVEAT, learned in round 9: focused mode is for routine feedback, NOT for closing a
-review round. Run the FULL suite per mutation before merging. Three times in round 9
-a mutation still matched its anchor, still passed `check_stale`, and had quietly
-stopped biting, because a later fix made its guard redundant or moved the code its
-killing test exercised. The suite was green and `check_stale` was clean every time.
-Only the full run caught it.
+CAVEAT, learned in round 9 and reinforced in round 10: focused mode is for routine
+feedback, NOT for closing a review round. Run the FULL suite per mutation before
+merging. Repeatedly, a mutation has still matched its anchor, still passed
+`check_stale`, and quietly stopped biting, because a later fix made its guard redundant
+or moved the code its killing test exercised. The suite was green and `check_stale` was
+clean every time. Only the full run caught it.
+
+A related failure mode, also worth naming: a TEST that passes for the wrong reason.
+Round 9's `test_deeply_nested_json_returns_invalid` was green on 3.14 while the defect
+was fully present, because its fixture would have been INVALID anyway. Round 10 drafted
+a concurrency load test that passed against the unfixed code (it never hit the race
+window) and deleted it. The discipline in both cases: a fixture must be one that would
+PASS but for the property under test, and a test that cannot fail for the reason it
+exists is not a weak test, it is false comfort.
 
 ## 2. Dual-form `ExecutionEngine` constructor cleanup
 

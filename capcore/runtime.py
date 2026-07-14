@@ -294,6 +294,40 @@ class Budget:
     max_steps: int = None            # deprecated alias; sets both when given
 
     def __post_init__(self):
+        # TYPE CHECKS FIRST, and they are EXACT (`type(x) is int`, not isinstance).
+        #
+        # bool is a SUBCLASS of int, so isinstance(True, int) is True and
+        # Budget(max_actions=True) was silently accepted as the budget 1. This project
+        # already legislates against exactly this elsewhere: `type(x) is not str` is
+        # used deliberately to close str-subclass holes (see the existing
+        # proposal_accepts_str_subclass_resource mutation). Budget never got the same
+        # discipline.
+        #
+        # The mode flag is the nastier half. `count_denied_attempts="false"` is a
+        # plausible configuration typo, and the string "false" is TRUTHY, so the
+        # runtime selected COUNTED mode: the exact opposite of what was written. A
+        # silently inverted budget mode is a policy-semantics defect, not a cosmetic
+        # one.
+        #
+        # This runs BEFORE the alias resolution below, because max_steps propagates
+        # into max_actions and max_iterations: validating only the destinations would
+        # let `Budget(max_steps=True)` through.
+        for name in ("max_actions", "max_iterations", "max_steps"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if type(value) is not int:      # exact: rejects bool, float, numpy ints
+                raise ValueError(
+                    f"budget {name} must be an exact int, got "
+                    f"{type(value).__name__}")
+            if value < 0:
+                raise ValueError(f"budget {name} must be non-negative")
+
+        if type(self.count_denied_attempts) is not bool:
+            raise ValueError(
+                "budget count_denied_attempts must be a bool, got "
+                f"{type(self.count_denied_attempts).__name__}")
+
         # Resolve the compat alias.
         if self.max_steps is not None:
             if self.max_actions is None:
@@ -307,10 +341,12 @@ class Budget:
         if self.max_iterations is not None and self.max_actions is None:
             object.__setattr__(self, "max_actions", self.max_iterations)
 
-        if not isinstance(self.max_actions, int) or self.max_actions < 0:
-            raise ValueError("budget max_actions must be a non-negative int")
-        if not isinstance(self.max_iterations, int) or self.max_iterations < 0:
-            raise ValueError("budget max_iterations must be a non-negative int")
+        # A budget with nothing set at all is a configuration error, not a default.
+        if self.max_actions is None or self.max_iterations is None:
+            raise ValueError(
+                "budget requires max_actions and/or max_iterations (or the "
+                "deprecated max_steps alias)")
+
         # keep max_steps populated for any external reader
         object.__setattr__(self, "max_steps", self.max_actions)
 

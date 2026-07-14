@@ -80,6 +80,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import re
 import threading
 import secrets
 import time
@@ -94,6 +95,56 @@ from capcore import (
 
 # Bound on the untrusted tool-registration id the model names.
 MAX_TOOL_ID_BYTES = 128
+
+# The tool-registration-id grammar. ONE definition, enforced at BOTH accept sites
+# (ToolRegistration, which is trusted config, and ExecutionProposal, which is
+# untrusted model output), so the two accept-sets cannot drift apart.
+#
+# They HAD drifted. ExecutionProposal accepted any exact str within the byte limit,
+# and ToolRegistration accepted any non-empty str, so `t}` was a legal tool id on
+# both. But parse_model_output extracts the JSON object with a non-greedy regex
+# (`\{.*?\}`), which is not string-aware, so a tool id containing `}` truncates the
+# match and the whole proposal comes back INVALID. A legitimately registered tool
+# was unreachable through the model path. Not an authorization bypass: a
+# parser/catalog domain mismatch.
+#
+# Fixed HERE, at the registration boundary, rather than by changing the extractor.
+# The reviewer proposed replacing the regex with `text.strip()`, reasoning that the
+# system prompt already demands exactly one JSON object and no prose. That reasoning
+# is unsound: the model is UNTRUSTED, so what the prompt ASKS FOR is not a constraint
+# on what arrives, and small local models routinely wrap JSON in prose. text.strip()
+# would turn every such response from a recoverable parse into an INVALID, which is a
+# real regression in a live path for a cosmetic gain.
+#
+# A slug grammar is instead a strictly NARROWER accept-set (deny by default), closes
+# the mismatch where it originates, and needs no parser change. A tool id containing
+# `}` or `"` is a configuration smell regardless of any parser.
+TOOL_ID_PATTERN = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+
+
+def validate_tool_id(tool_id: object) -> str:
+    """Return `tool_id` if it is a legal tool-registration id, else raise ValueError.
+
+    The caller wraps this in its own layer's error type: a bad id in a REGISTRATION is
+    a configuration error (CatalogError), while a bad id in a PROPOSAL is untrusted
+    model output (AuthorizationError). Same grammar, different meanings.
+
+    Must start alphanumeric (so an id cannot be a leading `-` that reads as a flag, or
+    a leading `.` that reads as a path), then alphanumerics, dot, underscore, hyphen.
+    No whitespace, no JSON metacharacters, no path separators.
+    """
+    if type(tool_id) is not str or not tool_id:
+        raise ValueError("tool id must be a non-empty exact str")
+    length = utf8_length(tool_id)
+    if length is None:
+        raise ValueError("tool id is not valid utf-8")
+    if length > MAX_TOOL_ID_BYTES:
+        raise ValueError("tool id exceeds maximum length")
+    if not TOOL_ID_PATTERN.match(tool_id):
+        raise ValueError(
+            "tool id must match [A-Za-z0-9][A-Za-z0-9._-]* (no whitespace, no JSON "
+            "metacharacters, no path separators)")
+    return tool_id
 
 
 def _is_positive_finite_ttl(value) -> bool:
@@ -188,6 +239,39 @@ def checked_now(clock: Clock) -> float:
     return value
 
 
+def checked_expiry(now: float, ttl: float) -> float:
+    """Compute an expiry and REFUSE one that cannot bound a lifetime.
+
+    checked_now validates the OPERANDS of a security time. That is not sufficient,
+    because two finite operands can produce a non-finite RESULT:
+
+        1e308 + 1e308  ->  inf
+
+    Both are finite. Both pass checked_now and the positive-finite-TTL validation. The
+    derived expires_at is inf, and no finite clock value can ever be >= inf, so the
+    authorization NEVER expires.
+
+    This is the same class of defect as the last three rounds, one level up each time:
+    Round 6 validated TTL values, Round 9 validated clock values, and neither validated
+    the value the comparison ACTUALLY USES. Validating inputs is not validating the
+    thing you then make a decision with.
+
+    Two checks, and the second is not redundant:
+      - the expiry must be FINITE, or it is unreachable and the lifetime is unbounded.
+      - the expiry must be STRICTLY LATER than now, or the lifetime is zero or negative
+        and the authorization is born dead (which would be a silent, confusing refusal
+        rather than an honest configuration error).
+    """
+    expires_at = now + ttl
+    if not math.isfinite(expires_at):
+        raise ClockError(
+            "clock and TTL produced a non-finite expiry; the lifetime would be "
+            "unbounded")
+    if expires_at <= now:
+        raise ClockError("expiry must be strictly later than the issue time")
+    return expires_at
+
+
 class MonotonicClock:
     """Wraps a Clock and enforces the MONOTONIC contract the Clock protocol has
     always documented but never checked.
@@ -200,6 +284,28 @@ class MonotonicClock:
 
     The watermark is deliberately NOT reset by anything. Time going backward is a
     broken trusted component, not a recoverable condition.
+
+    THE READ AND THE COMPARISON HAPPEN UNDER ONE LOCK, and that is load-bearing.
+
+    An earlier version (Review 9, mine) called checked_now OUTSIDE the lock and only
+    compared inside. Two threads could then linearize their reads in the wrong order:
+
+        thread A  reads 100, is descheduled before taking the lock
+        thread B  reads 101, takes the lock, records the watermark as 101
+        thread A  resumes, takes the lock, compares its (valid, earlier) 100
+                  against 101, and raises ClockError
+
+    The underlying clock never moved backward. 100 and 101 are both valid,
+    forward-moving reads. The wrapper was mistaking a scheduler reordering for a
+    broken time source, and spuriously failing valid concurrent mints, issuances, and
+    redemptions.
+
+    It failed CLOSED (a spurious refusal, mapped to a typed MintRefusal.CLOCK_UNUSABLE),
+    so it could never extend a lifetime or bypass authorization: an availability
+    defect, not an integrity one. But holding the lock across the read is what makes
+    "the broker's security time" a single linearized sequence rather than a set of
+    racing observations, which is what the monotonicity check needs in order to mean
+    anything at all.
     """
     def __init__(self, clock: Clock):
         self._clock = clock
@@ -207,12 +313,14 @@ class MonotonicClock:
         self._lock = threading.Lock()
 
     def now(self) -> float:
-        value = checked_now(self._clock)
+        # ONE critical section: read, validate, compare, record. See the class
+        # docstring for why splitting these is a race.
         with self._lock:
+            value = checked_now(self._clock)
             if self._high_water is not None and value < self._high_water:
                 raise ClockError("clock moved backward; time source is not monotonic")
             self._high_water = value
-        return value
+            return value
 
 
 class FakeClock:
@@ -313,13 +421,12 @@ class ExecutionProposal:
         # different semantics into execution than authorization validated.
         if type(self.action) is not Proposal:
             raise AuthorizationError("execution proposal requires an exact Proposal action")
-        if type(self.tool_registration_id) is not str or not self.tool_registration_id:
-            raise AuthorizationError("execution proposal requires an exact str tool_registration_id")
-        _tlen = utf8_length(self.tool_registration_id)
-        if _tlen is None:
-            raise AuthorizationError("tool_registration_id is not valid utf-8")
-        if _tlen > MAX_TOOL_ID_BYTES:
-            raise AuthorizationError("tool_registration_id exceeds maximum length")
+        # ONE grammar, shared with ToolRegistration, so the accept-sets cannot drift.
+        # Here it is UNTRUSTED model output, so a violation is a malformed proposal.
+        try:
+            validate_tool_id(self.tool_registration_id)
+        except ValueError as exc:
+            raise AuthorizationError(f"invalid tool_registration_id: {exc}") from exc
 
 
 # --------------------------------------------------------------------------- #
@@ -422,42 +529,97 @@ class CredentialVault:
     Stores immutable, vault-owned copies (`_StoredCredential`), never the caller's
     object, so no retained caller reference can mutate trusted credential state
     after issuance. Consumption is tracked in a vault-owned set under the lock.
+
+    SEALING. The vault owns its own sealed state, for exactly the reason ToolPolicy
+    does (Review 9 F4), and the omission here was that fix left half-done.
+
+    The broker accepts a caller-supplied vault (a supported public constructor arg)
+    and retains the reference. seal_configuration() refuses broker.issue_credential()
+    afterwards, and the README says sealing freezes credential issuance. It did not:
+    a caller still holding the vault could call vault.issue() after the seal, and
+    with a prepopulated injected catalog naming that credential, a credentialed
+    adapter would then receive the secret. No private-field access, no object-graph
+    attack: public constructors and public methods.
+
+    Sealing the broker is not enough. The object a caller can still be holding is
+    the object that has to refuse.
     """
 
     def __init__(self, clock: Clock):
         self._creds: dict[str, _StoredCredential] = {}
         self._consumed_ids: set[str] = set()
         self._clock = clock
+        self._sealed = False
         # Serializes availability-check + consume for single-use credentials, so
         # two concurrent redemptions cannot both see an unconsumed credential and
-        # both deliver the secret. Same reasoning as the pending-store lock.
+        # both deliver the secret. Same reasoning as the pending-store lock. It now
+        # also serializes issue(), so a seal cannot interleave with an issuance.
         self._lock = threading.Lock()
 
     @property
     def clock(self) -> Clock:
-        """The vault's trusted clock. The broker requires an injected vault to
-        already use the broker's clock object (identity), so issue-time and TTL
-        are measured against one clock domain."""
+        """The vault's trusted clock. The broker requires an injected vault to use
+        the broker's EXACT clock object, so issue-time and TTL are measured against
+        one clock domain."""
         return self._clock
 
+    @property
+    def is_sealed(self) -> bool:
+        return self._sealed
+
+    @property
+    def is_empty(self) -> bool:
+        """True if nothing has ever been issued. The broker requires this of an
+        INJECTED vault: a vault that already holds credentials was stamped by some
+        other clock (the broker's wrapped clock does not exist until the broker
+        does), so its issue-time domain is unverifiable. See TrustedExecutionBroker.
+        """
+        return not self._creds
+
+    @property
+    def credential_ids(self) -> frozenset[str]:
+        """Which credentials exist. Read at seal time to validate that every
+        credentialed registration names one that is actually present."""
+        with self._lock:
+            return frozenset(self._creds)
+
+    def seal(self) -> None:
+        """Freeze issuance. Idempotent: a seal is a STATE, not an event."""
+        with self._lock:
+            self._sealed = True
+
     def issue(self, cred: Credential) -> str:
-        if cred.id in self._creds:
-            raise CredentialError(f"duplicate credential id: {cred.id}")
-        # COPY the caller's values into a vault-owned immutable record. The secret
-        # value is copied into a fresh Secret, so mutating the caller's original
-        # (even secret._value) cannot reach the stored copy. The TTL clock is
-        # stamped HERE from the trusted clock, never from the caller.
-        stored = _StoredCredential(
-            id=cred.id,
-            verb=cred.verb,
-            scope=cred.scope,
-            secret=Secret(cred.secret.reveal()),   # fresh, copied value
-            single_use=cred.single_use,
-            ttl_seconds=cred.ttl_seconds,
-            issued_at=self._clock.now(),
-        )
-        self._creds[cred.id] = stored
-        return cred.id
+        with self._lock:
+            if self._sealed:
+                raise CredentialError(
+                    "credential vault is sealed; no issuance after seal")
+            if cred.id in self._creds:
+                raise CredentialError(f"duplicate credential id: {cred.id}")
+            # COPY the caller's values into a vault-owned immutable record. The
+            # secret value is copied into a fresh Secret, so mutating the caller's
+            # original (even secret._value) cannot reach the stored copy. The TTL
+            # clock is stamped HERE from the trusted clock, never from the caller.
+            # Stamp issue-time from the trusted clock, and VALIDATE THE DERIVED
+            # EXPIRY, not just the operands. A finite issued_at and a finite ttl can
+            # still overflow (1e308 + 1e308 -> inf), and `now - issued_at >= ttl` can
+            # then never be true: a finite TTL that never elapses. Fail at ISSUE,
+            # where it is a configuration error, rather than at redemption, when a
+            # secret is already in play.
+            issued_at = self._clock.now()
+            if cred.ttl_seconds is not None:
+                checked_expiry(issued_at, cred.ttl_seconds)
+
+            stored = _StoredCredential(
+                id=cred.id,
+                verb=cred.verb,
+                scope=cred.scope,
+                secret=Secret(cred.secret.reveal()),   # fresh, copied value
+                single_use=cred.single_use,
+                ttl_seconds=cred.ttl_seconds,
+                issued_at=issued_at,
+            )
+            self._creds[cred.id] = stored
+            return cred.id
 
     def resolve(self, credential_id: str) -> Optional[_StoredCredential]:
         return self._creds.get(credential_id)
@@ -522,8 +684,13 @@ class ToolRegistration:
     credential_id: Optional[str] = None    # required iff CREDENTIALED
 
     def __post_init__(self):
-        if not self.registration_id:
-            raise CatalogError("tool registration_id must be non-empty")
+        # ONE grammar, shared with ExecutionProposal. Here it is TRUSTED config, so a
+        # violation is a configuration error. A registered id the model can never name
+        # (because it breaks the JSON extractor) is a tool that silently does not work.
+        try:
+            validate_tool_id(self.registration_id)
+        except ValueError as exc:
+            raise CatalogError(f"invalid tool registration_id: {exc}") from exc
         if not self.verb:
             raise CatalogError("tool registration must name a verb")
         if self.kind is ToolKind.CREDENTIALED and not self.credential_id:
@@ -598,6 +765,15 @@ class ToolCatalog:
     def resolve(self, registration_id: str) -> Optional[ToolRegistration]:
         entry = self._tools.get(registration_id)
         return entry[0] if entry else None
+
+    @property
+    def registrations(self) -> tuple[ToolRegistration, ...]:
+        """Every registration, read atomically. Used to validate the configuration
+        AS A WHOLE at seal time (e.g. that each credentialed tool names a credential
+        the vault actually holds), which register_tool cannot do for a catalog it
+        never saw."""
+        with self._lock:
+            return tuple(reg for reg, _gen in self._tools.values())
 
     def generation(self, registration_id: str) -> Optional[int]:
         """The catalog-owned generation for a registration, or None if absent.
@@ -1023,32 +1199,59 @@ class TrustedExecutionBroker:
         self._monitor = monitor
         self._catalog = catalog or ToolCatalog()
         self._policy = policy or ToolPolicy()      # deny-by-default when empty
-        # The vault stamps credential issue-time from the trusted clock. A supplied
-        # vault MUST be in the broker's clock DOMAIN. Rewriting its clock (the
-        # pre-Review-8 behaviour) silently created a clock-domain split: credentials
-        # issued under the vault's ORIGINAL clock kept their old issued_at, so a TTL
-        # measured against the broker's clock could be wrong (a credential outliving
-        # its TTL, or expiring early). Require sameness and refuse divergence rather
-        # than paper over it.
+        # The vault stamps credential issue-time from the trusted clock, and the TTL
+        # is measured against that same clock. Both sides must therefore be in ONE
+        # clock domain, or a credential can outlive its TTL (or expire early).
         #
-        # Review 9 note: the broker now wraps its clock in MonotonicClock, so a
-        # caller CANNOT hold the broker's exact clock object (it does not exist until
-        # the broker builds it). Identity is therefore checked against the UNDERLYING
-        # source, which is the thing the Review 8 invariant was actually about: one
-        # clock domain, not one Python object. A vault whose underlying clock differs
-        # is still refused; a vault built on the same source is accepted and then
-        # REBOUND to the broker's wrapper below, so its reads are validated too. That
-        # rebinding is not the old silent rewrite: the domain is proven identical
-        # first, and the only change is that reads now go through validation.
+        # REVIEW 10 CORRECTION, reverting a Review 9 regression I authored.
+        #
+        # R8 required `vault.clock is not self._clock` and refused divergence. R9
+        # wrapped the broker's clock in MonotonicClock, which meant a caller could no
+        # longer hold the broker's exact clock object, so I relaxed the check to
+        #
+        #     getattr(vault.clock, "_clock", vault.clock) is not raw_clock
+        #
+        # and justified it as "the invariant was about one clock domain, not one
+        # Python object". That was WRONG, and the commit message claiming the
+        # invariant was "unchanged; only the comparison moved" was false.
+        #
+        # `getattr(x, "_clock")` asks "does this object happen to have a private
+        # attribute of that name pointing at my clock". That is a DUCK-TYPE test, not
+        # an identity test. Any wrapper satisfies it while returning entirely
+        # different time: offset, scale, cache, round, re-epoch. An OffsetClock with
+        # the same shape as MonotonicClock passed, and a credential pre-issued in the
+        # offset domain kept issued_at=1000 while the broker measured its TTL against
+        # a raw clock starting at 0. The R8 clock-domain split was fully reopened.
+        #
+        # So: EXACT IDENTITY against the raw clock, no introspection. Sameness is
+        # proven, never inferred.
+        #
+        # This narrows the API, deliberately. The broker's wrapped clock does not
+        # exist until the broker does, so a vault holding the broker's exact clock
+        # cannot have issued anything beforehand. A PREPOPULATED injected vault is
+        # therefore no longer a supported configuration: its credentials were stamped
+        # by some other clock, and there is no sound way to verify that domain after
+        # the fact. Refuse it rather than infer. (Nothing in the suite ever
+        # prepopulated an injected vault; the narrowing costs nothing.)
+        #
+        # An accepted (empty, exact-clock) vault is then rebound to the broker's
+        # wrapper so its reads are validated too. That is not the pre-R8 silent
+        # rewrite: the vault is proven empty first, so there are no stamped timestamps
+        # to strand in the wrong domain.
         if vault is not None:
-            supplied = vault.clock
-            underlying = getattr(supplied, "_clock", supplied)
-            if underlying is not raw_clock:
+            if vault.clock is not raw_clock:
                 raise ValueError(
-                    "injected credential vault must use the broker's clock object; "
-                    "construct the vault with the same clock, or let the broker own it"
+                    "injected credential vault must use the broker's EXACT clock "
+                    "object; construct it with the same clock, or let the broker own "
+                    "it. A wrapper around the same clock is NOT the same clock domain."
                 )
-            vault._clock = self._clock   # same domain, now validated on every read
+            if not vault.is_empty:
+                raise ValueError(
+                    "injected credential vault must be empty; its existing credentials "
+                    "were stamped by a clock the broker cannot verify. Issue "
+                    "credentials through the broker after construction."
+                )
+            vault._clock = self._clock   # proven empty + same source; now validated
             self._vault = vault
         else:
             self._vault = CredentialVault(self._clock)
@@ -1093,25 +1296,56 @@ class TrustedExecutionBroker:
             raise CatalogError("cannot grant an unregistered tool")
         self._policy.grant(registration_id, scope)
 
+    def _validate_configuration(self) -> None:
+        """Check the configuration is COHERENT before freezing it.
+
+        Specifically: every CREDENTIALED registration must name a credential that
+        actually exists in the vault.
+
+        register_tool() already performs this check, but a caller-supplied,
+        prepopulated ToolCatalog never passes through register_tool, so the check
+        was simply not run on that path. That is how a registration naming a
+        nonexistent credential could be installed, and then (before the vault seal
+        below) have that credential appear afterwards via a retained vault.
+
+        Sealing is the last point at which the configuration can be validated AS A
+        WHOLE, so it is where a whole-configuration invariant belongs. Failing here
+        is a configuration error, surfaced at setup, rather than a mint-time refusal
+        surfaced during a live run.
+        """
+        available = self._vault.credential_ids
+        for reg in self._catalog.registrations:
+            if reg.kind is not ToolKind.CREDENTIALED:
+                continue
+            if reg.credential_id not in available:
+                raise CredentialError(
+                    f"credentialed tool {reg.registration_id!r} names credential "
+                    f"{reg.credential_id!r}, which does not exist in the vault"
+                )
+
     def seal_configuration(self) -> None:
         """Freeze the entire execution configuration: catalog, tool policy, and
-        credential issuance. After this, register_tool, grant_tool, tool
-        replacement, and issue_credential are all refused.
+        credential vault. After this, register_tool, grant_tool, tool replacement,
+        and credential issuance are all refused, through the broker AND through any
+        object the caller still holds a reference to.
 
         This is the honest seal: "sealed" means the whole configuration is
-        immutable, not just the executor registry. The broker refuses to mint
-        against an unsealed configuration, so the lifecycle
-        (register -> grant -> issue -> seal -> execute) is explicit and the
+        immutable, not just the parts the broker happens to own the only reference
+        to. The broker refuses to mint against an unsealed configuration, so the
+        lifecycle (register -> grant -> issue -> seal -> execute) is explicit and the
         configuration state is visible, never silently mutable trusted state.
 
-        The policy is sealed THROUGH ITS OWN seal(), not by a flag here. Setting a
-        broker-side flag alone left a real hole: a caller-supplied policy is
-        retained by reference, so its public grant() kept working after the seal
-        and the new grant still minted. The object a caller can still hold is the
-        object that has to refuse.
+        Each component is sealed THROUGH ITS OWN seal(), never by a broker-side flag
+        alone. The broker accepts caller-supplied catalog, policy, and vault objects
+        and retains those references, so a flag here would leave the caller's own
+        public methods working after the seal. Review 9 established this for the
+        policy and missed the vault; the vault is the same shape and gets the same
+        treatment.
         """
+        self._validate_configuration()
         self._catalog.seal()
         self._policy.seal()
+        self._vault.seal()
         self._config_sealed = True
 
     def seal_catalog(self) -> None:
@@ -1210,8 +1444,17 @@ class TrustedExecutionBroker:
         # Security time. A clock that cannot say what time it is cannot bound an
         # authorization's lifetime, so the mint is REFUSED with a typed code rather
         # than raising into the engine: an honest terminal state, not a crash.
+        #
+        # The EXPIRY is computed and validated here too, inside the same guard.
+        # checked_now validates the operands; checked_expiry validates the value the
+        # redemption comparison will actually use. Two finite operands can overflow to
+        # inf (1e308 + 1e308), and no finite clock reading can ever reach inf, so the
+        # authorization would never expire. Both failures are the same condition from
+        # the caller's point of view (this configuration cannot bound a lifetime) and
+        # both become MintRefusal.CLOCK_UNUSABLE.
         try:
             now = self._clock.now()
+            expires_at = checked_expiry(now, self._action_ttl)
         except ClockError as exc:
             self._record("-", None, action, False, "clock unusable")
             raise MintRefused(MintRefusal.CLOCK_UNUSABLE, "clock unusable") from exc
@@ -1232,7 +1475,7 @@ class TrustedExecutionBroker:
                 tool_generation=gen,              # authenticity: catalog-owned
                 credential_id=reg.credential_id,  # bound: cannot be substituted
                 issued_at=now,
-                expires_at=now + self._action_ttl,
+                expires_at=expires_at,   # validated: finite, and strictly after `now`
                 state=AuthorizationState.PENDING,
             )
             try:

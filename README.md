@@ -33,7 +33,7 @@ Three layers, each with its own trust boundary:
 "Single-process trust model" is load-bearing, not a hedge. See
 [Trust model](#trust-model).
 
-307 tests pass. `python scripts/mutation_check.py` reintroduces 85 known defects
+332 tests pass. `python scripts/mutation_check.py` reintroduces 103 known defects
 one at a time and asserts the suite catches every one (it mutates a temporary
 copy, never your working tree). CI runs Python 3.11-3.13 on Ubuntu and Windows.
 
@@ -376,25 +376,42 @@ remote service:
   classification), not BUDGET_EXHAUSTED, even when the budget is spent. Applying one
   ordering to both modes silently disabled the attempt budget, which is why they are
   now deliberately different.
-- **Sealing seals the whole configuration, including a policy you still hold.**
-  `seal_configuration()` freezes the catalog, the tool policy, AND credential
-  issuance. The policy is sealed through its own `seal()`, not a broker-side flag:
-  the broker retains a caller-supplied `ToolPolicy` by reference, so a flag alone
-  left the caller's own `policy.grant()` working after the seal, and the late grant
-  still minted. The object a caller can still be holding is the object that has to
-  refuse. In-process TCB code can of course still mutate private state; the claim is
-  the narrower, honest one: the SUPPORTED PUBLIC API cannot change policy after the
-  seal.
-- **An injected vault must share the broker's clock domain, and the clock's OUTPUT
-  is validated.** Clock identity is checked against the underlying source (the
-  broker wraps its clock, so a caller cannot hold the wrapper). Every security-time
-  read goes through `checked_now`: non-numeric and non-finite values are refused,
-  and `MonotonicClock` enforces the monotonic contract the `Clock` protocol has
-  always documented. This matters because a finite TTL under a broken clock stops
-  expiring: NaN makes every comparison False (nothing expires), and inf makes
-  `inf - inf` NaN (a credential's TTL never fires, even though the authorization
-  gate happens to fail closed). A clock failure is a typed refusal
-  (`MintRefusal.CLOCK_UNUSABLE`), not a crash.
+- **Sealing seals every object you can still be holding.** `seal_configuration()`
+  freezes the catalog, the tool policy, AND the credential vault, each through its
+  own `seal()`, never by a broker-side flag. The broker accepts caller-supplied
+  catalog, policy, and vault objects and RETAINS those references, so a flag alone
+  left the caller's own `policy.grant()` and `vault.issue()` working after the seal,
+  and the late grant or credential still reached an adapter. Review 9 established
+  this for the policy and missed the vault; Review 10 closed it. The seal also
+  VALIDATES the configuration first: every credentialed registration must name a
+  credential the vault actually holds, which `register_tool` checks but an injected
+  prepopulated catalog bypassed. In-process TCB code can still mutate private state;
+  the claim is the narrower, honest one: the SUPPORTED PUBLIC API cannot change the
+  configuration after the seal.
+- **An injected vault must use the broker's EXACT clock, and be empty.** Not "a clock
+  in the same domain", and emphatically not "an object with a `_clock` attribute
+  pointing at the same source". Review 9 tried the latter and it was wrong: that is a
+  duck-type test, and any wrapper satisfies it while returning entirely different time
+  (offset, scale, cache, re-epoch), which fully reopened the clock-domain split it was
+  meant to close. Sameness is proven, never inferred. The broker's wrapped clock does
+  not exist until the broker does, so a vault holding it cannot have issued anything
+  beforehand: a prepopulated injected vault is refused rather than accepted and
+  silently rebound.
+- **Security time is validated at the read AND at the derivation.** Every read goes
+  through `checked_now` (non-numeric and non-finite refused) inside `MonotonicClock`,
+  which enforces the monotonic contract the `Clock` protocol has always documented and
+  reads under its own lock, so concurrent reads are one linearized sequence rather than
+  racing observations. Every derived expiry goes through `checked_expiry`, because
+  validating the OPERANDS is not validating the value the comparison actually uses:
+  `1e308 + 1e308` is `inf` from two finite operands, and no finite clock reading can
+  ever reach `inf`, so the authorization would never expire. A clock or expiry failure
+  is a typed refusal (`MintRefusal.CLOCK_UNUSABLE`), not a crash.
+- **Configuration types are exact.** `bool` is an `int` subclass, so
+  `Budget(max_actions=True)` was silently the budget `1`, and
+  `count_denied_attempts="false"` is TRUTHY, so a plausible typo selected the OPPOSITE
+  budget mode. Tool ids must match an anchored slug grammar, enforced identically at
+  registration (trusted config) and in a proposal (untrusted model output), so the
+  catalog's accept-set and the JSON parser's cannot drift apart.
 
 ## Terminal state is honest
 
@@ -438,7 +455,7 @@ attacks.
 - `capcore/adapters.py` - `OllamaModel` (a real local LLM as an untrusted
   `ModelClient`), `ScriptedModel`, proposal parsing.
 - `capcore/MODEL.md` - semantics, test regime, mutation results, open decisions.
-- `scripts/mutation_check.py` - reintroduces 85 known defects; asserts the suite
+- `scripts/mutation_check.py` - reintroduces 103 known defects; asserts the suite
   catches each.
 - `scripts/demo_live.py` - a real local LLM driven through the full trusted loop.
 - `scripts/demo_live_m3.py` - a real secret over real HTTPS, through the broker.

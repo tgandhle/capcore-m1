@@ -198,6 +198,38 @@ MUTATIONS = [
      "        if len(buf) > max_bytes:\n            raise ProviderResponseTooLarge(\n                f\"provider response exceeded {max_bytes} bytes\")",
      "        if False:\n            raise ProviderResponseTooLarge(\n                f\"provider response exceeded {max_bytes} bytes\")",
      "capcore/httptool.py"),
+    # R10-LOW. The parser's accept-set and the catalog's accept-set must agree. They
+    # had drifted: `t}` was a legal ToolRegistration id and a legal ExecutionProposal
+    # tool id, but parse_model_output's non-greedy `\{.*?\}` extractor is not
+    # string-aware, so a `}` inside the tool id truncated the match and the whole
+    # proposal came back INVALID. A legitimately registered tool was unreachable
+    # through the model path. Not an authorization bypass: a domain mismatch.
+    #
+    # Fixed at the REGISTRATION boundary (a slug grammar, a strictly narrower
+    # accept-set) rather than by loosening the extractor. The reviewer proposed
+    # `candidate = text.strip()` because the system prompt demands one bare JSON
+    # object; that reasoning is unsound, since the model is UNTRUSTED and what the
+    # prompt asks for does not constrain what arrives.
+    ("tool_id_grammar_unenforced_at_registration",
+     "        try:\n            validate_tool_id(self.registration_id)\n        except ValueError as exc:\n            raise CatalogError(f\"invalid tool registration_id: {exc}\") from exc",
+     "        if not self.registration_id:  # BUG: any non-empty string is a tool id\n            raise CatalogError(\"tool registration_id must be non-empty\")",
+     "capcore/broker.py",
+     ("capcore/tests/test_review10_hardening.py::test_tool_registration_id_must_be_a_slug",)),
+    # And the proposal side must enforce the SAME grammar, or the accept-sets drift
+    # apart again the moment one of them is edited.
+    ("tool_id_grammar_unenforced_in_proposal",
+     "        try:\n            validate_tool_id(self.tool_registration_id)\n        except ValueError as exc:\n            raise AuthorizationError(f\"invalid tool_registration_id: {exc}\") from exc",
+     "        if type(self.tool_registration_id) is not str or not self.tool_registration_id:  # BUG: no grammar\n            raise AuthorizationError(\"execution proposal requires an exact str tool_registration_id\")",
+     "capcore/broker.py",
+     ("capcore/tests/test_review10_hardening.py::test_execution_proposal_tool_id_must_be_a_slug",)),
+    # The grammar must be anchored. An unanchored search matches a legal slug ANYWHERE
+    # in the string, so `t}` passes because `t` matches.
+    ("tool_id_pattern_unanchored",
+     "TOOL_ID_PATTERN = re.compile(r\"\\A[A-Za-z0-9][A-Za-z0-9._-]*\\Z\")",
+     "TOOL_ID_PATTERN = re.compile(r\"[A-Za-z0-9][A-Za-z0-9._-]*\")  # BUG: unanchored",
+     "capcore/broker.py",
+     ("capcore/tests/test_review10_hardening.py::test_tool_registration_id_must_be_a_slug",
+      "capcore/tests/test_review10_hardening.py::test_execution_proposal_tool_id_must_be_a_slug")),
     ("proposal_accepts_str_subclass_resource",
      "    if type(path) is not str:\n        raise ResourceError(\"resource must be an exact built-in str\")",
      "    if False:\n        raise ResourceError(\"resource must be an exact built-in str\")",
@@ -256,6 +288,38 @@ MUTATIONS = [
     # Removing the pre-authorization gate: max_actions no longer bounds attempts
     # when denied attempts count. The run authorizes, classifies, and counts an
     # attempt it had no budget for.
+    # R10-F5. bool is an int SUBCLASS, so isinstance(True, int) is True and
+    # Budget(max_actions=True) was silently accepted as the budget 1. The project
+    # already closes str-subclass holes with `type(x) is not str` (see
+    # proposal_accepts_str_subclass_resource); Budget never got the same discipline.
+    ("budget_limit_type_not_exact",
+     "            if type(value) is not int:      # exact: rejects bool, float, numpy ints",
+     "            if not isinstance(value, int):  # BUG: bool is an int subclass",
+     "capcore/runtime.py",
+     ("capcore/tests/test_review10_hardening.py::test_budget_rejects_boolean_limits",
+      "capcore/tests/test_review10_hardening.py::test_budget_type_check_covers_the_deprecated_alias")),
+    # The nastier half: count_denied_attempts="false" is TRUTHY, so a plausible config
+    # typo silently selected the OPPOSITE budget mode.
+    ("budget_mode_flag_not_exact_bool",
+     "        if type(self.count_denied_attempts) is not bool:",
+     "        if False:  # BUG: any truthy value selects counted mode",
+     "capcore/runtime.py",
+     ("capcore/tests/test_review10_hardening.py::test_budget_requires_boolean_count_mode",)),
+    # The type check must run BEFORE the alias is resolved: max_steps propagates into
+    # max_actions and max_iterations, so validating only the destinations lets a bool
+    # alias become a bool budget.
+    ("budget_alias_not_type_checked",
+     "        for name in (\"max_actions\", \"max_iterations\", \"max_steps\"):",
+     "        for name in (\"max_actions\", \"max_iterations\"):  # BUG: alias unchecked",
+     "capcore/runtime.py",
+     ("capcore/tests/test_review10_hardening.py::test_budget_type_check_covers_the_deprecated_alias",)),
+    # A budget with no limit at all left max_actions=None, and `steps_taken >= None`
+    # raises TypeError deep inside step(). Configuration error, not a default.
+    ("budget_without_a_limit_accepted",
+     "        if self.max_actions is None or self.max_iterations is None:",
+     "        if False:  # BUG: a budget with no limit is accepted, and crashes later",
+     "capcore/runtime.py",
+     ("capcore/tests/test_review10_hardening.py::test_budget_requires_a_limit",)),
     ("counted_attempt_budget_not_enforced",
      "        if self.budget.count_denied_attempts:\n            if record.steps_taken >= self.budget.max_actions:",
      "        if False:  # BUG: attempt budget never gates\n            if record.steps_taken >= self.budget.max_actions:",
@@ -448,10 +512,48 @@ MUTATIONS = [
      "capcore/broker.py",
      ("capcore/tests/test_review9_hardening.py::test_broker_refuses_a_post_seal_grant_at_its_own_boundary",)),
     # issue_credential must be refused after seal.
+    # R10-F1. The vault is the THIRD object the broker accepts by reference and
+    # retains, and Review 9 sealed only two of them (catalog, policy). A caller
+    # holding the vault could issue a credential after seal_configuration(), and
+    # with a prepopulated injected catalog naming it, deliver the secret to an
+    # adapter. Same shape as the R9 policy hole, one object over.
+    ("vault_seal_not_propagated",
+     "        self._catalog.seal()\n        self._policy.seal()\n        self._vault.seal()",
+     "        self._catalog.seal()\n        self._policy.seal()\n        pass  # BUG: the vault stays publicly mutable after the seal",
+     "capcore/broker.py",
+     ("capcore/tests/test_review10_hardening.py::test_retained_vault_cannot_issue_after_configuration_seal",)),
+    # And the vault's own refusal must actually refuse.
+    ("sealed_vault_still_issues",
+     "            if self._sealed:\n                raise CredentialError(\n                    \"credential vault is sealed; no issuance after seal\")",
+     "            if False:  # BUG: a sealed vault issues anyway\n                raise CredentialError(\n                    \"credential vault is sealed; no issuance after seal\")",
+     "capcore/broker.py",
+     ("capcore/tests/test_review10_hardening.py::test_retained_vault_cannot_issue_after_configuration_seal",
+      "capcore/tests/test_review10_hardening.py::test_vault_seal_is_idempotent")),
+    # register_tool validates that a credentialed registration's credential exists.
+    # An INJECTED prepopulated catalog never passes through register_tool, so the
+    # check is simply not run. The seal is the last point the configuration can be
+    # validated as a whole, so it is where the whole-configuration check belongs.
+    ("seal_skips_configuration_validation",
+     "        self._validate_configuration()\n        self._catalog.seal()",
+     "        pass  # BUG: seal an incoherent configuration\n        self._catalog.seal()",
+     "capcore/broker.py",
+     ("capcore/tests/test_review10_hardening.py::test_seal_rejects_credentialed_registration_without_credential",)),
+    # The validation must actually reject a dangling credential_id, not merely run.
+    ("dangling_credential_id_accepted_at_seal",
+     "            if reg.credential_id not in available:",
+     "            if False:  # BUG: a credentialed tool may name a missing credential",
+     "capcore/broker.py",
+     ("capcore/tests/test_review10_hardening.py::test_seal_rejects_credentialed_registration_without_credential",)),
+    # Review 10 note: sealing the vault makes this guard REDUNDANT, which is exactly
+    # what disarmed grant_after_seal_allowed in R9 when ToolPolicy got its seal. It
+    # survives here only because the broker raises CatalogError and the vault raises
+    # CredentialError, so a type assertion still distinguishes them. That is luck,
+    # not design, so the selector pins the broker's OWN message deliberately.
     ("issue_after_seal_allowed",
      "        if self._config_sealed:\n            raise CatalogError(\"configuration is sealed; no credential issuance after seal\")",
      "        if False:\n            raise CatalogError(\"configuration is sealed; no credential issuance after seal\")",
-     "capcore/broker.py"),
+     "capcore/broker.py",
+     ("capcore/tests/test_review10_hardening.py::test_broker_refuses_post_seal_issuance_at_its_own_boundary",)),
     ("mint_allows_unsealed_catalog",
      "        if not self._config_sealed:\n            self._record(\"-\", None, action, False, \"configuration not sealed\")\n            raise MintRefused(MintRefusal.CATALOG_NOT_SEALED, \"configuration is not sealed\")",
      "        if False:\n            self._record(\"-\", None, action, False, \"configuration not sealed\")\n            raise MintRefused(MintRefusal.CATALOG_NOT_SEALED, \"configuration is not sealed\")",
@@ -504,12 +606,54 @@ MUTATIONS = [
     # neither is safe: NaN makes every comparison False (nothing ever expires),
     # while inf makes `now >= expires_at` True (authorization fails closed, by
     # luck) but `inf - inf` NaN (credential TTL never fires). Reject both.
+    # R10-F4. checked_now validates the OPERANDS of a security time; it does not
+    # validate the value the comparison ACTUALLY USES. Two finite operands overflow:
+    # 1e308 + 1e308 = inf, and no finite clock reading can ever reach inf, so the
+    # authorization never expires. Same class as R6 (validated TTLs) and R9 (validated
+    # clocks), one level up: each round validated the inputs and not the derivation.
+    ("derived_expiry_finiteness_unchecked",
+     "    if not math.isfinite(expires_at):\n        raise ClockError(",
+     "    if False:  # BUG: a finite clock and a finite TTL may overflow to inf\n        raise ClockError(",
+     "capcore/broker.py",
+     ("capcore/tests/test_review10_hardening.py::test_finite_time_and_ttl_cannot_create_infinite_action_expiry",
+      "capcore/tests/test_review10_hardening.py::test_finite_time_and_ttl_cannot_create_infinite_credential_expiry")),
+    # The strictly-later check is NOT redundant with finiteness: a subnormal TTL
+    # (1e-320) added to 100.0 rounds to exactly 100.0, which is finite but a
+    # ZERO-length lifetime. The credential is born already expired.
+    ("derived_expiry_may_not_advance",
+     "    if expires_at <= now:\n        raise ClockError(\"expiry must be strictly later than the issue time\")",
+     "    if False:  # BUG: a zero or negative lifetime is accepted\n        raise ClockError(\"expiry must be strictly later than the issue time\")",
+     "capcore/broker.py",
+     ("capcore/tests/test_review10_hardening.py::test_a_ttl_too_small_to_change_the_clock_is_rejected",)),
+    # The mint must USE the validated expiry, not recompute an unvalidated one.
+    ("mint_expiry_not_validated",
+     "            expires_at = checked_expiry(now, self._action_ttl)",
+     "            expires_at = now + self._action_ttl  # BUG: unvalidated derivation",
+     "capcore/broker.py",
+     ("capcore/tests/test_review10_hardening.py::test_finite_time_and_ttl_cannot_create_infinite_action_expiry",)),
+    # And so must credential issuance.
+    ("credential_expiry_not_validated_at_issue",
+     "            if cred.ttl_seconds is not None:\n                checked_expiry(issued_at, cred.ttl_seconds)",
+     "            if False:  # BUG: a credential TTL that can never elapse is accepted\n                checked_expiry(issued_at, cred.ttl_seconds)",
+     "capcore/broker.py",
+     ("capcore/tests/test_review10_hardening.py::test_finite_time_and_ttl_cannot_create_infinite_credential_expiry",
+      "capcore/tests/test_review10_hardening.py::test_a_ttl_too_small_to_change_the_clock_is_rejected")),
+    # Review 10 note: R10's checked_expiry (F4) made this guard REDUNDANT on most paths
+    # and the mutation SURVIVED a full harness run. With finiteness unchecked at the
+    # read, a NaN clock still yields `nan + ttl = nan`, checked_expiry rejects it, and
+    # the outcome is the same CLOCK_UNUSABLE refusal, so every outcome-asserting test
+    # stayed green. Fourth instance of a new guard disarming an older one.
+    #
+    # Defense in depth held; falsifiability did not. The selectors below pin the
+    # LAYERING (checked_now's own message) and the one input for which this guard is
+    # the ONLY guard: a credential with ttl_seconds=None never reaches checked_expiry
+    # at all, so nothing else would stop `issued_at = nan`.
     ("clock_finiteness_unchecked",
      "    if not math.isfinite(value):\n        raise ClockError(\"clock returned non-finite time\")",
      "    if False:  # BUG: a NaN or inf clock disables every expiry\n        raise ClockError(\"clock returned non-finite time\")",
      "capcore/broker.py",
-     ("capcore/tests/test_review9_hardening.py::test_nan_clock_fails_closed_at_mint",
-      "capcore/tests/test_review9_hardening.py::test_infinite_clock_does_not_disable_credential_ttl")),
+     ("capcore/tests/test_review10_hardening.py::test_the_clock_read_itself_refuses_a_non_finite_value",
+      "capcore/tests/test_review10_hardening.py::test_a_ttl_less_credential_cannot_be_stamped_with_a_non_finite_time")),
     # A clock returning a str makes every comparison a TypeError deep inside
     # redemption, with a live credential already in play. Fail at the READ.
     ("clock_type_unchecked",
@@ -520,6 +664,17 @@ MUTATIONS = [
     # Clock is DOCUMENTED as monotonic and was never checked. A clock that moves
     # backward extends every authorization and credential lifetime even when all
     # its values are finite.
+    # R10-F3. The clock read and the watermark comparison must happen under ONE lock.
+    # Reading outside it (the R9 form, mine) lets two threads linearize valid reads in
+    # the wrong order: A reads 100 and is descheduled, B reads 101 and records the
+    # watermark, A resumes and compares 100 against 101 and raises. The clock never
+    # moved backward. Fails CLOSED (a spurious typed refusal), so availability, not
+    # integrity, but it breaks valid concurrent mints for no reason.
+    ("monotonic_clock_read_outside_the_lock",
+     "        with self._lock:\n            value = checked_now(self._clock)\n            if self._high_water is not None and value < self._high_water:",
+     "        value = checked_now(self._clock)  # BUG: read outside the lock\n        with self._lock:\n            if self._high_water is not None and value < self._high_water:",
+     "capcore/broker.py",
+     ("capcore/tests/test_review10_hardening.py::test_concurrent_monotonic_reads_do_not_false_detect_backward_time",)),
     ("clock_monotonicity_unchecked",
      "            if self._high_water is not None and value < self._high_water:\n                raise ClockError(\"clock moved backward; time source is not monotonic\")",
      "            if False:  # BUG: time may run backward, extending every lifetime\n                raise ClockError(\"clock moved backward; time source is not monotonic\")",
@@ -540,17 +695,40 @@ MUTATIONS = [
      "        except ClockError:\n            raise  # BUG: crash into the engine instead of a typed refusal",
      "capcore/broker.py",
      ("capcore/tests/test_review9_hardening.py::test_clock_failure_is_an_honest_outcome_not_a_crash",)),
-    # Re-anchored (Review 9 F5): the broker now wraps its clock in MonotonicClock,
-    # so a caller cannot hold the broker's exact clock object and identity is checked
-    # against the UNDERLYING source instead. The Review 8 invariant is unchanged
-    # (vault and broker must share ONE clock domain); only the comparison moved.
+    # R10-F2. Re-anchored AGAIN, reverting the R9 form. R9 relaxed this to
+    # `getattr(vault.clock, "_clock", vault.clock) is raw_clock`, which is a DUCK-TYPE
+    # test, not an identity test: any wrapper with a `_clock` attribute satisfies it
+    # while returning entirely different time (offset, scale, cache, re-epoch), so the
+    # R8 clock-domain split was fully reopened. Exact identity, no introspection.
     ("injected_vault_clock_not_checked",
-     "            if underlying is not raw_clock:\n                raise ValueError(",
+     "            if vault.clock is not raw_clock:\n                raise ValueError(",
      "            if False:  # BUG: accept a vault from a different clock domain\n                raise ValueError(",
-     "capcore/broker.py"),
+     "capcore/broker.py",
+     ("capcore/tests/test_review10_hardening.py::test_offset_clock_wrapper_is_not_the_same_clock_domain",)),
+    # The specific R9 regression, as its own mutation: a check that INFERS domain
+    # sameness by introspecting a private attribute name accepts an offset wrapper.
+    # This is what shipped, and it must never ship again.
+    ("vault_clock_domain_inferred_by_introspection",
+     "            if vault.clock is not raw_clock:",
+     "            if getattr(vault.clock, \"_clock\", vault.clock) is not raw_clock:  # BUG: duck-typed, not identity",
+     "capcore/broker.py",
+     ("capcore/tests/test_review10_hardening.py::test_offset_clock_wrapper_is_not_the_same_clock_domain",
+      "capcore/tests/test_review10_hardening.py::test_preissued_vault_credential_cannot_survive_clock_rebinding")),
+    # An injected vault must be EMPTY: credentials it already holds were stamped by a
+    # clock the broker cannot verify, and rebinding then strands them in the wrong
+    # domain. This is the other half of what makes the rebind sound.
+    ("prepopulated_vault_accepted",
+     "            if not vault.is_empty:\n                raise ValueError(",
+     "            if False:  # BUG: accept a vault with unverifiable issue times\n                raise ValueError(",
+     "capcore/broker.py",
+     ("capcore/tests/test_review10_hardening.py::test_a_prepopulated_injected_vault_is_refused",
+      "capcore/tests/test_review10_hardening.py::test_preissued_vault_credential_cannot_survive_clock_rebinding")),
+    # Re-anchored (Review 10 F4): the issue-time stamp is now a separate statement, so
+    # its derived expiry can be validated before the record is built. The invariant is
+    # unchanged (issue time comes from the TRUSTED clock, never from the caller).
     ("credential_issue_time_not_stamped",
-     "            issued_at=self._clock.now(),",
-     "            issued_at=0.0,  # BUG: ignore the clock, every credential epoch-issued",
+     "            issued_at = self._clock.now()",
+     "            issued_at = 0.0  # BUG: ignore the clock, every credential epoch-issued",
      "capcore/broker.py"),
     ("broker_stores_unnormalized_tool_result",
      "    if type(out) is not str:\n        return False, None",
