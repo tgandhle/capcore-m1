@@ -16,7 +16,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python ${{ matrix.python-version }}
@@ -31,8 +31,17 @@ jobs:
         run: python -m pytest -q
 
   # Slower gate: the mutation check reintroduces each known defect and asserts
-  # the suite catches it. Runs once (Linux, one Python) since it is
-  # platform-independent and takes a couple of minutes.
+  # the suite catches it. Runs once (Linux, one Python) because it takes several
+  # minutes and the matrix would multiply that by eight.
+  #
+  # NOT because it is platform-independent. It is not, and this comment used to say
+  # so. Review 9 disproved it: a test can be green on one interpreter and red on
+  # another for the same defect (3.14 parses 10000-deep JSON that 3.11-3.13 reject),
+  # so a mutation guarding it could be caught on some interpreters and survive on
+  # others. Running on 3.12 only is a COST decision, and the residual risk is real.
+  # The mitigation is upstream, in how mutations are written: prefer controls that
+  # are pure functions of their input (a nesting cap) over ones that depend on
+  # interpreter behaviour (catching RecursionError).
   mutation-check:
     name: mutation check
     runs-on: ubuntu-latest
