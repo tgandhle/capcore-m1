@@ -163,15 +163,24 @@ def test_valid_done_response_is_finished():
 
 def test_call_decodes_strictly_not_with_replace():
     """errors='replace' silently repairs malformed bytes, contradicting the
-    fail-closed unicode decision. Check the actual decode CALL, not comments."""
+    fail-closed unicode decision. Check the actual decode CALL, not comments.
+
+    The decode itself now lives in decode_provider_envelope, which Review 9
+    extracted from _call so the envelope's untrusted-input gates (utf-8, JSON
+    nesting cap, shape) are testable without a live provider. The INVARIANT is
+    unchanged, so this test follows the code rather than pinning it in place:
+    inspect both, and require the strict decode to exist in one of them and a
+    repairing decode in NEITHER.
+    """
     import inspect
     import re
-    from capcore.adapters import OllamaModel
-    src = inspect.getsource(OllamaModel._call)
+    from capcore.adapters import OllamaModel, decode_provider_envelope
+    src = (inspect.getsource(OllamaModel._call)
+           + inspect.getsource(decode_provider_envelope))
     # find every .decode(...) call and assert none passes errors="replace"
     for call in re.findall(r"\.decode\([^)]*\)", src):
         assert "replace" not in call, (
-            f"_call decodes with a repairing errors mode: {call}"
+            f"the provider path decodes with a repairing errors mode: {call}"
         )
     # and it must strict-decode somewhere
     assert '.decode("utf-8")' in src or ".decode('utf-8')" in src

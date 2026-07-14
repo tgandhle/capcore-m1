@@ -33,6 +33,135 @@ from capcore.runtime import ModelResult, ModelView
 OLLAMA_URL = "http://localhost:11434/api/generate"
 DEFAULT_MODEL = "llama3.2"
 
+
+# --------------------------------------------------------------------------- #
+# JSON nesting cap. The control against a decoder blowing its stack on
+# provider-controlled input.
+# --------------------------------------------------------------------------- #
+
+MAX_JSON_NESTING = 16
+"""Maximum container nesting accepted from a provider, checked BEFORE decoding.
+
+Depth convention (increment on `[` and `{`):
+    {}            -> 1
+    {"a": []}     -> 2
+    {"a": [[]]}   -> 3
+
+Both accepted schemas are depth 1 (`{"verb":..,"resource":..,"tool":..}` and
+`{"done":true}`), so 16 is pure margin: it leaves room for nested metadata later
+without revisiting a security control, while staying far below any depth that
+troubles a decoder.
+
+WHY A CAP AND NOT `except RecursionError`.
+
+Widening the except clause is the obvious fix and it is NOT sufficient. Evidence,
+from this project's own supported interpreters:
+
+    CPython 3.11-3.13   json.loads() at depth 10000 raises RecursionError
+    CPython 3.14.6      json.loads() at depth 10000 PARSES, with the default
+                        recursion limit (1000) untouched
+
+RecursionError is therefore a property of the DECODER'S IMPLEMENTATION on a given
+interpreter, not a property of the INPUT. Two consequences:
+
+  1. On 3.14 a hostile model can send a complete, well-formed, otherwise-valid
+     proposal carrying a 10000-deep field and it parses straight through. There is
+     no exception for the engine to catch, so the input is not rejected: it is
+     ACCEPTED. "Fail closed" was a 3.11-3.13 property, not a system property.
+  2. 3.14 did not remove the bound, it RAISED it. Some greater depth still
+     exhausts the C scanner's stack, and a native stack overflow is not a
+     catchable RecursionError. `except Exception` cannot save you from a segfault,
+     which is why the provider-envelope decode needs the cap too even though
+     next_proposal already wraps it broadly.
+
+A cap is a pure function of the input, so it behaves identically on every
+interpreter, and it is testable and mutatable on every interpreter. RecursionError
+stays in the except tuples below as defense in depth, never as the control.
+"""
+
+
+def json_nesting_within_limit(text: str, *, limit: int = MAX_JSON_NESTING) -> bool:
+    """True if `text` nests no deeper than `limit`. STRING-AWARE.
+
+    The string-awareness is not a nicety. A naive bracket counter is WORSE than no
+    scanner at all: it would reject legitimate output whose string VALUES contain
+    brackets, and a resource path like "acme/api/[x]" or an error message the
+    model is quoting back are entirely ordinary. Rejecting those would be a silent
+    availability bug introduced by a security control.
+
+    So: characters inside a JSON string are content, not structure. A backslash
+    escapes the next character, which means `\\"` does NOT end the string but
+    `\\\\` followed by `"` DOES (the backslash is itself escaped). Getting that
+    wrong in either direction is exploitable: exit string state too early and you
+    count content brackets as structure; stay in string state forever and you stop
+    counting real structure after the first quote.
+
+    This does NOT validate JSON. Malformed input (unbalanced, unterminated string)
+    may still return True; json.loads rejects it immediately after. The scanner's
+    ONE job is to refuse excessive nesting before the decoder ever sees it.
+    """
+    depth = 0
+    in_string = False
+    escaped = False
+
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == "[" or char == "{":
+            depth += 1
+            if depth > limit:
+                return False
+        elif char == "]" or char == "}":
+            depth -= 1
+            if depth < 0:
+                return False
+
+    return True
+
+
+def decode_provider_envelope(raw: bytes) -> str:
+    """Decode the provider's HTTP envelope and return its `response` field.
+
+    Extracted from OllamaModel._call so the envelope's own untrusted-input gates
+    (utf-8, nesting, shape) are testable WITHOUT a live provider or a network.
+    This is the SECOND decoder in the pipeline operating on provider-controlled
+    bytes, and it gets the same nesting cap as the first for the same reason.
+    """
+    from capcore.httptool import ProviderProtocolError
+
+    # STRICT decode: do NOT silently repair malformed bytes with errors="replace".
+    # Malformed provider unicode fails closed, consistent with every other
+    # untrusted-text boundary.
+    try:
+        decoded = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ProviderProtocolError("provider response is not valid utf-8") from exc
+
+    # Cap BEFORE decode. next_proposal wraps _call in `except Exception`, which
+    # catches a RecursionError but NOT a native stack overflow.
+    if not json_nesting_within_limit(decoded):
+        raise ProviderProtocolError("provider response exceeds JSON nesting limit")
+
+    try:
+        obj = json.loads(decoded)
+    except (json.JSONDecodeError, ValueError, RecursionError) as exc:
+        raise ProviderProtocolError("provider response is not valid JSON") from exc
+    if type(obj) is not dict:
+        raise ProviderProtocolError("provider response must be a JSON object")
+    text = obj.get("response")
+    if type(text) is not str:
+        raise ProviderProtocolError("provider response field must be a string")
+    return text
+
 # The model is asked to emit ONE action as a compact JSON object. We keep the
 # grammar tiny so a small local model can follow it. The engine treats whatever
 # comes back as untrusted regardless.
@@ -91,9 +220,21 @@ def parse_model_output(text: str) -> ParsedModelOutput:
     match = re.search(r"\{.*?\}", text, re.DOTALL)
     if not match:
         return ParsedModelOutput(ParsedOutputKind.INVALID)
+    candidate = match.group(0)
+
+    # Cap the nesting of the JSON CANDIDATE, before json.loads sees it. Applied to
+    # the candidate rather than the whole text on purpose: braces in explanatory
+    # prose the model wrapped around its JSON are not JSON structure and must not
+    # count toward depth.
+    if not json_nesting_within_limit(candidate):
+        return ParsedModelOutput(ParsedOutputKind.INVALID)
+
     try:
-        obj = json.loads(match.group(0))
-    except (json.JSONDecodeError, ValueError):
+        obj = json.loads(candidate)
+    except (json.JSONDecodeError, ValueError, RecursionError):
+        # RecursionError is a BACKSTOP, not the control: see MAX_JSON_NESTING. On
+        # 3.11-3.13 the decoder raises it, on 3.14 it does not, so a fix relying on
+        # it would hold on some interpreters and not others.
         return ParsedModelOutput(ParsedOutputKind.INVALID)
     if not isinstance(obj, dict):
         return ParsedModelOutput(ParsedOutputKind.INVALID)
@@ -166,10 +307,9 @@ class OllamaModel:
 
     def _call(self, prompt: str) -> str:
         # imported lazily so the parsing logic has no hard dependency on requests
-        import json as _json
         import requests
         from capcore import MAX_PROVIDER_HTTP_BODY_BYTES
-        from capcore.httptool import bounded_read, ProviderProtocolError
+        from capcore.httptool import bounded_read
         # The response is used as a CONTEXT MANAGER so the connection is closed on
         # every exit path (success, size rejection, protocol error, HTTP error),
         # not left awaiting garbage collection.
@@ -190,24 +330,9 @@ class OllamaModel:
             # lie about Content-Length).
             raw = bounded_read(resp, MAX_PROVIDER_HTTP_BODY_BYTES)
 
-        # STRICT decode: do NOT silently repair malformed bytes with
-        # errors="replace". Malformed provider unicode fails closed, consistent
-        # with every other untrusted-text boundary.
-        try:
-            decoded = raw.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise ProviderProtocolError("provider response is not valid utf-8") from exc
-
-        try:
-            obj = _json.loads(decoded)
-        except (ValueError, _json.JSONDecodeError) as exc:
-            raise ProviderProtocolError("provider response is not valid JSON") from exc
-        if type(obj) is not dict:
-            raise ProviderProtocolError("provider response must be a JSON object")
-        text = obj.get("response")
-        if type(text) is not str:
-            raise ProviderProtocolError("provider response field must be a string")
-        return text
+        # utf-8, nesting cap, and shape checks all live in the extracted decoder,
+        # so they are testable without a live provider.
+        return decode_provider_envelope(raw)
 
     def next_proposal(self, view: ModelView) -> ModelResult:
         """Return a TYPED result. A provider failure is not a completion.

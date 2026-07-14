@@ -572,18 +572,55 @@ class ExecutionEngine:
             record.history.append(res)
             return res
 
-        # 1. Propose-time authorization (control flow + audit) FIRST. M1's
-        #    classification (DENY / REQUIRE_APPROVAL) must survive budget
-        #    exhaustion: an out-of-scope proposal is DENIED, not BUDGET_EXHAUSTED,
-        #    even when the action budget is spent. So the budget gate comes AFTER
-        #    the DENY/APPROVAL returns below, not before authorization.
+        # 1. THE BUDGET GATE, WHOSE POSITION DEPENDS ON THE MODE.
+        #
+        # The two budget modes mean different things and therefore need different
+        # orderings. Review 8 moved the gate after authorization to fix the
+        # non-counting mode, and applied that ordering to BOTH, which silently
+        # disabled the attempt budget in the counting mode.
+        #
+        #   count_denied_attempts=True   max_actions is an ATTEMPT budget: how many
+        #                                proposals the model may put to the monitor
+        #                                at all. So it must be checked BEFORE
+        #                                authorization, or the run authorizes,
+        #                                classifies, and counts an attempt it had no
+        #                                budget for. (max_actions=1 with one attempt
+        #                                spent still produced a DENIED and
+        #                                steps_taken=2.)
+        #
+        #   count_denied_attempts=False  max_actions is an EXECUTION budget: only
+        #                                actions that actually run consume it. An M1
+        #                                denial must therefore keep its honest
+        #                                classification (DENIED, not
+        #                                BUDGET_EXHAUSTED) even once the budget is
+        #                                spent, so the gate comes AFTER
+        #                                authorization. This is the Review 8
+        #                                invariant and it must not regress.
+        #
+        # The structural max_iterations ceiling (in run()) is what prevents an
+        # unbounded loop; it always applied and still does. This is about policy
+        # semantics: what max_actions is a budget FOR.
+        if self.budget.count_denied_attempts:
+            if record.steps_taken >= self.budget.max_actions:
+                record.state = RunState.ABORTED
+                res = StepResult(StepOutcome.BUDGET_EXHAUSTED, action,
+                                 audit_reason="run budget exhausted")
+                record.history.append(res)
+                return res
+
+        # 2. Propose-time authorization (control flow + audit). In the NON-counting
+        #    mode this precedes the budget gate on purpose: M1's classification
+        #    (DENY / REQUIRE_APPROVAL) must survive execution-budget exhaustion, so
+        #    an out-of-scope proposal is DENIED, not BUDGET_EXHAUSTED, even when the
+        #    budget is spent.
         first = self._authorize(record.ctx, action)
 
         # Budget accounting for DENIED / APPROVAL happens here ONLY when the run
-        # counts denied attempts. With count_denied_attempts=False, an M1 denial
-        # or approval classification does not consume the ACTION budget; the count
-        # for an authorized action is deferred until the broker actually mints an
-        # authorization (execution attempted). See the mint site below.
+        # counts denied attempts (and the gate above has already confirmed there
+        # was budget for this attempt). With count_denied_attempts=False, an M1
+        # denial or approval classification does not consume the ACTION budget; the
+        # count for an authorized action is deferred until the broker actually
+        # mints an authorization (execution attempted). See the mint site below.
         if self.budget.count_denied_attempts and first.verdict != Verdict.ALLOW:
             record.steps_taken += 1
 
@@ -598,15 +635,18 @@ class ExecutionEngine:
             record.history.append(res)
             return res
 
-        # 2. Budget gate, AFTER M1 classification. Only an ALLOWed action that
-        #    would actually execute is subject to the action budget; a denial or
-        #    approval has already returned above with its honest classification.
-        if record.steps_taken >= self.budget.max_actions:
-            record.state = RunState.ABORTED
-            res = StepResult(StepOutcome.BUDGET_EXHAUSTED, action,
-                             audit_reason="run budget exhausted")
-            record.history.append(res)
-            return res
+        # 3. Budget gate for the NON-counting mode, AFTER M1 classification. Only an
+        #    ALLOWed action that would actually execute is subject to the execution
+        #    budget; a denial or approval has already returned above with its honest
+        #    classification. In the counting mode this was already checked at step 1,
+        #    so it is skipped here rather than double-gated.
+        if not self.budget.count_denied_attempts:
+            if record.steps_taken >= self.budget.max_actions:
+                record.state = RunState.ABORTED
+                res = StepResult(StepOutcome.BUDGET_EXHAUSTED, action,
+                                 audit_reason="run budget exhausted")
+                record.history.append(res)
+                return res
 
         # 3. Test hook: a revocation may fire here, between propose and execute.
         if self._pre_execute_hook is not None:

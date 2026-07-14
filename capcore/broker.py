@@ -144,6 +144,77 @@ class SystemClock:
         return time.monotonic()
 
 
+class ClockError(Exception):
+    """The trusted time source produced a value that cannot be used for a security
+    decision. Fail closed: a broken clock must stop the action, never silently
+    disable an expiry."""
+    pass
+
+
+def checked_now(clock: Clock) -> float:
+    """Read the trusted clock and REFUSE a value that cannot bound a lifetime.
+
+    Round 6 rejected non-finite TTL VALUES. That is not sufficient, because a
+    non-finite time SOURCE turns a perfectly finite TTL into a non-expiring
+    control. The arithmetic is worth spelling out, because the two non-finite
+    values fail DIFFERENTLY and neither is safe:
+
+      NaN.  Every comparison against NaN is False. The redemption gate
+            `now >= expires_at` is False, so an authorization stamped NaN never
+            expires. The TTL gate `now - issued_at >= ttl` is False, so a
+            credential never expires. Both controls are simply off.
+
+      inf.  `now >= expires_at` is `inf >= inf` -> True, so an AUTHORIZATION reads
+            as already expired and happens to fail closed. But `now - issued_at` is
+            `inf - inf` -> NaN, so `NaN >= ttl` is False and the CREDENTIAL TTL
+            never fires. Fails closed in one place and open in the other, by luck
+            rather than design, which is exactly the kind of accidental correctness
+            this project refuses to rely on.
+
+    So: one checked read, used everywhere security time is consumed. A clock that
+    cannot say what time it is stops the action.
+
+    Type is checked before value: a clock returning a str makes every comparison a
+    TypeError deep inside redemption, with a live credential already in play. Fail
+    at the READ, not mid-action. bool is excluded explicitly (it is an int
+    subclass, and True as a timestamp is nonsense).
+    """
+    value = clock.now()
+    if type(value) not in (int, float):
+        raise ClockError("clock must return a number")
+    value = float(value)
+    if not math.isfinite(value):
+        raise ClockError("clock returned non-finite time")
+    return value
+
+
+class MonotonicClock:
+    """Wraps a Clock and enforces the MONOTONIC contract the Clock protocol has
+    always documented but never checked.
+
+    A clock that moves backward extends every lifetime even when all its values are
+    finite: an authorization minted at t=100 with a 30s TTL is still 'unexpired' at
+    a later read of t=50, and a credential's elapsed time shrinks. `checked_now` is
+    a pure per-value check and cannot see this; catching it needs state, so it
+    lives here rather than being folded into checked_now.
+
+    The watermark is deliberately NOT reset by anything. Time going backward is a
+    broken trusted component, not a recoverable condition.
+    """
+    def __init__(self, clock: Clock):
+        self._clock = clock
+        self._high_water: Optional[float] = None
+        self._lock = threading.Lock()
+
+    def now(self) -> float:
+        value = checked_now(self._clock)
+        with self._lock:
+            if self._high_water is not None and value < self._high_water:
+                raise ClockError("clock moved backward; time source is not monotonic")
+            self._high_water = value
+        return value
+
+
 class FakeClock:
     """A controllable clock for tests. Replaces the removed `now=` backdoor.
 
@@ -594,13 +665,46 @@ class ToolPolicy:
     no tool at all. This is the same posture as capability default-deny in M1, and
     it is deliberately strict: an allow-unless-denied default would reintroduce
     exactly the hole above for every newly registered tool.
+
+    SEALING. The policy owns its own sealed state, and this is load-bearing.
+
+    An earlier version had the seal live only on the broker: seal_configuration()
+    refused broker.grant_tool() afterwards, and the README said sealing sealed the
+    whole configuration. It did not. The broker accepts a caller-supplied policy
+    (the supported public constructor arg) and RETAINS THE SAME REFERENCE, so the
+    caller still held an object whose public grant() method kept working after the
+    seal, and a grant added that way still minted authorizations. No private-field
+    access, no object-graph attack: just the documented API doing something the
+    documentation said was impossible.
+
+    Sealing the broker is therefore not enough. The policy object itself has to
+    refuse, because the policy object is the thing a caller can still be holding.
+
+    As with any in-process object, malicious TCB code can still reach in and mutate
+    _sealed directly. The invariant being established is narrower and honest: the
+    SUPPORTED PUBLIC API cannot change policy after the seal.
     """
 
     def __init__(self, grants: Optional[list[ToolGrant]] = None):
         self._grants: list[ToolGrant] = list(grants or [])
+        self._sealed = False
+        self._lock = threading.Lock()
+
+    @property
+    def is_sealed(self) -> bool:
+        return self._sealed
+
+    def seal(self) -> None:
+        """Freeze the policy. Idempotent: a seal is a STATE, not an event, so
+        sealing an already-sealed policy is not an error."""
+        with self._lock:
+            self._sealed = True
 
     def grant(self, registration_id: str, scope: str) -> None:
-        self._grants.append(ToolGrant(registration_id, scope))
+        with self._lock:
+            if self._sealed:
+                raise CatalogError("tool policy is sealed; no grants after seal")
+            self._grants.append(ToolGrant(registration_id, scope))
 
     def allows(self, registration_id: str, action: Proposal) -> bool:
         for g in self._grants:
@@ -809,6 +913,9 @@ class MintRefusal(Enum):
     ACTION_ID_EXHAUSTED = "action_id_exhausted"
     NOT_AN_EXECUTION_PROPOSAL = "not_an_execution_proposal"
     ACTION_NOT_UTF8 = "action_not_utf8"
+    CLOCK_UNUSABLE = "clock_unusable"      # the trusted time source failed its
+    #                  own validation (non-numeric, non-finite, or went backward).
+    #                  A lifetime cannot be bounded, so nothing may be authorized.
 
 
 class MintRefused(AuthorizationError):
@@ -903,23 +1010,45 @@ class TrustedExecutionBroker:
             raise ValueError("action_ttl_seconds must be a positive finite number")
         # ONE clock, owned here. All TTL and expiry decisions read it. Production
         # methods do not accept a caller `now`; tests inject a FakeClock instead.
-        self._clock = clock or SystemClock()
+        #
+        # It is wrapped ONCE, here, in MonotonicClock, which validates every read
+        # (checked_now: numeric, finite) and enforces the monotonic contract the
+        # Clock protocol documents. Wrapping at the boundary rather than validating
+        # at each call site means a future clock read cannot forget to check: there
+        # is no unchecked clock in the broker to read FROM. The vault gets the same
+        # wrapped object, so both sides of the credential TTL (issue-time stamp and
+        # elapsed-time check) are measured against one validated clock domain.
+        raw_clock = clock or SystemClock()
+        self._clock = MonotonicClock(raw_clock)
         self._monitor = monitor
         self._catalog = catalog or ToolCatalog()
         self._policy = policy or ToolPolicy()      # deny-by-default when empty
-        # The vault stamps credential issue-time from the trusted clock. A
-        # supplied vault MUST already use the broker's clock object. Rewriting its
-        # clock (the old behaviour) silently created a clock-domain split:
-        # credentials issued under the vault's ORIGINAL clock kept their old
-        # issued_at, so a TTL measured against the broker's clock could be wrong
-        # (a credential outliving its TTL, or expiring early). Require identity and
-        # refuse divergence rather than paper over it.
+        # The vault stamps credential issue-time from the trusted clock. A supplied
+        # vault MUST be in the broker's clock DOMAIN. Rewriting its clock (the
+        # pre-Review-8 behaviour) silently created a clock-domain split: credentials
+        # issued under the vault's ORIGINAL clock kept their old issued_at, so a TTL
+        # measured against the broker's clock could be wrong (a credential outliving
+        # its TTL, or expiring early). Require sameness and refuse divergence rather
+        # than paper over it.
+        #
+        # Review 9 note: the broker now wraps its clock in MonotonicClock, so a
+        # caller CANNOT hold the broker's exact clock object (it does not exist until
+        # the broker builds it). Identity is therefore checked against the UNDERLYING
+        # source, which is the thing the Review 8 invariant was actually about: one
+        # clock domain, not one Python object. A vault whose underlying clock differs
+        # is still refused; a vault built on the same source is accepted and then
+        # REBOUND to the broker's wrapper below, so its reads are validated too. That
+        # rebinding is not the old silent rewrite: the domain is proven identical
+        # first, and the only change is that reads now go through validation.
         if vault is not None:
-            if vault.clock is not self._clock:
+            supplied = vault.clock
+            underlying = getattr(supplied, "_clock", supplied)
+            if underlying is not raw_clock:
                 raise ValueError(
                     "injected credential vault must use the broker's clock object; "
                     "construct the vault with the same clock, or let the broker own it"
                 )
+            vault._clock = self._clock   # same domain, now validated on every read
             self._vault = vault
         else:
             self._vault = CredentialVault(self._clock)
@@ -974,8 +1103,15 @@ class TrustedExecutionBroker:
         against an unsealed configuration, so the lifecycle
         (register -> grant -> issue -> seal -> execute) is explicit and the
         configuration state is visible, never silently mutable trusted state.
+
+        The policy is sealed THROUGH ITS OWN seal(), not by a flag here. Setting a
+        broker-side flag alone left a real hole: a caller-supplied policy is
+        retained by reference, so its public grant() kept working after the seal
+        and the new grant still minted. The object a caller can still hold is the
+        object that has to refuse.
         """
         self._catalog.seal()
+        self._policy.seal()
         self._config_sealed = True
 
     def seal_catalog(self) -> None:
@@ -1071,7 +1207,15 @@ class TrustedExecutionBroker:
             self._record("-", None, action, False, "tool registration is not authorized")
             raise MintRefused(MintRefusal.TOOL_NOT_AUTHORIZED, "tool registration is not authorized")
 
-        now = self._clock.now()
+        # Security time. A clock that cannot say what time it is cannot bound an
+        # authorization's lifetime, so the mint is REFUSED with a typed code rather
+        # than raising into the engine: an honest terminal state, not a crash.
+        try:
+            now = self._clock.now()
+        except ClockError as exc:
+            self._record("-", None, action, False, "clock unusable")
+            raise MintRefused(MintRefusal.CLOCK_UNUSABLE, "clock unusable") from exc
+
         # A colliding action_id must not overwrite an existing authorization. put()
         # fails closed on a duplicate; retry with a fresh random id a bounded
         # number of times, then give up (a persistent collision means the RNG is
@@ -1111,7 +1255,17 @@ class TrustedExecutionBroker:
         state. That is what closes substitution: a valid action_id cannot be aimed
         at a different credential or a different adapter.
         """
-        now = self._clock.now()
+        # Security time, at the moment of decision. A clock that cannot say what
+        # time it is cannot decide whether this authorization has expired, so it
+        # must not be redeemed. Fail closed rather than raise into the engine with
+        # a credential about to be touched.
+        try:
+            now = self._clock.now()
+        except ClockError:
+            self._pending.settle(action_id, AuthorizationState.FAILED)
+            self._record(action_id, None, None, False, "clock unusable")
+            return SanitizedToolResult(ok=False, code="authorization_refused",
+                                       audit_code="clock_unusable")
 
         try:
             rec = self._pending.claim(action_id, now)

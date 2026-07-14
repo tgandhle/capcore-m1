@@ -33,7 +33,7 @@ Three layers, each with its own trust boundary:
 "Single-process trust model" is load-bearing, not a hedge. See
 [Trust model](#trust-model).
 
-268 tests pass. `python scripts/mutation_check.py` reintroduces 68 known defects
+307 tests pass. `python scripts/mutation_check.py` reintroduces 85 known defects
 one at a time and asserts the suite catches every one (it mutates a temporary
 copy, never your working tree). CI runs Python 3.11-3.13 on Ubuntu and Windows.
 
@@ -357,20 +357,44 @@ remote service:
   response via a context manager. A hostile allowed endpoint can no longer force
   unbounded memory allocation in the credentialed path. (High, remote-reachable.)
 - **Model-output parsing is total.** `parse_model_output` never raises: a
-  non-string, oversized, or otherwise malformed input becomes a typed INVALID
-  result instead of an escaping exception.
-- **M1 classification survives budget exhaustion.** The action-budget gate runs
-  AFTER authorization, so an out-of-scope proposal is DENIED, not
-  BUDGET_EXHAUSTED, even when the budget is spent.
-- **Sealing seals the whole configuration.** `seal_configuration()` freezes the
-  catalog, the tool policy, AND credential issuance. `grant_tool` and
-  `issue_credential` are refused after sealing (`seal_catalog()` remains as a
-  deprecated alias). "Sealed" means sealed, not "catalog frozen, policy still
-  mutable."
-- **An injected vault must share the broker clock.** The broker no longer
-  rewrites an injected vault's clock (which created a clock-domain split where a
-  credential could outlive its TTL); it requires clock identity and refuses a
-  mismatch.
+  non-string, oversized, malformed, or excessively nested input becomes a typed
+  INVALID result instead of an escaping exception. Nesting is capped
+  (`MAX_JSON_NESTING`, 16) by a string-aware scanner BEFORE decoding, on both the
+  model-output candidate and the provider envelope. The cap, not `except
+  RecursionError`, is the control: CPython 3.11-3.13 raise RecursionError at depth
+  10000 while 3.14 simply PARSES it, so the exception is a property of the
+  interpreter, not of the input.
+- **A non-success HTTP status is a tool failure, not an execution.** Only an
+  accepted status (2xx by default, or an explicit `accepted_statuses`) reports
+  EXECUTED. A 500, a 403, or an unfollowed 302 is a sanitized TOOL_ERROR. The
+  status is chosen by the remote endpoint, so treating any status as success let an
+  untrusted party select the runtime's terminal state. (High, remote-reachable.)
+- **What `max_actions` bounds depends on the mode, and the gate is ordered
+  accordingly.** With `count_denied_attempts=True` it is an ATTEMPT budget, checked
+  BEFORE authorization. With `count_denied_attempts=False` it is an EXECUTION
+  budget, checked AFTER, so an out-of-scope proposal is DENIED (its honest M1
+  classification), not BUDGET_EXHAUSTED, even when the budget is spent. Applying one
+  ordering to both modes silently disabled the attempt budget, which is why they are
+  now deliberately different.
+- **Sealing seals the whole configuration, including a policy you still hold.**
+  `seal_configuration()` freezes the catalog, the tool policy, AND credential
+  issuance. The policy is sealed through its own `seal()`, not a broker-side flag:
+  the broker retains a caller-supplied `ToolPolicy` by reference, so a flag alone
+  left the caller's own `policy.grant()` working after the seal, and the late grant
+  still minted. The object a caller can still be holding is the object that has to
+  refuse. In-process TCB code can of course still mutate private state; the claim is
+  the narrower, honest one: the SUPPORTED PUBLIC API cannot change policy after the
+  seal.
+- **An injected vault must share the broker's clock domain, and the clock's OUTPUT
+  is validated.** Clock identity is checked against the underlying source (the
+  broker wraps its clock, so a caller cannot hold the wrapper). Every security-time
+  read goes through `checked_now`: non-numeric and non-finite values are refused,
+  and `MonotonicClock` enforces the monotonic contract the `Clock` protocol has
+  always documented. This matters because a finite TTL under a broken clock stops
+  expiring: NaN makes every comparison False (nothing expires), and inf makes
+  `inf - inf` NaN (a credential's TTL never fires, even though the authorization
+  gate happens to fail closed). A clock failure is a typed refusal
+  (`MintRefusal.CLOCK_UNUSABLE`), not a crash.
 
 ## Terminal state is honest
 
@@ -414,7 +438,7 @@ attacks.
 - `capcore/adapters.py` - `OllamaModel` (a real local LLM as an untrusted
   `ModelClient`), `ScriptedModel`, proposal parsing.
 - `capcore/MODEL.md` - semantics, test regime, mutation results, open decisions.
-- `scripts/mutation_check.py` - reintroduces 68 known defects; asserts the suite
+- `scripts/mutation_check.py` - reintroduces 85 known defects; asserts the suite
   catches each.
 - `scripts/demo_live.py` - a real local LLM driven through the full trusted loop.
 - `scripts/demo_live_m3.py` - a real secret over real HTTPS, through the broker.

@@ -22,6 +22,19 @@ class DestinationError(ValueError):
     pass
 
 
+class RemoteServiceError(Exception):
+    """The remote service answered, but not with success, so the requested action
+    did not necessarily occur.
+
+    Carries NO detail: not the status, not the headers, not the credential, not
+    the remote body. The broker discards every exception out of a credentialed
+    adapter without inspecting it, so detail here would be pointless at best and,
+    if a careless future edit interpolated the request headers, a secret leak at
+    worst. The message is a constant for that reason.
+    """
+    pass
+
+
 class ProviderResponseTooLarge(Exception):
     """A provider response exceeded the maximum permitted body size."""
     pass
@@ -187,10 +200,18 @@ class HttpTool:
     not either. A 3xx from the allowed host would otherwise send the Authorization
     header to whatever Location says, which defeats the entire point of pinning a
     destination. `real_requests_transport` sets allow_redirects=False.
+
+    OUTCOME CLASSIFICATION. A status code is chosen by the REMOTE endpoint, which
+    is untrusted. Turning any status into a success string let that endpoint pick
+    the runtime's terminal state: a 500, a 403, or an unfollowed 302 all reported
+    StepOutcome.EXECUTED, which says the action HAPPENED when it did not. Only an
+    accepted status is success now; everything else raises and the broker maps it
+    to a sanitized tool failure. See `accepted_statuses`.
     """
     def __init__(self, allowed_url: str, transport: Transport, method: str = "GET",
                  allowed_hosts: Optional[frozenset[str]] = None,
-                 allowed_ports: frozenset[int] = DEFAULT_ALLOWED_PORTS):
+                 allowed_ports: frozenset[int] = DEFAULT_ALLOWED_PORTS,
+                 accepted_statuses: Optional[frozenset[int]] = None):
         # Validate and normalize BEFORE storing. An HttpTool that exists is an
         # HttpTool whose destination is safe.
         self.allowed_url = validate_destination(
@@ -198,6 +219,27 @@ class HttpTool:
         )
         self.transport = transport
         self.method = method
+        # Which statuses mean "the action occurred". The default is 2xx and only
+        # 2xx. A tool for which some other status is a legitimate business outcome
+        # (a 404 that means "absent", say) must say so EXPLICITLY at construction;
+        # it is never the silent default, because the silent default is the thing
+        # that let a remote 500 read as a successful execution.
+        #
+        # Note this is deliberately NOT `response.raise_for_status()`. In requests,
+        # raise_for_status() does not treat 3xx as an error, and a 3xx here means
+        # the request was redirected and NOT followed (that is what protects the
+        # credential), so the action definitively did not occur.
+        if accepted_statuses is None:
+            self.accepted_statuses = None  # means: the 2xx range
+        else:
+            if not all(type(s) is int for s in accepted_statuses):
+                raise DestinationError("accepted_statuses must be a set of ints")
+            self.accepted_statuses = frozenset(accepted_statuses)
+
+    def _is_success(self, status: int) -> bool:
+        if self.accepted_statuses is None:
+            return 200 <= status < 300
+        return status in self.accepted_statuses
 
     def execute_with_credential(self, proposal: Proposal, secret: Secret) -> str:
         """A CredentialedTool. Called ONLY by the broker, inside its boundary.
@@ -208,8 +250,26 @@ class HttpTool:
         message (a hostile or careless transport will), which is exactly why the
         BROKER catches and discards every exception from this call rather than
         trusting adapters to sanitize their own errors.
+
+        The RemoteServiceError raised below is deliberately generic: no headers,
+        no credential, no remote body, not even the status code. The broker
+        discards the exception object without inspecting it, so every failure here
+        collapses to one sanitized TOOL_ERROR. That loses the distinction between
+        a 500 and a 403, which is the right trade: an adapter holding a live secret
+        is the last place that should be composing detailed error text, and the
+        model is not entitled to a channel for reading remote status codes back.
         """
         headers = {"Authorization": f"Bearer {secret.reveal()}"}
         resp = self.transport(self.method, self.allowed_url, headers)
+
+        status = resp.get("status") if isinstance(resp, dict) else None
+        if type(status) is not int or isinstance(status, bool):
+            # A transport that cannot even say what happened has not established
+            # that the action occurred. Fail closed.
+            raise RemoteServiceError("remote service returned an invalid status")
+
+        if not self._is_success(status):
+            raise RemoteServiceError("remote service returned a non-success status")
+
         # redacted summary; never echo the secret
-        return f"http {resp['status']} from {self.allowed_url}"
+        return f"http {status} from {self.allowed_url}"

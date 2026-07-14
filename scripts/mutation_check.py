@@ -54,9 +54,20 @@ ROOT = Path(__file__).resolve().parent.parent
 CORE_REL = Path("capcore") / "__init__.py"
 PER_MUTATION_TIMEOUT = 120  # seconds; a caught mutation returns well under this
 
-# (name, exact source snippet to find, replacement). `find` must occur exactly
-# once; otherwise the mutation is reported stale. Covers all documented
-# defects: original seven plus six from hardening review.
+# (name, exact source snippet to find, replacement, file[, selectors]). `find` must
+# occur exactly once; otherwise the mutation is reported stale (run
+# scripts/check_stale.py). Covers every documented defect from every review round
+# to date: 85 as of round 9.
+#
+# WHY THE FULL RUN MATTERS, not just check_stale. A mutation can still match its
+# anchor, still pass check_stale, and have quietly STOPPED BITING, because a later
+# fix made the guard it targets redundant or moved the code the killing test
+# exercised. Round 9 hit this three times: splitting the budget gate per mode
+# disarmed budget_not_enforced and budget_gate_disabled, and adding the ToolPolicy
+# seal disarmed grant_after_seal_allowed (the policy refused, so removing the
+# broker's own check changed nothing observable). In every case the suite was green
+# and check_stale was clean. Only the full run caught it. A stale anchor is loud; an
+# anchor that matches while no longer biting is silent.
 MUTATIONS = [
     ("untrusted_identity_from_proposal",
      "            if cap.tenant != ctx.tenant:\n                continue",
@@ -95,6 +106,59 @@ MUTATIONS = [
     # including completion. Removing the size check lets an oversized {"done"}
     # through as FINISHED.
     # The parser must be total: a non-str input must return INVALID, not raise.
+    # R9-F2. The JSON nesting cap. RecursionError is NOT the control: 3.11-3.13
+    # raise it at depth 10000 and 3.14 does not (it parses), so a fix relying on
+    # the exception holds on some interpreters and not others. Only a pre-decode
+    # cap is a pure function of the input and therefore identical everywhere.
+    #
+    # DELIBERATELY UNMUTATED: the `RecursionError` entries in the two except
+    # tuples. They cannot be given a catchable mutation, and this is honest rather
+    # than an oversight. Removing either is a no-op, because the cap has ALREADY
+    # rejected any input deep enough to make the decoder recurse; falsifying them
+    # would need an input the cap accepts (depth <= 16) but the decoder still blows
+    # up on, which does not exist. They are unreachable-by-construction defense in
+    # depth against a future bug in the cap itself. The alternative was deleting a
+    # cheap guard to satisfy a metric, or writing a mutation that "passes" by
+    # riding on unrelated red tests. Both are worse.
+    ("model_output_nesting_uncapped",
+     "    if not json_nesting_within_limit(candidate):",
+     "    if False:  # BUG: let the decoder cope with arbitrary nesting",
+     "capcore/adapters.py",
+     ("capcore/tests/test_review9_hardening.py::test_deeply_nested_json_returns_invalid",
+      "capcore/tests/test_review9_hardening.py::test_json_depth_one_past_the_limit_is_rejected")),
+    # Off by one: depth == limit is LEGAL. `>=` silently rejects a payload at the
+    # documented boundary, which is a compatibility break dressed as a control.
+    ("json_nesting_limit_off_by_one",
+     "            if depth > limit:",
+     "            if depth >= limit:  # BUG: rejects the documented limit itself",
+     "capcore/adapters.py",
+     ("capcore/tests/test_review9_hardening.py::test_json_depth_at_the_limit_is_accepted",)),
+    # A scanner that does not track string state counts brackets inside string
+    # VALUES as structure, and rejects legitimate output (a resource path like
+    # "acme/api/[x]"). A naive counter is WORSE than none.
+    ("json_nesting_scanner_ignores_strings",
+     "        if char == '\"':\n            in_string = True",
+     "        if False:  # BUG: treat string content as structure\n            in_string = True",
+     "capcore/adapters.py",
+     ("capcore/tests/test_review9_hardening.py::test_brackets_inside_strings_do_not_count",
+      "capcore/tests/test_review9_hardening.py::test_a_json_string_containing_brackets_still_parses")),
+    # Not tracking escapes is the DANGEROUS direction: an escaped backslash before
+    # a quote leaves the scanner stuck in string state, so it stops counting real
+    # structure and ACCEPTS an over-deep payload.
+    ("json_nesting_scanner_ignores_escapes",
+     "            elif char == \"\\\\\":\n                escaped = True",
+     "            elif False:  # BUG: ignore escapes\n                escaped = True",
+     "capcore/adapters.py",
+     ("capcore/tests/test_review9_hardening.py::test_escaped_backslash_before_quote_is_handled",
+      "capcore/tests/test_review9_hardening.py::test_escaped_quote_does_not_end_string_state")),
+    # The provider ENVELOPE is a second decoder on provider-controlled bytes.
+    # next_proposal's `except Exception` catches a RecursionError there but not a
+    # native stack overflow, so the envelope needs the cap too.
+    ("provider_envelope_nesting_uncapped",
+     "    if not json_nesting_within_limit(decoded):",
+     "    if False:  # BUG: envelope may nest arbitrarily deep",
+     "capcore/adapters.py",
+     ("capcore/tests/test_review9_hardening.py::test_provider_envelope_depth_is_capped_before_decode",)),
     ("parse_model_output_non_string_raises",
      "    if type(text) is not str:\n        return ParsedModelOutput(ParsedOutputKind.INVALID)",
      "    if False:\n        return ParsedModelOutput(ParsedOutputKind.INVALID)",
@@ -118,14 +182,17 @@ MUTATIONS = [
     # unbounded body be buffered.
     # The provider transport must decode strictly. Reverting to errors="replace"
     # silently repairs malformed bytes, defeating the fail-closed unicode rule.
+    # NOTE: the envelope decode moved from OllamaModel._call into the extracted
+    # decode_provider_envelope (Review 9 F2), so it is testable without a live
+    # provider. The invariant is unchanged; the anchors are dedented to match.
     ("provider_decode_repairs_malformed",
-     "            decoded = raw.decode(\"utf-8\")",
-     "            decoded = raw.decode(\"utf-8\", errors=\"replace\")  # BUG: repair",
+     "        decoded = raw.decode(\"utf-8\")",
+     "        decoded = raw.decode(\"utf-8\", errors=\"replace\")  # BUG: repair",
      "capcore/adapters.py"),
     # The provider response field must be an exact str.
     ("provider_response_field_untyped",
-     "        if type(text) is not str:\n            raise ProviderProtocolError(\"provider response field must be a string\")",
-     "        if False:\n            raise ProviderProtocolError(\"provider response field must be a string\")",
+     "    if type(text) is not str:\n        raise ProviderProtocolError(\"provider response field must be a string\")",
+     "    if False:\n        raise ProviderProtocolError(\"provider response field must be a string\")",
      "capcore/adapters.py"),
     ("bounded_read_unbounded",
      "        if len(buf) > max_bytes:\n            raise ProviderResponseTooLarge(\n                f\"provider response exceeded {max_bytes} bytes\")",
@@ -181,14 +248,41 @@ MUTATIONS = [
     # A broker-denied action (nothing executed) must not consume the action
     # budget when count_denied_attempts is False. Counting it before the mint
     # re-conflates denial with execution.
+    # R9-F3. The two budget modes need DIFFERENT orderings. Applying one to both
+    # is precisely the Review 8 regression: the gate moved after authorization to
+    # protect the non-counting mode's honest DENIED classification, which silently
+    # disabled the ATTEMPT budget in the counting mode.
+    #
+    # Removing the pre-authorization gate: max_actions no longer bounds attempts
+    # when denied attempts count. The run authorizes, classifies, and counts an
+    # attempt it had no budget for.
+    ("counted_attempt_budget_not_enforced",
+     "        if self.budget.count_denied_attempts:\n            if record.steps_taken >= self.budget.max_actions:",
+     "        if False:  # BUG: attempt budget never gates\n            if record.steps_taken >= self.budget.max_actions:",
+     "capcore/runtime.py",
+     ("capcore/tests/test_review9_hardening.py::test_counted_denial_respects_exhausted_attempt_budget",
+      "capcore/tests/test_review9_hardening.py::test_counted_approval_respects_exhausted_attempt_budget")),
+    # NOT MUTATED, and deliberately so: the MIRROR defect (gating the non-counting
+    # mode BEFORE authorization, which is the Review 8 bug) cannot be expressed as a
+    # line substitution. Flipping the `if not self.budget.count_denied_attempts:`
+    # guard at step 3 to `if True:` is INERT, because by the time control reaches
+    # step 3 a denied proposal has already returned DENIED at step 2. Reintroducing
+    # that bug requires MOVING the gate, which this harness (a line-substitution
+    # mutator) cannot do. The invariant is instead held by the control test
+    # test_non_counted_denial_still_survives_execution_budget, and by the existing
+    # denied_action_consumes_budget and budget_gate_disabled mutations below.
     ("denied_action_consumes_budget",
      "        # The broker minted an authorization: execution is now being attempted,\n        # which may produce an external effect. Count it exactly once here, for\n        # BOTH budget modes.\n        record.steps_taken += 1",
      "        pass  # BUG: never count executed actions, or count them before mint",
      "capcore/runtime.py"),
+    # Re-anchored (Review 9 F3): the single budget gate became two, one per mode,
+    # because the modes need different orderings. This one is the NON-COUNTING
+    # (execution) budget: an allowed action past it must not run.
     ("budget_not_enforced",
-     "        if record.steps_taken >= self.budget.max_actions:\n            record.state = RunState.ABORTED\n            res = StepResult(StepOutcome.BUDGET_EXHAUSTED, action,",
-     "        if False:  # BUG: never enforce budget\n            record.state = RunState.ABORTED\n            res = StepResult(StepOutcome.BUDGET_EXHAUSTED, action,",
-     "capcore/runtime.py"),
+     "        if not self.budget.count_denied_attempts:\n            if record.steps_taken >= self.budget.max_actions:\n                record.state = RunState.ABORTED",
+     "        if not self.budget.count_denied_attempts:\n            if False:  # BUG: never enforce the execution budget\n                record.state = RunState.ABORTED",
+     "capcore/runtime.py",
+     ("capcore/tests/test_review9_hardening.py::test_non_counted_execution_budget_is_enforced",)),
     # The engine's independent loop ceiling: a hostile model must not be able to
     # produce an unbounded run even if trusted counter state were corrupted.
     # The action budget (step-level) and the iteration ceiling (loop) must be
@@ -225,10 +319,14 @@ MUTATIONS = [
      "capcore/runtime.py"),
     # M1 classification must survive budget exhaustion. Moving the budget gate
     # BEFORE the DENY/APPROVAL returns re-hides denials as BUDGET_EXHAUSTED.
+    # Re-anchored (Review 9 F3). The COUNTING (attempt) budget's ABORT: exhausting
+    # the attempt budget must abort the run, not merely refuse one step and let the
+    # loop keep asking.
     ("budget_gate_disabled",
-     "        # 2. Budget gate, AFTER M1 classification. Only an ALLOWed action that\n        #    would actually execute is subject to the action budget; a denial or\n        #    approval has already returned above with its honest classification.\n        if record.steps_taken >= self.budget.max_actions:",
-     "        # 2. Budget gate.\n        if False:  # BUG: budget gate disabled  # was: steps_taken >= max_actions",
-     "capcore/runtime.py"),
+     "        if self.budget.count_denied_attempts:\n            if record.steps_taken >= self.budget.max_actions:\n                record.state = RunState.ABORTED",
+     "        if self.budget.count_denied_attempts:\n            if record.steps_taken >= self.budget.max_actions:\n                record.state = RunState.RUNNING  # BUG: exhaustion does not abort",
+     "capcore/runtime.py",
+     ("capcore/tests/test_review9_hardening.py::test_counted_budget_exhaustion_aborts_the_run",)),
     ("run_retains_invalid_proposal_in_history",
      "                if not valid_proposal(result.proposal.action):",
      "                if False:  # BUG: let a malformed action into history",
@@ -337,10 +435,18 @@ MUTATIONS = [
     # proceed against a mutable catalog.
     # grant_tool must be refused after seal_configuration(). Removing the guard
     # lets policy be mutated after sealing.
+    # Review 9 note: this guard became REDUNDANT with the policy's own seal (F4),
+    # and the redundancy silently disarmed this mutation: with the broker's check
+    # removed, ToolPolicy.grant() still refuses, so a type-only assertion cannot
+    # tell the difference and the mutation SURVIVED a full harness run. Defense in
+    # depth held, but a guard nothing tests is a guard nothing tests. The selector
+    # below asserts the broker refuses at ITS OWN boundary (its own message), which
+    # makes the two layers separately killable.
     ("grant_after_seal_allowed",
      "        if self._config_sealed:\n            raise CatalogError(\"configuration is sealed; no grants after seal\")",
      "        if False:\n            raise CatalogError(\"configuration is sealed; no grants after seal\")",
-     "capcore/broker.py"),
+     "capcore/broker.py",
+     ("capcore/tests/test_review9_hardening.py::test_broker_refuses_a_post_seal_grant_at_its_own_boundary",)),
     # issue_credential must be refused after seal.
     ("issue_after_seal_allowed",
      "        if self._config_sealed:\n            raise CatalogError(\"configuration is sealed; no credential issuance after seal\")",
@@ -352,9 +458,39 @@ MUTATIONS = [
      "capcore/broker.py"),
     # Sealing must actually block registration. If seal() is a no-op, the
     # lifecycle guarantee is void.
+    # R9-F4. "Sealed" must mean sealed. The broker retains a caller-supplied policy
+    # BY REFERENCE (the supported public constructor arg), so a broker-side flag
+    # alone left the policy's own public grant() working after the seal, and the
+    # late grant still minted. The object a caller can still hold is the object
+    # that has to refuse.
+    ("policy_seal_not_propagated",
+     "        self._catalog.seal()\n        self._policy.seal()",
+     "        self._catalog.seal()\n        pass  # BUG: seal the catalog but not the policy",
+     "capcore/broker.py",
+     ("capcore/tests/test_review9_hardening.py::test_retained_policy_reference_cannot_grant_after_seal",)),
+    # And the policy's own refusal must actually refuse. A seal() that sets the
+    # flag while grant() ignores it is the same hole with extra ceremony.
+    ("sealed_policy_still_grants",
+     "            if self._sealed:\n                raise CatalogError(\"tool policy is sealed; no grants after seal\")",
+     "            if False:  # BUG: sealed policy accepts grants anyway\n                raise CatalogError(\"tool policy is sealed; no grants after seal\")",
+     "capcore/broker.py",
+     ("capcore/tests/test_review9_hardening.py::test_retained_policy_reference_cannot_grant_after_seal",
+      "capcore/tests/test_review9_hardening.py::test_policy_seal_is_idempotent")),
+    # The seal must FREEZE the policy, not empty it: grants made before the seal
+    # must survive it. A seal that discards them fails closed on everything, which
+    # is not a fix, it is a different bug.
+    ("policy_seal_discards_grants",
+     "    def seal(self) -> None:\n        \"\"\"Freeze the policy. Idempotent: a seal is a STATE, not an event, so\n        sealing an already-sealed policy is not an error.\"\"\"\n        with self._lock:\n            self._sealed = True",
+     "    def seal(self) -> None:\n        \"\"\"Freeze the policy. Idempotent: a seal is a STATE, not an event, so\n        sealing an already-sealed policy is not an error.\"\"\"\n        with self._lock:\n            self._grants = []  # BUG: seal empties the policy\n            self._sealed = True",
+     "capcore/broker.py",
+     ("capcore/tests/test_review9_hardening.py::test_grants_made_before_seal_still_work",)),
+    # Anchored on the catalog's seal SIGNATURE, not just its body: Review 9 gave
+    # ToolPolicy a seal() with an identical body, so a body-only anchor matched
+    # twice and check_stale (correctly) flagged it stale. The two seals are
+    # different invariants and need different mutations.
     ("catalog_seal_is_noop",
-     "        with self._lock:\n            self._sealed = True",
-     "        with self._lock:\n            self._sealed = self._sealed  # BUG: seal does nothing",
+     "    def seal(self) -> None:\n        with self._lock:\n            self._sealed = True",
+     "    def seal(self) -> None:\n        with self._lock:\n            self._sealed = self._sealed  # BUG: seal does nothing",
      "capcore/broker.py"),
     ("redemption_ignores_tool_generation",
      "            if reg is None or gen != rec.tool_generation:",
@@ -362,9 +498,55 @@ MUTATIONS = [
      "capcore/broker.py"),
     # An injected vault must share the broker clock. Removing the identity check
     # reintroduces the clock-domain split (rewriting or ignoring the mismatch).
+    # R9-F5. The clock's OUTPUT is security-load-bearing, not just its identity.
+    # Round 6 rejected non-finite TTL VALUES; a non-finite time SOURCE turns a
+    # finite TTL into a non-expiring control. NaN and inf fail differently and
+    # neither is safe: NaN makes every comparison False (nothing ever expires),
+    # while inf makes `now >= expires_at` True (authorization fails closed, by
+    # luck) but `inf - inf` NaN (credential TTL never fires). Reject both.
+    ("clock_finiteness_unchecked",
+     "    if not math.isfinite(value):\n        raise ClockError(\"clock returned non-finite time\")",
+     "    if False:  # BUG: a NaN or inf clock disables every expiry\n        raise ClockError(\"clock returned non-finite time\")",
+     "capcore/broker.py",
+     ("capcore/tests/test_review9_hardening.py::test_nan_clock_fails_closed_at_mint",
+      "capcore/tests/test_review9_hardening.py::test_infinite_clock_does_not_disable_credential_ttl")),
+    # A clock returning a str makes every comparison a TypeError deep inside
+    # redemption, with a live credential already in play. Fail at the READ.
+    ("clock_type_unchecked",
+     "    if type(value) not in (int, float):\n        raise ClockError(\"clock must return a number\")",
+     "    if False:  # BUG: trust whatever the clock returned\n        raise ClockError(\"clock must return a number\")",
+     "capcore/broker.py",
+     ("capcore/tests/test_review9_hardening.py::test_non_numeric_clock_is_rejected",)),
+    # Clock is DOCUMENTED as monotonic and was never checked. A clock that moves
+    # backward extends every authorization and credential lifetime even when all
+    # its values are finite.
+    ("clock_monotonicity_unchecked",
+     "            if self._high_water is not None and value < self._high_water:\n                raise ClockError(\"clock moved backward; time source is not monotonic\")",
+     "            if False:  # BUG: time may run backward, extending every lifetime\n                raise ClockError(\"clock moved backward; time source is not monotonic\")",
+     "capcore/broker.py",
+     ("capcore/tests/test_review9_hardening.py::test_backward_clock_is_rejected",)),
+    # The wrapper must actually be installed. An unwrapped clock is an unchecked
+    # clock, and every read below it bypasses validation.
+    ("broker_clock_not_wrapped",
+     "        self._clock = MonotonicClock(raw_clock)",
+     "        self._clock = raw_clock  # BUG: reads bypass validation entirely",
+     "capcore/broker.py",
+     ("capcore/tests/test_review9_hardening.py::test_nan_clock_fails_closed_at_mint",
+      "capcore/tests/test_review9_hardening.py::test_backward_clock_is_rejected")),
+    # A clock failure must be an HONEST TERMINAL STATE, not an escaping exception.
+    # Nothing executing is necessary but not sufficient: the run must say why.
+    ("clock_error_escapes_as_crash",
+     "        except ClockError as exc:\n            self._record(\"-\", None, action, False, \"clock unusable\")\n            raise MintRefused(MintRefusal.CLOCK_UNUSABLE, \"clock unusable\") from exc",
+     "        except ClockError:\n            raise  # BUG: crash into the engine instead of a typed refusal",
+     "capcore/broker.py",
+     ("capcore/tests/test_review9_hardening.py::test_clock_failure_is_an_honest_outcome_not_a_crash",)),
+    # Re-anchored (Review 9 F5): the broker now wraps its clock in MonotonicClock,
+    # so a caller cannot hold the broker's exact clock object and identity is checked
+    # against the UNDERLYING source instead. The Review 8 invariant is unchanged
+    # (vault and broker must share ONE clock domain); only the comparison moved.
     ("injected_vault_clock_not_checked",
-     "            if vault.clock is not self._clock:\n                raise ValueError(",
-     "            if False:\n                raise ValueError(",
+     "            if underlying is not raw_clock:\n                raise ValueError(",
+     "            if False:  # BUG: accept a vault from a different clock domain\n                raise ValueError(",
      "capcore/broker.py"),
     ("credential_issue_time_not_stamped",
      "            issued_at=self._clock.now(),",
@@ -410,6 +592,31 @@ MUTATIONS = [
      "    with requests.request(method, url, headers=headers, timeout=30,\n                          allow_redirects=False, stream=True) as response:\n        return {\"status\": response.status_code}",
      "    response = requests.request(method, url, headers=headers, timeout=30,\n                          allow_redirects=False)\n    return {\"status\": response.status_code, \"body\": response.text}",
      "capcore/httptool.py"),
+    # R9-F1. The remote endpoint picks the status code. Treating every status as
+    # success lets an UNTRUSTED party choose the runtime's terminal state: a 500,
+    # a 403, or an unfollowed 302 all reported EXECUTED, i.e. "the action
+    # happened", when it demonstrably did not.
+    ("http_non_success_status_reported_as_executed",
+     "        if not self._is_success(status):",
+     "        if False:  # BUG: any status is a successful execution",
+     "capcore/httptool.py",
+     ("capcore/tests/test_review9_hardening.py::test_http_500_is_not_reported_as_executed",
+      "capcore/tests/test_review9_hardening.py::test_http_302_is_not_reported_as_executed")),
+    # 2xx-and-only-2xx is the DEFAULT accepted range. Widening it to "whatever the
+    # endpoint says" is the same defect wearing a different hat.
+    ("http_accepted_status_range_widened",
+     "            return 200 <= status < 300",
+     "            return True  # BUG: every status counts as success",
+     "capcore/httptool.py",
+     ("capcore/tests/test_review9_hardening.py::test_http_500_is_not_reported_as_executed",
+      "capcore/tests/test_review9_hardening.py::test_http_2xx_is_reported_as_executed")),
+    # A transport that cannot even say what happened has not established that the
+    # action occurred. A non-int status must fail closed, not fall through.
+    ("http_invalid_status_type_not_rejected",
+     "        if type(status) is not int or isinstance(status, bool):",
+     "        if False:  # BUG: trust whatever the transport returned",
+     "capcore/httptool.py",
+     ("capcore/tests/test_review9_hardening.py::test_non_integer_status_is_not_reported_as_executed",)),
     ("httptool_allows_any_scheme",
      "    if scheme not in ALLOWED_SCHEMES:",
      "    if False:  # BUG: send credentials over any scheme",

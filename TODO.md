@@ -12,20 +12,27 @@ collection-error/timeout-as-harness-error); and self-tests for the harness in
 `capcore/tests/test_mutation_harness.py`.
 
 ONGOING CONVENTION (not a separate task, just a habit): selectors are declared on
-only 3 of 68 mutations so far. A mutation without selectors falls back to the full
-suite in focused mode (safe, just slower). When adding a NEW mutation, give it a
-selector while the relevant test is fresh; back-filling the existing 65 is
-low-value grunt work and a wrong selector is worse than none, so let them accrue
-rather than bulk-adding.
+23 of 85 mutations. A mutation without selectors falls back to the full suite in
+focused mode (safe, just slower). When adding a NEW mutation, give it a selector
+while the relevant test is fresh; back-filling the remaining 62 is low-value grunt
+work and a wrong selector is worse than none, so let them accrue rather than
+bulk-adding. (Round 9 added 17 selectors this way, from 3 to 23, at no extra cost.)
+
+CAVEAT, learned in round 9: focused mode is for routine feedback, NOT for closing a
+review round. Run the FULL suite per mutation before merging. Three times in round 9
+a mutation still matched its anchor, still passed `check_stale`, and had quietly
+stopped biting, because a later fix made its guard redundant or moved the code its
+killing test exercised. The suite was green and `check_stale` was clean every time.
+Only the full run caught it.
 
 ## 2. Dual-form `ExecutionEngine` constructor cleanup
 
 Deferred since round 4. The engine accepts both the new
 `ExecutionEngine(broker, budget)` and the legacy
 `ExecutionEngine(monitor, broker, budget)` (where the monitor must equal
-`broker.monitor`). Migrate the ~21 call sites to the new form and remove the old
-one. Its own commit, with its own red/green cycle, because it is a broad
-mechanical edit across test files.
+`broker.monitor`). Migrate the 21 legacy call sites (verified by grep at round 9;
+all in test files) to the new form and remove the old one. Its own commit, with its
+own red/green cycle, because it is a broad mechanical edit across test files.
 
 ## 3. Approval workflow
 
