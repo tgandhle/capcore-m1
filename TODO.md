@@ -4,9 +4,9 @@ Deliberately deferred work, tracked here so it survives across sessions rather
 than living in memory. None of these is a defect; each is a known, documented
 gap or a cleanup with its own reason to be a separate change.
 
-Rough order: (2) is a one-line CI fix and should just be done. (3) is mechanical and
-low-risk. (4) is the only real feature left, and is gated by (5). (5) is not a build
-task at all right now: it is a question to answer before any of the above matters.
+Rough order: (3) is mechanical and low-risk. (4) is the only real feature left, and is
+gated by (5). (5) is not a build task at all right now: it is a question to answer
+before any of the above matters.
 
 ## 1. Focused mutation selectors (harness) — DONE (commit 6dffc4e)
 
@@ -16,7 +16,7 @@ collection-error/timeout-as-harness-error); and self-tests for the harness in
 `capcore/tests/test_mutation_harness.py`.
 
 ONGOING CONVENTION (not a separate task, just a habit): selectors are declared on
-43 of 103 mutations. A mutation without selectors falls back to the full suite in
+45 of 104 mutations. A mutation without selectors falls back to the full suite in
 focused mode (safe, just slower). When adding a NEW mutation, give it a selector
 while the relevant test is fresh; back-filling the remaining 62 is low-value grunt
 work and a wrong selector is worse than none, so let them accrue rather than
@@ -54,40 +54,55 @@ window) and deleted it. The discipline in both cases: a fixture must be one that
 PASS but for the property under test, and a test that cannot fail for the reason it
 exists is not a weak test, it is false comfort.
 
-## 2. Add Python 3.14 to the CI test matrix
+## 2. Add Python 3.14 to the CI test matrix — DONE
 
-CI runs 3.11 / 3.12 / 3.13 on Ubuntu and Windows. Local development is on 3.14.
-That gap is backwards: the interpreter the code is actually exercised on daily is
-the one CI does not check.
+Delivered: `matrix.python-version` is now `["3.11", "3.12", "3.13", "3.14"]`, so the
+matrix is 8 cells (4 versions x Ubuntu/Windows). `requires-python = ">=3.11"` already
+claimed 3.14 support; the claim is now tested rather than aspirational.
 
-It is not hypothetical. Round 9's F2 was ONLY visible because of it, and only by
-accident: CPython 3.11-3.13 raise RecursionError decoding 10000-deep JSON, and 3.14
-simply PARSES it. A fix relying on `except RecursionError` would have been correct on
-every interpreter CI tests and silently broken on the one in daily use, and it took a
-hand-run of a test on the dev box to notice. The control had to become a pre-decode
-nesting cap precisely because the exception is a property of the interpreter, not the
-input.
+Also corrected the mutation-check job's comment, which claimed the check was
+"platform-independent". Review 9 disproved that: a test can be green on one interpreter
+and red on another for the same defect, so a mutation could be caught on some and
+survive on others. Running it on 3.12 only is a COST decision (the matrix would multiply
+several minutes by eight), and the residual risk is stated at the job. The mitigation is
+upstream, in how mutations are written: prefer controls that are pure functions of their
+input (a nesting cap) over ones that depend on interpreter behaviour (catching
+RecursionError).
 
-Round 10 then added threading (MonotonicClock's lock, the vault lock, and their
-ordering), which is exactly the kind of code that diverges across interpreters.
-
-Change: add "3.14" to `matrix.python-version` in `.github/workflows/ci.yml`. One line.
-
-Also worth fixing while there: the mutation-check job's comment claims the check is
-"platform-independent". Round 9 disproved that. It runs on 3.12 only, so a mutation
-that bites on some interpreters and not others would not be caught. Either correct
-the comment or (cheaper than it sounds, since the job is already `needs: tests`)
-consider whether it should matrix too.
+WHY IT MATTERED: Review 9's F2 was only visible because the dev interpreter (3.14) was
+outside the matrix, and only by accident. CPython 3.11-3.13 raise RecursionError decoding
+10000-deep JSON; 3.14 simply PARSES it. A fix relying on `except RecursionError` would
+have passed every version CI tested and been silently broken on the one in daily use.
 
 
-## 3. Dual-form `ExecutionEngine` constructor cleanup
+## 3. Dual-form `ExecutionEngine` constructor cleanup — DONE
 
-Deferred since round 4. The engine accepts both the new
-`ExecutionEngine(broker, budget)` and the legacy
-`ExecutionEngine(monitor, broker, budget)` (where the monitor must equal
-`broker.monitor`). Migrate the 21 legacy call sites (verified by grep at round 9;
-all in test files) to the new form and remove the old one. Its own commit, with its
-own red/green cycle, because it is a broad mechanical edit across test files.
+Delivered: one call form, `ExecutionEngine(broker, budget, pre_execute_hook=None)`.
+The legacy `ExecutionEngine(monitor, broker, budget)` is gone, along with the runtime
+check that a passed monitor equalled `broker.monitor`. 20 call sites migrated (17
+mechanical, 3 needing judgment).
+
+THE POINT OF IT, which turned out to be more than tidying: split authority (an engine
+authorizing through monitor A while the broker executes through monitor B, so revoking
+through one is a silent no-op) is now UNCONSTRUCTIBLE rather than merely refused. There
+is no monitor parameter, and `self.monitor = broker.monitor` is the only assignment.
+The defect is designed out, not guarded against.
+
+That deleted a security test and the `engine_accepts_divergent_monitor` mutation, which
+is worth being explicit about because this project otherwise NEVER deletes a mutation
+that stops biting (see the disarming pattern in item 1: four instances, and every time
+the answer was to make the layering observable). The distinction:
+  - DISARMED:     the bad state is still reachable, nothing tests the guard -> fix the test
+  - DESIGNED OUT: the bad state is unreachable, there is no guard at all     -> delete
+Deleting for the first reason hides a coverage loss. Deleting for the second is the
+point. The invariant moved into the SIGNATURE and is asserted there.
+
+Two guards turned out to have never been armed at all, and the cleanup surfaced them:
+the engine's broker type check and its budget type check both had no mutation, and a
+probe confirmed both were unfalsifiable. Now armed
+(`engine_accepts_a_non_broker`, `engine_accepts_a_non_budget`).
+
+Net: 335 -> 336 tests, 103 -> 104 mutations.
 
 ## 4. Approval workflow
 

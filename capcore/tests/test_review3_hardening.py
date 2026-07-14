@@ -107,7 +107,7 @@ def test_model_cannot_mutate_trusted_history_through_tool_result():
                                      lambda a: "result-string", "1"))
     b.grant_tool("t", "acme/api")
     b.seal_catalog()
-    engine = ExecutionEngine(mon, b, Budget(3))
+    engine = ExecutionEngine(b, Budget(3))
 
     record = engine.run(ctx, ScriptedModel([ep()]))
     # the model's view of the just-run history

@@ -425,10 +425,42 @@ MUTATIONS = [
      "    if audit_code == BrokerRefusal.REAUTHORIZATION_FAILED:\n        return StepOutcome.REVOKED_RACE, \"authorization lost before execution\"",
      "    if True:\n        return StepOutcome.REVOKED_RACE, \"authorization lost before execution\"  # BUG: every refusal a revoke race",
      "capcore/runtime.py"),
-    ("engine_accepts_divergent_monitor",
-     "        if passed_monitor is not None and passed_monitor is not broker.monitor:",
-     "        if False:  # BUG: accept a monitor that differs from broker.monitor",
-     "capcore/runtime.py"),
+    # REMOVED in the constructor cleanup: engine_accepts_divergent_monitor.
+    #
+    # It anchored on the engine's runtime check that a monitor passed via the old
+    # `ExecutionEngine(monitor, broker, budget)` form equalled `broker.monitor`. That
+    # form is gone, so the engine has no monitor parameter, so split authority (engine
+    # authorizing through monitor A while the broker executes through monitor B) is not
+    # merely refused: it is UNCONSTRUCTIBLE. There is no guard left to falsify.
+    #
+    # THIS IS THE ONLY LEGITIMATE REASON TO DELETE A MUTATION, and it is the opposite of
+    # the disarming pattern this file documents elsewhere. Four times in rounds 9-10 a
+    # mutation stopped biting because a NEW guard made an OLDER one redundant; every
+    # time the answer was to make the layering observable, never to delete. Here the
+    # DEFECT was designed out, not the test coverage. The difference:
+    #   - disarmed: the bad state is still reachable, nothing tests the guard  -> FIX THE TEST
+    #   - designed out: the bad state is unreachable, there is no guard        -> DELETE
+    # Deleting for the first reason hides a coverage loss. Deleting for the second is
+    # the point of the exercise.
+    #
+    # The invariant did not disappear; it moved into the signature, and that is now what
+    # is asserted (test_engine_has_no_monitor_parameter, test_the_old_call_form_is_gone).
+    # The engine's broker type check is now its ONLY construction guard (the
+    # divergent-monitor check above was designed out), and it had never carried a
+    # mutation. An engine built on a non-broker has no monitor, no store, and no
+    # authority: it must fail closed at construction, not at first step().
+    # Likewise never armed until the cleanup: an engine with no budget is unbounded.
+    ("engine_accepts_a_non_budget",
+     "        if not isinstance(budget, Budget):",
+     "        if False:  # BUG: an engine with no budget is unbounded",
+     "capcore/runtime.py",
+     ("capcore/tests/test_integration_m2_m3.py::test_engine_requires_a_budget",)),
+    ("engine_accepts_a_non_broker",
+     "        if not isinstance(broker, TrustedExecutionBroker):",
+     "        if False:  # BUG: build an engine with no authority at all",
+     "capcore/runtime.py",
+     ("capcore/tests/test_integration_m2_m3.py::test_engine_requires_a_broker",
+      "capcore/tests/test_review4_hardening.py::test_the_old_call_form_is_gone")),
     # The vault must store a COPY, not the caller's mutable Credential. Storing
     # the caller's object lets a retained reference widen scope / reset single-use
     # / backdate TTL / swap the secret after issuance.

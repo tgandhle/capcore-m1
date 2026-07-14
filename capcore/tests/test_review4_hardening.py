@@ -75,7 +75,50 @@ def wired_broker(monitor, adapter=None, scope="acme/api", kind=ToolKind.PLAIN,
 # seam.
 # --------------------------------------------------------------------------- #
 
-def test_engine_rejects_a_broker_with_a_different_monitor():
+def test_engine_has_no_monitor_parameter():
+    """Split authority is now UNCONSTRUCTIBLE, not merely refused.
+
+    Rewritten in the constructor cleanup, and the change is worth stating rather than
+    burying, because it deletes a security test and its mutation.
+
+    Round 4 fixed the split-authority defect (an engine authorizing through monitor A
+    while the broker executes through monitor B, so revoking through one was a silent
+    no-op and the action executed anyway) but kept a compatibility call form,
+    `ExecutionEngine(monitor, broker, budget)`, which ACCEPTED a monitor and raised if
+    it was not `broker.monitor`. That was a runtime GUARD against a state the API still
+    let you try to build. The old test here drove that guard, and the
+    engine_accepts_divergent_monitor mutation killed it.
+
+    Removing the form removes the state. There is no parameter through which a
+    divergent monitor can arrive, and `self.monitor = broker.monitor` is the only
+    assignment (no setter, no post-construction rebinding). So the guard, its test, and
+    its mutation are all gone, and what replaces them is an assertion about the
+    SIGNATURE, because that is where the invariant now lives.
+
+    Designing a defect out beats guarding against it. But a deleted mutation should be
+    a visible decision, never a side effect of tidying, which is why this test is
+    explicit about what it replaced.
+    """
+    import inspect
+
+    params = inspect.signature(ExecutionEngine.__init__).parameters
+    assert "monitor" not in params, (
+        "the engine must not accept a monitor: that is how split authority became "
+        "constructible in the first place")
+    assert list(params) == ["self", "broker", "budget", "pre_execute_hook"]
+
+    # And the derivation is the only route.
+    store, mon, ctx = build()
+    broker = wired_broker(mon)
+    engine = ExecutionEngine(broker, Budget(2))
+    assert engine.monitor is broker.monitor
+    assert engine.store is broker.monitor.store
+
+
+def test_the_old_call_form_is_gone():
+    """`ExecutionEngine(monitor, broker, budget)` must now FAIL, not be quietly
+    reinterpreted. A compatibility form that silently keeps working is worse than one
+    that is removed, because callers never learn to migrate."""
     store_a = CapabilityStore()
     store_a.issue(Capability("cap-1", "acme", "acme/api", frozenset({"read"}),
                              principal="p", run="r"))
@@ -85,9 +128,7 @@ def test_engine_rejects_a_broker_with_a_different_monitor():
     monitor_a = ReferenceMonitor(store_a)
     broker_b = wired_broker(ReferenceMonitor(store_b))
 
-    # Old call form with a monitor that differs from the broker's must be refused
-    # at construction, not silently accepted with a divergent authority.
-    with pytest.raises(ValueError):
+    with pytest.raises(TypeError):
         ExecutionEngine(monitor_a, broker_b, Budget(2))
 
 
@@ -293,7 +334,7 @@ def test_denied_attempt_does_not_consume_the_action_budget():
     calls = []
     b = wired_broker(mon, adapter=lambda a: calls.append(1) or "ok")
     # one action allowed; denied attempts must not count
-    engine = ExecutionEngine(mon, b, Budget(max_actions=1, max_iterations=5,
+    engine = ExecutionEngine(b, Budget(max_actions=1, max_iterations=5,
                                             count_denied_attempts=False))
 
     class Model:
@@ -321,7 +362,7 @@ def test_single_action_budget_allows_completion():
     not be force-aborted by the loop ceiling."""
     store, mon, ctx = build()
     b = wired_broker(mon)
-    engine = ExecutionEngine(mon, b, Budget(max_actions=1, max_iterations=5))
+    engine = ExecutionEngine(b, Budget(max_actions=1, max_iterations=5))
 
     class Model:
         def __init__(self):
@@ -368,7 +409,7 @@ def test_expired_credential_is_not_reported_as_revocation_race():
     b.grant_tool("t", "acme/api")
     b.seal_catalog()
 
-    engine = ExecutionEngine(mon, b, Budget(max_actions=3, max_iterations=3),
+    engine = ExecutionEngine(b, Budget(max_actions=3, max_iterations=3),
                              pre_execute_hook=lambda e, p, r: clock.advance(50.0))
     record = engine.run(RunContext("acme", "p", "r"),
                         ScriptedModel([ep()]))

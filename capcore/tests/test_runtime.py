@@ -65,7 +65,7 @@ def build(budget_steps=10, pre_execute_hook=None, tools=None):
     registry = tools or ToolRegistry()
     registry.install(broker)
     broker.seal_catalog()
-    engine = ExecutionEngine(mon, broker, Budget(budget_steps),
+    engine = ExecutionEngine(broker, Budget(budget_steps),
                              pre_execute_hook=pre_execute_hook)
     ctx = RunContext("acme", "p1", "r1")
     return engine, store, ctx, registry

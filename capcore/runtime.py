@@ -493,49 +493,34 @@ PreExecuteHook = Optional[
 class ExecutionEngine:
     def __init__(
         self,
-        monitor_or_broker=None,
-        broker_=None,
-        budget: Budget = None,
+        broker: "TrustedExecutionBroker",
+        budget: Budget,
         pre_execute_hook: PreExecuteHook = None,
-        *,
-        monitor: ReferenceMonitor = None,
-        broker: "TrustedExecutionBroker" = None,
     ):
         """The engine derives ALL authorization authority from the broker.
 
-        There is a single source of truth for the monitor and the capability
-        store: `broker.monitor`. The engine no longer accepts a separate monitor,
-        so it is impossible to construct an engine that authorizes control flow
-        through monitor A while the broker executes through monitor B. An earlier
-        version accepted both and only type-checked them, which let engine and
-        broker diverge onto different stores: revoking through one was a silent
-        no-op and the action executed anyway (the split-authority defect, first
-        seen as engine.store vs monitor.store, then again here as engine.monitor
-        vs broker.monitor).
+        There is a single source of truth for the monitor and the capability store:
+        `broker.monitor`. The engine takes NO monitor parameter, so it is not merely
+        forbidden to construct an engine that authorizes control flow through monitor
+        A while the broker executes through monitor B: it is IMPOSSIBLE. An earlier
+        version accepted both and only type-checked them, which let engine and broker
+        diverge onto different stores, so revoking through one was a silent no-op and
+        the action executed anyway (the split-authority defect, first seen as
+        engine.store vs monitor.store, then again as engine.monitor vs broker.monitor).
 
-        Signature note: for backward compatibility with the previous
-        `ExecutionEngine(monitor, broker, budget)` call form, a monitor passed in
-        the first position is accepted and MUST equal `broker.monitor`, else
-        construction fails. New code should call
-        `ExecutionEngine(broker, budget)`.
+        HISTORY, because this is a security invariant that changed shape rather than
+        going away. Round 4 removed the divergent-monitor DEFECT but kept a
+        compatibility form, `ExecutionEngine(monitor, broker, budget)`, which accepted
+        a monitor and raised if it was not `broker.monitor`. That was a runtime GUARD
+        against a constructible bad state. Removing the form removes the bad state:
+        there is now no parameter through which a divergent monitor could arrive, and
+        `self.monitor = broker.monitor` is the only assignment. Designed out, not
+        guarded against.
+
+        The guard's test and mutation went with it, deliberately, and are replaced by
+        a structural one (`test_engine_has_no_monitor_parameter`): the invariant is now
+        a property of the SIGNATURE, so that is what is asserted.
         """
-        # Untangle the two accepted call forms:
-        #   new:  ExecutionEngine(broker, budget, pre_execute_hook=...)
-        #   old:  ExecutionEngine(monitor, broker, budget, pre_execute_hook=...)
-        passed_monitor = None
-        if isinstance(monitor_or_broker, TrustedExecutionBroker):
-            # NEW form: ExecutionEngine(broker, budget, ...)
-            broker = monitor_or_broker
-            if budget is None and isinstance(broker_, Budget):
-                budget = broker_
-        elif isinstance(monitor_or_broker, ReferenceMonitor):
-            # OLD form: ExecutionEngine(monitor, broker, budget, ...)
-            passed_monitor = monitor_or_broker
-            if broker is None:
-                broker = broker_
-        if monitor is not None:
-            passed_monitor = monitor
-
         if not isinstance(broker, TrustedExecutionBroker):
             raise TypeError(
                 "ExecutionEngine requires a TrustedExecutionBroker; the engine "
@@ -545,13 +530,6 @@ class ExecutionEngine:
             raise TypeError("budget must be a Budget")
         if pre_execute_hook is not None and not callable(pre_execute_hook):
             raise TypeError("pre_execute_hook must be callable or None")
-
-        # If a monitor was passed (old call form), it MUST be the broker's.
-        if passed_monitor is not None and passed_monitor is not broker.monitor:
-            raise ValueError(
-                "engine monitor differs from broker.monitor: split authority is "
-                "not permitted. Construct with ExecutionEngine(broker, budget)."
-            )
 
         self.broker = broker
         self.monitor = broker.monitor           # single source of truth

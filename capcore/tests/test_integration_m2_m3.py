@@ -104,7 +104,7 @@ def test_engine_has_no_tool_registry():
     """
     store = build_store()
     monitor = ReferenceMonitor(store)
-    engine = ExecutionEngine(monitor, build_broker(monitor), Budget(3))
+    engine = ExecutionEngine(build_broker(monitor), Budget(3))
 
     assert not hasattr(engine, "tools")
     assert not hasattr(engine, "_tools")
@@ -112,11 +112,35 @@ def test_engine_has_no_tool_registry():
 
 
 def test_engine_requires_a_broker():
-    """Without a broker the engine can execute nothing. Fail closed at construction."""
+    """Without a broker the engine can execute nothing. Fail closed at construction.
+
+    A ReferenceMonitor is used as the not-a-broker here on purpose: it is the object
+    the removed compatibility form used to accept in the first position, so this pins
+    that the OLD call shape now fails rather than being silently reinterpreted.
+    """
     store = build_store()
     monitor = ReferenceMonitor(store)
     with pytest.raises(TypeError):
-        ExecutionEngine(monitor, object(), Budget(3))
+        ExecutionEngine(object(), Budget(3))
+    with pytest.raises(TypeError):
+        ExecutionEngine(monitor, Budget(3))          # the old form's first argument
+
+
+def test_engine_requires_a_budget():
+    """And an unbounded engine is not a thing either. Fail closed at construction.
+
+    Added during the constructor cleanup: the budget type check had NEVER carried a
+    mutation, and a probe showed it was unfalsifiable (no test passed a non-Budget).
+    A guard nothing can test is a guard nothing tests. Same class as the four disarmed
+    mutations in rounds 9-10, just never armed in the first place.
+    """
+    store = build_store()
+    monitor = ReferenceMonitor(store)
+    broker = build_broker(monitor)
+    with pytest.raises(TypeError):
+        ExecutionEngine(broker, 3)              # an int is not a Budget
+    with pytest.raises(TypeError):
+        ExecutionEngine(broker, None)
 
 
 # --------------------------------------------------------------------------- #
@@ -147,7 +171,7 @@ def test_plain_tool_executes_through_the_broker_catalog():
     monitor = ReferenceMonitor(store)
     plain = PlainRecorder()
     broker = build_broker(monitor, plain=plain)
-    engine = ExecutionEngine(monitor, broker, Budget(3))
+    engine = ExecutionEngine(broker, Budget(3))
 
     record = engine.run(ctx(), ScriptedModel([ep(tool="plain-read")]))
 
@@ -162,7 +186,7 @@ def test_credentialed_tool_executes_without_returning_the_secret():
     monitor = ReferenceMonitor(store)
     cred = CredRecorder()
     broker = build_broker(monitor, cred=cred)
-    engine = ExecutionEngine(monitor, broker, Budget(3))
+    engine = ExecutionEngine(broker, Budget(3))
 
     record = engine.run(ctx(), ScriptedModel([ep(tool="cred-read")]))
 
@@ -232,7 +256,7 @@ def test_exact_registration_must_be_policy_authorized():
     broker.grant_tool("read-customer-record", "acme/records")
     broker.seal_catalog()
 
-    engine = ExecutionEngine(monitor, broker, Budget(3))
+    engine = ExecutionEngine(broker, Budget(3))
 
     # The model names the executor it wants. That is not authorization.
     record = engine.run(ctx(), ScriptedModel([
@@ -390,7 +414,7 @@ def test_revoke_race_through_the_engine():
     def revoke_hook(engine, proposal, record):
         engine.store.revoke("cap-1")
 
-    engine = ExecutionEngine(monitor, broker, Budget(3), pre_execute_hook=revoke_hook)
+    engine = ExecutionEngine(broker, Budget(3), pre_execute_hook=revoke_hook)
     record = engine.run(ctx(), ScriptedModel([ep(tool="cred-read")]))
 
     assert cred.delivered == []
@@ -436,7 +460,7 @@ def test_adapter_exception_is_sanitized_end_to_end():
     store = build_store()
     monitor = ReferenceMonitor(store)
     broker = build_broker(monitor, cred=HostileAdapter())
-    engine = ExecutionEngine(monitor, broker, Budget(3))
+    engine = ExecutionEngine(broker, Budget(3))
 
     record = engine.run(ctx(), ScriptedModel([ep(tool="cred-read")]))
 

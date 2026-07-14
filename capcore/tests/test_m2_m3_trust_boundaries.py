@@ -172,7 +172,7 @@ def test_model_cannot_mutate_trusted_budget_counter():
     store = build_store()
     monitor = ReferenceMonitor(store)
     broker, calls = recording_broker(monitor)
-    engine = ExecutionEngine(monitor, broker, Budget(1))
+    engine = ExecutionEngine(broker, Budget(1))
     model = MutatingModel(ep())
 
     record = engine.run(build_ctx(), model)
@@ -209,7 +209,7 @@ def test_missing_tool_is_not_reported_as_executed():
     store = build_store()
     monitor = ReferenceMonitor(store)
     broker = TrustedExecutionBroker(monitor)      # empty catalog: no tools at all
-    engine = ExecutionEngine(monitor, broker, Budget(2))
+    engine = ExecutionEngine(broker, Budget(2))
     record = RunRecord(ctx=build_ctx(), state=RunState.RUNNING)
 
     result = engine.step(record, ep(tool="not-registered"))
@@ -255,7 +255,7 @@ def test_revoking_through_engine_store_actually_stops_the_action():
         engine.store.revoke("cap-1")
 
     engine = ExecutionEngine(
-        monitor, broker, Budget(2), pre_execute_hook=revoke_via_engine
+        broker, Budget(2), pre_execute_hook=revoke_via_engine
     )
     record = RunRecord(ctx=build_ctx(), state=RunState.RUNNING)
 
@@ -272,20 +272,34 @@ def test_engine_store_identity_invariant():
     """After the fix, the engine must expose exactly the monitor's store."""
     store = build_store()
     monitor = ReferenceMonitor(store)
-    engine = ExecutionEngine(monitor, TrustedExecutionBroker(monitor), Budget(1))
+    engine = ExecutionEngine(TrustedExecutionBroker(monitor), Budget(1))
 
     assert engine.store is engine.monitor.store
     assert engine.monitor.store is store
 
 
 def test_engine_rejects_a_second_store():
-    """After the fix, supplying a divergent store must be impossible."""
-    store_a = build_store()
-    store_b = build_store()
-    monitor = ReferenceMonitor(store_a)
+    """Supplying a divergent store must be impossible.
 
-    with pytest.raises((TypeError, ValueError)):
-        ExecutionEngine(monitor, store_b, TrustedExecutionBroker(monitor), Budget(1))
+    Rewritten in the constructor cleanup. The old version passed FOUR positional
+    arguments and asserted TypeError. Against the single-form constructor that would
+    still pass, but on ARITY: "takes 3 positional arguments but 4 were given", which
+    is not the property under test. A test that would pass for the wrong reason is
+    false comfort, so this asserts the STRUCTURAL fact instead: the engine exposes
+    exactly the broker's store, and there is no parameter through which a second one
+    could be supplied.
+    """
+    import inspect
+
+    store_a = build_store()
+    monitor = ReferenceMonitor(store_a)
+    engine = ExecutionEngine(TrustedExecutionBroker(monitor), Budget(1))
+
+    assert engine.store is monitor.store
+
+    params = set(inspect.signature(ExecutionEngine.__init__).parameters)
+    assert "store" not in params, (
+        "the engine must not accept a store; it derives one from broker.monitor")
 
 
 # --------------------------------------------------------------------------- #
@@ -360,7 +374,7 @@ def test_engine_cannot_distinguish_model_completion_from_model_failure():
     """
     store = build_store()
     monitor = ReferenceMonitor(store)
-    engine = ExecutionEngine(monitor, TrustedExecutionBroker(monitor), Budget(3))
+    engine = ExecutionEngine(TrustedExecutionBroker(monitor), Budget(3))
 
     record = engine.run(build_ctx(), UnparseableModel())
 
@@ -383,7 +397,7 @@ def test_ollama_adapter_does_not_swallow_provider_errors():
 
     store = build_store()
     monitor = ReferenceMonitor(store)
-    engine = ExecutionEngine(monitor, TrustedExecutionBroker(monitor), Budget(3))
+    engine = ExecutionEngine(TrustedExecutionBroker(monitor), Budget(3))
 
     record = engine.run(build_ctx(), BrokenOllama())
 
