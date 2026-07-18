@@ -35,7 +35,7 @@ Three layers, each with its own trust boundary:
 
 336 tests pass. `python scripts/mutation_check.py` reintroduces 104 known defects
 one at a time and asserts the suite catches every one (it mutates a temporary
-copy, never your working tree). CI runs Python 3.11-3.13 on Ubuntu and Windows.
+copy, never your working tree). CI runs Python 3.11-3.14 on Ubuntu and Windows.
 
 ## Install and test
 
@@ -48,6 +48,24 @@ pip install -e ".[test]"
 pytest
 python scripts/mutation_check.py
 ```
+
+## Live demos
+
+Both demos run a **real local LLM** (via Ollama) as the untrusted model, so the
+containment shown is against actual model output, not a scripted stand-in. The
+screenshots below are illustrative; the commands are the evidence.
+
+`python scripts/demo_live.py` drives the model through the full trusted loop.
+Proposals outside granted authority are denied by the monitor, whatever the
+model asks for:
+
+![demo_live.py: a live model's proposals being allowed and denied by the reference monitor](docs/demo-m2-llm-containment.png)
+
+`python scripts/demo_live_m3.py` sends a real secret over real HTTPS through the
+broker. The credential is injected inside the broker boundary and never appears
+in the model's view or the run record:
+
+![demo_live_m3.py: a real credential used by the broker without ever reaching the model](docs/demo-m3-secret-containment.png)
 
 ## Trust model
 
